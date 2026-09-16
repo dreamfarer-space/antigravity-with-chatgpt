@@ -1065,6 +1065,8 @@ Also need to check another file:
     assert.equal(canonicalizeManifestPath(tmp, '..config'), '..config', '合法文件名 ..config 必须允许保留');
     if (process.platform !== 'win32') {
       assert.equal(canonicalizeManifestPath(tmp, '..\\foo'), '..\\foo', 'POSIX 下合法文件名 ..\\foo 必须允许保留');
+    } else {
+      assert.equal(canonicalizeManifestPath(tmp, '..\\foo'), null, 'Windows 下 ..\\foo 必须视为父级逃逸');
     }
     assert.equal(canonicalizeManifestPath(tmp, '../foo'), null, '父级目录逃逸 ../foo 必须严格返回 null');
     assert.equal(canonicalizeManifestPath(tmp, '..'), null, '父级目录 .. 必须严格返回 null');
