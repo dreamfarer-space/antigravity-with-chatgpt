@@ -9,11 +9,57 @@
 
 import path from 'node:path';
 import { MODES, buildPromptEnvelope } from './prompts.mjs';
-import { buildAttachmentsBlock, getWorkspaceInfo } from '../workspace/context_provider.mjs';
+import { buildAttachmentsBlock, getWorkspaceInfo, readFileSafe } from '../workspace/context_provider.mjs';
 import { getGitDiff, getReviewEvidence } from '../git/git_helper.mjs';
 import { getRecentExecutions, formatExecutionSummary } from '../execution/recorder.mjs';
 import { sanitizeContent } from '../security/sensitive.mjs';
 import { sendPromptViaCdp } from '../transport/cdp_transport.mjs';
+
+/**
+ * 解析 ChatGPT 回复中的 <EVIDENCE_REQUEST> 证据拉取标签
+ * @param {string} text
+ * @returns {Array<object>} [{ type: 'git_diff'|'read_file', offset?: number, maxBytes?: number, path?: string, file?: string }]
+ */
+export function parseEvidenceRequests(text) {
+  if (typeof text !== 'string' || !text.includes('<EVIDENCE_REQUEST>')) {
+    return [];
+  }
+
+  const regex = /<EVIDENCE_REQUEST>([\s\S]*?)<\/EVIDENCE_REQUEST>/gi;
+  const requests = [];
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    let rawJson = match[1].trim();
+    // 移除潜在的 Markdown ```json 围栏
+    rawJson = rawJson.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+
+    try {
+      const parsed = JSON.parse(rawJson);
+      if (parsed && typeof parsed === 'object') {
+        const type = String(parsed.type || '').toLowerCase();
+        if (type === 'git_diff') {
+          requests.push({
+            type: 'git_diff',
+            offset: Math.max(0, Number(parsed.offset) || 0),
+            maxBytes: Math.min(Math.max(1024, Number(parsed.maxBytes) || 32768), 65536),
+            file: typeof parsed.file === 'string' ? parsed.file.trim() : undefined,
+          });
+        } else if (type === 'read_file' && typeof parsed.path === 'string' && parsed.path.trim()) {
+          requests.push({
+            type: 'read_file',
+            path: parsed.path.trim(),
+            maxBytes: Math.min(Math.max(1024, Number(parsed.maxBytes) || 32768), 128 * 1024),
+          });
+        }
+      }
+    } catch {
+      // 忽略无法解析的格式
+    }
+  }
+
+  return requests;
+}
 
 /**
  * 运行一次完整的大脑推理任务
@@ -23,10 +69,14 @@ import { sendPromptViaCdp } from '../transport/cdp_transport.mjs';
  * @param {string} [options.workspace] 工作区根目录，默认当前目录
  * @param {Array<string>} [options.files=[]] 显式附带的代码文件路径
  * @param {boolean} [options.gitDiff=false] 是否注入真实 Git Diff
+ * @param {number} [options.diffOffset=0] Git Diff 分页起始偏移量
+ * @param {number} [options.diffMaxBytes=32768] Git Diff 字节预算限制
  * @param {boolean} [options.executionEvidence=false] 是否注入最近的执行证据
+ * @param {boolean} [options.autoEvidence=true] review 模式下是否自动拉取 <EVIDENCE_REQUEST> 证据
+ * @param {number} [options.maxEvidenceRounds=3] 自动拉取证据的最大迭代轮数
  * @param {string} [options.session='reuse'] 'reuse' | 'new'
  * @param {number} [options.timeout=600] 超时时间（秒）
- * @returns {Promise<object>} { ok, text, elapsedMs, mode, turns }
+ * @returns {Promise<object>} { ok, text, elapsedMs, mode, turns, evidenceRounds, evidenceAudit }
  */
 export async function runBrainTask(options = {}) {
   const t0 = Date.now();
@@ -57,7 +107,9 @@ export async function runBrainTask(options = {}) {
     // 处理 Git 变更与审查证据 (review 与 diagnose 模式下默认自动附带，或显式要求)
     const needDiff = options.gitDiff === true || mode === MODES.REVIEW || (mode === MODES.DIAGNOSE && options.gitDiff !== false);
     if (needDiff) {
-      const evidence = getReviewEvidence(workspace, { maxBytes: 32768, untrackedMaxBytes: 16384 });
+      const diffMax = typeof options.diffMaxBytes === 'number' ? options.diffMaxBytes : 32768;
+      const diffOff = typeof options.diffOffset === 'number' ? options.diffOffset : 0;
+      const evidence = getReviewEvidence(workspace, { offset: diffOff, maxBytes: diffMax, untrackedMaxBytes: 16384 });
       const diffParts = [];
 
       if (mode === MODES.REVIEW) {
@@ -121,11 +173,95 @@ export async function runBrainTask(options = {}) {
   }
 
   // 4. 调度 CDP 传输层
-  const cdpRes = await sendPromptViaCdp({
+  let cdpRes = await sendPromptViaCdp({
     prompt: safePrompt,
     mode: session,
     timeoutS,
   });
+
+  // 5. 闭环证据拉取协议 (Closed-Loop Bounded Evidence Protocol)
+  let evidenceRounds = 0;
+  const maxRounds = typeof options.maxEvidenceRounds === 'number' ? options.maxEvidenceRounds : 3;
+  const evidenceAudit = [];
+  const autoEvidence = options.autoEvidence !== false && mode === MODES.REVIEW;
+
+  if (autoEvidence) {
+    let aggregateBytes = 0;
+    const MAX_AGGREGATE_BYTES = 128 * 1024; // 最多追加 128KB 证据，防止无限膨胀
+
+    while (evidenceRounds < maxRounds) {
+      const requests = parseEvidenceRequests(cdpRes.text);
+      if (!requests || requests.length === 0) {
+        break;
+      }
+
+      evidenceRounds++;
+      const evidenceSnippets = [];
+
+      for (const req of requests) {
+        if (aggregateBytes >= MAX_AGGREGATE_BYTES) {
+          evidenceSnippets.push(`[NOTICE: Aggregate evidence budget (${MAX_AGGREGATE_BYTES}B) reached. Proceeding with review.]`);
+          break;
+        }
+
+        if (req.type === 'git_diff') {
+          const reqOffset = Math.max(0, Number(req.offset) || 0);
+          const reqMax = Math.min(Math.max(1024, Number(req.maxBytes) || 32768), 65536);
+          const diffRes = getGitDiff(workspace, {
+            offset: reqOffset,
+            maxBytes: reqMax,
+            head: true,
+            file: req.file,
+          });
+
+          aggregateBytes += diffRes.returnedBytes;
+          evidenceAudit.push({
+            round: evidenceRounds,
+            type: 'git_diff',
+            offset: reqOffset,
+            returnedBytes: diffRes.returnedBytes,
+            hasMore: diffRes.hasMore,
+            nextOffset: diffRes.nextOffset,
+          });
+
+          evidenceSnippets.push(`### [EVIDENCE: GIT DIFF PAGE (offset: ${reqOffset}, returned: ${diffRes.returnedBytes}B)]\n${diffRes.diff}`);
+        } else if (req.type === 'read_file' && req.path) {
+          try {
+            const fileRes = readFileSafe(workspace, req.path, { maxBytes: req.maxBytes || 32768 });
+            const bytes = Buffer.byteLength(fileRes.content, 'utf8');
+            aggregateBytes += bytes;
+            evidenceAudit.push({
+              round: evidenceRounds,
+              type: 'read_file',
+              path: req.path,
+              bytes,
+            });
+            evidenceSnippets.push(`### [EVIDENCE: FILE CONTENT \`${req.path}\`]\n\`\`\`\n${fileRes.content}\n\`\`\``);
+          } catch (err) {
+            evidenceSnippets.push(`### [EVIDENCE: FAILED TO READ \`${req.path}\`]\nError: ${err.message}`);
+          }
+        }
+      }
+
+      if (evidenceSnippets.length === 0) break;
+
+      const followUpPrompt = [
+        '[ANTIGRAVITY-BRIDGE/EVIDENCE_RESPONSE]',
+        'Here is the requested workspace evidence:',
+        '',
+        evidenceSnippets.join('\n\n'),
+        '',
+        'Please incorporate this empirical evidence and finalize your review with an explicit verdict ([APPROVED] or [CHANGES REQUESTED]).',
+      ].join('\n');
+
+      const safeFollowUp = sanitizeContent(followUpPrompt);
+      cdpRes = await sendPromptViaCdp({
+        prompt: safeFollowUp,
+        mode: 'reuse',
+        timeoutS,
+      });
+    }
+  }
 
   const elapsedMs = Date.now() - t0;
 
@@ -136,5 +272,7 @@ export async function runBrainTask(options = {}) {
     turns: cdpRes.turns,
     mode,
     elapsedMs,
+    evidenceRounds,
+    evidenceAudit,
   };
 }

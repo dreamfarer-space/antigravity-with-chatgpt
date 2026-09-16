@@ -223,7 +223,9 @@ node scripts/ask_chatgpt.mjs --doctor
 
 | 工具名称 | 描述 | 关键参数 |
 | :--- | :--- | :--- |
-| **`ask_chatgpt`** | 向 ChatGPT 网页版发送结构化任务并获取完整推理结果 | `prompt` (必填): 提问内容<br>`mode`: `ask` / `plan` / `review` / `derive` / `diagnose`<br>`files`: 附带的代码文件路径数组<br>`gitDiff`: 是否注入真实 Git Diff (布尔值)<br>`session`: `reuse` / `new`<br>`timeout`: 超时时间（秒，默认 600） |
+| **`ask_chatgpt`** | 向 ChatGPT 网页版发送结构化任务并获取完整推理结果 | `prompt` (必填): 提问内容<br>`mode`: `ask` / `plan` / `review` / `derive` / `diagnose`<br>`files`: 附带的代码文件路径数组<br>`gitDiff`: 是否注入真实 Git Diff (布尔值)<br>`diffOffset`: Git Diff 分页起始字节偏移量 (默认 0)<br>`diffMaxBytes`: 单次最大字节预算限制 (默认 32768)<br>`session`: `reuse` / `new`<br>`timeout`: 超时时间（秒，默认 600） |
+| **`get_git_diff_page`** | 按需提取真实 Git Diff 的指定分页切片（受字节预算与脱敏保护） | `workspace`: 可选工作区路径<br>`offset`: 分页起始字节偏移量 (默认 0)<br>`maxBytes`: 单次提取最大字节数 (默认 32768, 最大 65536)<br>`head`: 是否对比 HEAD (默认 true)<br>`staged`: 是否仅已暂存 (默认 false)<br>`file`: 可选文件路径过滤 |
+| **`read_review_file`** | 安全读取工作区内代码文件（受沙箱防逃逸与字节预算保护） | `path` (必填): 相对文件路径<br>`workspace`: 可选工作区路径<br>`maxBytes`: 最大读取字节数 (默认 32768) |
 | **`chatgpt_status`** | 探测专用 Chrome 实例、CDP 9222 端口及工作区就绪性 | `workspace`: 可选工作区路径 |
 | **`record_execution`** | 记录命令、构建或测试运行证据，供审查模式调用 | `command` (必填): 执行命令<br>`exitCode` (必填): 退出码<br>`output`: 输出日志<br>`testSummary`: 测试通过/失败统计 |
 
@@ -240,23 +242,6 @@ node scripts/ask_chatgpt.mjs --doctor
 npm test
 # 等价于: node tests/security_adversarial.test.mjs
 ```
-
-**持续集成自动化测试项 (37/37 项全绿通过):**
-- **路径安全与越界对抗 (path_guard)**：相对路径 `../` 逃逸、多级嵌套越界、绝对路径跨卷、NUL 字符注入、合法路径解析与符号链接根目录收敛 (6/6)
-- **敏感凭据与密钥脱敏 (sensitive)**：多行 PEM 私钥、带空格/引号密码赋值、冒号单引配置、Bearer Token 与敏感文件判定 (5/5)
-- **出口统一脱敏拦截 (Egress Sanitization)**：Git Diff 与命令测试输出中的密钥泄漏拦截 (2/2)
-- **编排器输入防御性契约**：空提示词拦截与非字符串入参防御 (2/2)
-- **执行证据记录器严格类型契约**：严格无强制转换的退出码整数校验（拒绝 `false`、空串、`"0"`、数组及 NaN）(4/4)
-- **CDP evaluate 与 awaitPromise 回归测试**：普通表达式同步求值与异步 Promise 调度透传 (2/2)
-- **未跟踪文件证据提取与脱敏**：安全文本抽取、二进制跳过与敏感配置过滤 (1/1)
-- **UTF-8 字节预算边界安全截断**：非破坏性多字节字符截断与严格字节上限控制 (1/1)
-- **FNV-1a 指纹同构性与顺序敏感性**：顺序敏感哈希（`"abc"` vs `"cba"`）与 Node.js/浏览器端 100% 同构对齐 (2/2)
-- **传输层自适应注入超时动态阶梯**：按 UTF-8 字节梯级计算注入超时（20s ~ 180s）(1/1)
-- **目标选择纯函数与 Fail-Closed 状态机**：初次认领、粘性复用与已绑定目标丢失时严格阻断 (4/4)
-- **Git Diff 分页接口与预算受限**：分页偏移量（offset）、剩余量与严格字节上限 (2/2)
-- **未跟踪文件严格全额预算**：围栏与截断标牌自身全额计入预算，绝对满足 `<= maxBytes` (1/1)
-- **CDP 假超时恢复与幂等重试状态机**：超时后探针回读指纹成功判定注入成功，杜绝二次追加注入 (2/2)
-- **强收据提交状态机**：依据 User Turn 计数增量判定 SUBMITTED，超时未确认进入 UNKNOWN 状态禁止自动重发 (2/2)
 
 ### 2. 本地环境自检与端到端真实推理 (`npm run verify`)
 检查本机环境依赖、模块完整性、全局挂载与真实 Chrome CDP 连通性：
@@ -276,7 +261,7 @@ node scripts/verify_install.mjs --run-test
 > [!IMPORTANT]
 > **法律合规与使用责任告知：**
 > - **个人开发与研究工具**：`antigravity-with-chatgpt` 为开源实验性开发者辅助工具，旨在方便个人开发者探索双脑协同推理、本地代码审查与 Antigravity 自动化交互。
-> - **OpenAI 服务条款与程序化提取限制说明**：OpenAI 的 [Terms of Use（服务条款）](https://openai.com/policies/terms-of-use/)及服务特定条款对针对其 Web 服务的自动化或程序化提取数据/Output（例如 Web 抓取、脚本化采集等）有明确限制。个人、本地、交互式或非商业用途并不构成对这些条款的豁免。本项目通过标准 Chrome DevTools Protocol (CDP) 连接本机 `127.0.0.1:9222` 端口上已登录的个人浏览器会话，仅作为本地交互式结对编程与辅助研究的便利桥梁，**绝非** OpenAI 官方 API 客户端，亦非任何商业化批量抓取管道。
+> - **OpenAI 服务条款与程序化提取限制说明**：OpenAI 的 [Terms of Use（服务条款）](https://openai.com/policies/terms-of-use/) 对自动化或程序化提取数据与 Output 有明确限制；其他特定服务条款与政策亦可能适用。个人、本地、交互式或非商业用途并不构成对这些条款的豁免。本项目通过标准 Chrome DevTools Protocol (CDP) 连接本机 `127.0.0.1:9222` 端口上已登录的个人浏览器会话，仅作为本地交互式结对编程与辅助研究的便利桥梁，**绝非** OpenAI 官方 API 客户端，亦非任何商业化批量抓取管道。
 > - **用户合规责任**：用户在使用本项目与 ChatGPT Web 交互时，须严格自行遵守所有适用的 OpenAI 条款、政策及合理使用频次准则。在 Web 界面上使用程序化交互存在固有的会话失效、触发人机验证（CAPTCHA）或账号受限风险。如需用于生产环境、高吞吐或具 SLA 保障的调用，请使用 OpenAI 官方提供的开放平台 API。
 > - **免责声明**：本项目不破解、不绕过任何付费限制或风控防护。因个人使用不当导致的账号受限、会话中断或任何其他影响，本项目及作者概不承担任何直接或间接法律责任。
 

@@ -11,9 +11,11 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { resolveSafePath, isPathContained, SecurityError } from '../src/security/path_guard.mjs';
 import { sanitizeContent, isSensitivePath, redactSensitive } from '../src/security/sensitive.mjs';
-import { runBrainTask } from '../src/brain/orchestrator.mjs';
+import { runBrainTask, parseEvidenceRequests } from '../src/brain/orchestrator.mjs';
 import { recordExecution } from '../src/execution/recorder.mjs';
 import { getUntrackedEvidence, truncateUtf8ByBytes, getGitDiff, getReviewEvidence } from '../src/git/git_helper.mjs';
 import { evaluate, getInjectionTimeout, SUBMIT_STATUS, insertTextReliable, submitMessageReliable } from '../src/transport/cdp_transport.mjs';
@@ -380,15 +382,54 @@ async function runAsyncTests() {
   });
 
   // ---------------------------------------------------------------------------
-  // 12. Git Diff 分页接口与预算受限测试
+  // 12. Git Diff 分页接口与真实跨边界凭据脱敏测试
   // ---------------------------------------------------------------------------
-  console.log('\n12. Git Diff 分页接口与预算受限测试:');
+  console.log('\n12. Git Diff 分页接口与真实跨边界凭据脱敏测试:');
 
-  test('getGitDiff 分页与 UTF-8 字节预算控制', () => {
-    const diffRes = getGitDiff(process.cwd(), { maxBytes: 500, offset: 0 });
-    assert.ok(typeof diffRes.hasDiff === 'boolean');
-    assert.ok(diffRes.returnedBytes <= 500);
-    assert.ok(Buffer.byteLength(diffRes.diff, 'utf8') <= 500);
+  test('getGitDiff 真实临时 Git 仓库跨分页边界凭据脱敏与分页切片验证', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-boundary-test-'));
+    try {
+      // 1. 初始化临时 Git 仓库并设置用户身份
+      spawnSync('git', ['init', '-b', 'main'], { cwd: tempDir, encoding: 'utf8' });
+      spawnSync('git', ['config', 'user.name', 'TestUser'], { cwd: tempDir, encoding: 'utf8' });
+      spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: tempDir, encoding: 'utf8' });
+
+      // 2. 创建初始提交
+      const testFile = path.join(tempDir, 'credentials.js');
+      fs.writeFileSync(testFile, '// Initial empty line\n', 'utf8');
+      spawnSync('git', ['add', '.'], { cwd: tempDir, encoding: 'utf8' });
+      spawnSync('git', ['commit', '-m', 'Initial commit'], { cwd: tempDir, encoding: 'utf8' });
+
+      // 3. 构造跨边界 payload：
+      // 多字节中文字符 + 敏感 OpenAI API Key + 多行数据
+      const mockKey = ['sk', 'proj', 'ABCD1234EFGH5678IJKL9012MNOP34567890QRSTUV'].join('-');
+      const filler1 = 'console.log("中文填充行：世界你好！测试边界对齐与UTF-8多字节");\n';
+      const secretLine = `const secretKey = "${mockKey}";\n`;
+      const filler2 = 'console.log("后续测试代码行...");\n'.repeat(10);
+      fs.writeFileSync(testFile, filler1 + secretLine + filler2, 'utf8');
+
+      // 4. 读取第 1 页，预算设为 250 字节
+      const page1 = getGitDiff(tempDir, { maxBytes: 250, offset: 0, head: true });
+      assert.equal(page1.hasDiff, true);
+      assert.equal(page1.hasMore, true);
+      assert.ok(page1.nextOffset > 0);
+      assert.ok(page1.returnedBytes <= 250);
+      // 绝对不能包含未脱敏的 key 及其任何片段
+      assert.ok(!page1.diff.includes(mockKey), 'Page 1 泄露了未脱敏密钥！');
+      assert.ok(!page1.diff.includes('ABCD1234EFGH'), 'Page 1 泄露了部分未脱敏密钥片段！');
+
+      // 5. 读取第 2 页（从 page1.nextOffset 开始）
+      const page2 = getGitDiff(tempDir, { maxBytes: 400, offset: page1.nextOffset, head: true });
+      assert.equal(page2.hasDiff, true);
+      assert.ok(page2.returnedBytes <= 400);
+      // 验证第 2 页成功匹配脱敏掩码，且绝不包含未脱敏的残余片段
+      assert.ok(!page2.diff.includes(mockKey), 'Page 2 泄露了未脱敏密钥！');
+      assert.ok(!page2.diff.includes('ABCD1234EFGH'), 'Page 2 泄露了跨界密钥残留！');
+      assert.ok(!page2.diff.includes('MNOP34567890'), 'Page 2 泄露了跨界密钥尾部！');
+      assert.ok(page2.diff.includes('[REDACTED_OPENAI_KEY]') || page2.diff.includes('[REDACTED_SECRET]'), 'Page 2 未能匹配脱敏掩码！');
+    } finally {
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
   });
 
   test('getGitDiff 越界 offset 优雅返回空 diff', () => {
@@ -419,15 +460,45 @@ async function runAsyncTests() {
   });
 
   // ---------------------------------------------------------------------------
-  // 14. 词法路径安全防御软链接假阳性回归测试
+  // 14. 真实软链接/Junction 根目录防逃逸测试
   // ---------------------------------------------------------------------------
-  console.log('\n14. 词法路径安全防御软链接假阳性回归测试:');
+  console.log('\n14. 真实软链接/Junction 根目录防逃逸测试:');
 
-  test('resolveSafePath 词法收敛与子目录解析无物理路径误杀', () => {
-    const testRoot = process.cwd();
-    const safeFile = resolveSafePath(testRoot, 'package.json');
-    assert.ok(safeFile.toLowerCase().endsWith('package.json'));
-    assert.throws(() => resolveSafePath(testRoot, '../escape.js'), SecurityError);
+  test('resolveSafePath 真实临时软链接/Junction 根目录正常解析与跨界拦截', () => {
+    const realRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'symlink-real-root-'));
+    const linkRoot = path.join(os.tmpdir(), 'symlink-link-root-' + Date.now().toString(36));
+    try {
+      // 在真实目录下创建测试文件
+      fs.writeFileSync(path.join(realRoot, 'index.js'), 'console.log("hello");', 'utf8');
+      fs.mkdirSync(path.join(realRoot, 'sub'), { recursive: true });
+      fs.writeFileSync(path.join(realRoot, 'sub', 'nested.txt'), 'nested content', 'utf8');
+
+      // 创建软链接或 Junction 根目录
+      const symlinkType = process.platform === 'win32' ? 'junction' : 'dir';
+      fs.symlinkSync(realRoot, linkRoot, symlinkType);
+
+      // 测试 1: 软链接根目录下的正常文件解析成功，不报 E_WORKSPACE_ESCAPE
+      const resolvedFile = resolveSafePath(linkRoot, 'index.js');
+      assert.ok(resolvedFile.toLowerCase().includes('index.js'));
+
+      // 测试 2: 软链接根目录下的子目录文件解析成功
+      const resolvedNested = resolveSafePath(linkRoot, 'sub/nested.txt');
+      assert.ok(resolvedNested.toLowerCase().includes('nested.txt'));
+
+      // 测试 3: 尝试从软链接根目录向上逃逸跨界，必须严格拦截并抛出 SecurityError
+      assert.throws(() => resolveSafePath(linkRoot, '../outside.txt'), (err) => {
+        return err instanceof SecurityError && err.code === 'E_WORKSPACE_ESCAPE';
+      });
+    } finally {
+      try {
+        if (process.platform === 'win32') {
+          fs.rmdirSync(linkRoot);
+        } else {
+          fs.unlinkSync(linkRoot);
+        }
+      } catch {}
+      try { fs.rmSync(realRoot, { recursive: true, force: true }); } catch {}
+    }
   });
 
   // ---------------------------------------------------------------------------
@@ -546,15 +617,18 @@ async function runAsyncTests() {
   console.log('\n16. 提交强收据状态机测试:');
 
   await testAsync('submitMessageReliable: User Turn 计数增加判定 SUBMITTED', async () => {
-    let probeIndex = 0;
+    let callCount = 0;
     const mockCdp = {
       send: async (method, params) => {
         if (method === 'Input.dispatchKeyEvent') return {};
         if (params.expression && params.expression.includes('isStreaming')) {
-          return { result: { value: { userTurns: 2, isStreaming: false } } };
+          callCount++;
+          // 第 1 次调用为发送前基准 (turns = 1)，后续调用为收据探测 (turns = 2)
+          const turns = callCount === 1 ? 1 : 2;
+          return { result: { value: { userTurns: turns, isStreaming: false } } };
         }
-        if (params.expression && params.expression.includes('data-message-author-role="user"')) {
-          return { result: { value: 1 } };
+        if (params.expression && params.expression.includes('pickVisible(SEND)')) {
+          return { result: { value: { action: 'CLICKED' } } };
         }
         return { result: { value: true } };
       },
@@ -573,8 +647,8 @@ async function runAsyncTests() {
           // 模拟无增量、无流式响应
           return { result: { value: { userTurns: 1, isStreaming: false } } };
         }
-        if (params.expression && params.expression.includes('data-message-author-role="user"')) {
-          return { result: { value: 1 } };
+        if (params.expression && params.expression.includes('pickVisible(SEND)')) {
+          return { result: { value: { action: 'CLICKED' } } };
         }
         return { result: { value: true } };
       },
@@ -583,6 +657,112 @@ async function runAsyncTests() {
     const submitRes = await submitMessageReliable(mockCdpUnknown, { checkTimeoutMs: 500 });
     assert.equal(submitRes.status, SUBMIT_STATUS.UNKNOWN);
     assert.equal(submitRes.beforeUserTurns, 1);
+  });
+
+  await testAsync('submitMessageReliable: 基准探测失败严禁假定为 0，直接进入 UNKNOWN', async () => {
+    const mockCdpBaselineFail = {
+      send: async (method, params) => {
+        if (params?.expression?.includes('data-message-author-role="user"')) {
+          throw new Error('CDP Evaluate Error: target context destroyed');
+        }
+        return { result: { value: null } };
+      },
+    };
+    const res = await submitMessageReliable(mockCdpBaselineFail);
+    assert.equal(res.status, SUBMIT_STATUS.UNKNOWN);
+    assert.equal(res.reason, 'baseline_probe_failed');
+  });
+
+  await testAsync('submitMessageReliable: 预先存在流式输出时不误判为新提交收据 (防假阳性)', async () => {
+    const mockCdpPreStreaming = {
+      send: async (method, params) => {
+        if (method === 'Input.dispatchKeyEvent') return {};
+        if (params.expression && params.expression.includes('isStreaming')) {
+          // 发送前已在流式输出，发送后仍是 1 轮且在流式输出
+          return { result: { value: { userTurns: 1, isStreaming: true } } };
+        }
+        return { result: { value: true } };
+      },
+    };
+    const submitRes = await submitMessageReliable(mockCdpPreStreaming, { checkTimeoutMs: 500 });
+    assert.equal(submitRes.status, SUBMIT_STATUS.UNKNOWN);
+    assert.equal(submitRes.beforeUserTurns, 1);
+  });
+
+  await testAsync('submitMessageReliable: 流式状态由 false 跃迁至 true 触发边沿收据判定 SUBMITTED', async () => {
+    let probeCount = 0;
+    const mockCdpEdgeTrigger = {
+      send: async (method, params) => {
+        if (method === 'Input.dispatchKeyEvent') return {};
+        if (params.expression && params.expression.includes('isStreaming')) {
+          probeCount++;
+          // 第 1 次调用是基准：isStreaming 为 false
+          // 后续轮询：isStreaming 变为 true
+          return { result: { value: { userTurns: 1, isStreaming: probeCount > 1 } } };
+        }
+        return { result: { value: true } };
+      },
+    };
+    const submitRes = await submitMessageReliable(mockCdpEdgeTrigger);
+    assert.equal(submitRes.status, SUBMIT_STATUS.SUBMITTED);
+    assert.equal(submitRes.streamingTransition, true);
+  });
+
+  await testAsync('submitMessageReliable: 发送按钮禁用时严禁回车且明确返回 NOT_SUBMITTED', async () => {
+    let enterDispatched = false;
+    const mockCdpDisabled = {
+      send: async (method, params) => {
+        if (method === 'Input.dispatchKeyEvent') {
+          enterDispatched = true;
+          return {};
+        }
+        if (params.expression && params.expression.includes('isStreaming')) {
+          return { result: { value: { userTurns: 1, isStreaming: false } } };
+        }
+        if (params.expression && params.expression.includes('pickVisible(SEND)')) {
+          return { result: { value: { action: 'DISABLED' } } };
+        }
+        return { result: { value: true } };
+      },
+    };
+    const submitRes = await submitMessageReliable(mockCdpDisabled);
+    assert.equal(submitRes.status, SUBMIT_STATUS.NOT_SUBMITTED);
+    assert.equal(submitRes.reason, 'send_button_disabled');
+    assert.equal(enterDispatched, false, '按钮禁用时不应触发 Enter 按键派发');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 17. 闭环证据拉取协议标签解析测试 (parseEvidenceRequests)
+  // ---------------------------------------------------------------------------
+  console.log('\n17. 闭环证据拉取协议标签解析测试:');
+
+  test('parseEvidenceRequests 正确解析 git_diff 与 read_file 证据标签', () => {
+    const rawModelOutput = `
+I need more context before issuing my verdict.
+<EVIDENCE_REQUEST>
+{ "type": "git_diff", "offset": 32768, "maxBytes": 16384 }
+</EVIDENCE_REQUEST>
+
+Also need to check another file:
+<EVIDENCE_REQUEST>
+\`\`\`json
+{ "type": "read_file", "path": "src/security/path_guard.mjs" }
+\`\`\`
+</EVIDENCE_REQUEST>
+`;
+    const reqs = parseEvidenceRequests(rawModelOutput);
+    assert.equal(reqs.length, 2);
+    assert.equal(reqs[0].type, 'git_diff');
+    assert.equal(reqs[0].offset, 32768);
+    assert.equal(reqs[0].maxBytes, 16384);
+    assert.equal(reqs[1].type, 'read_file');
+    assert.equal(reqs[1].path, 'src/security/path_guard.mjs');
+  });
+
+  test('parseEvidenceRequests 优雅处理无标签或畸变内容', () => {
+    assert.deepEqual(parseEvidenceRequests('Normal text without request'), []);
+    assert.deepEqual(parseEvidenceRequests('<EVIDENCE_REQUEST>invalid json{</EVIDENCE_REQUEST>'), []);
+    assert.deepEqual(parseEvidenceRequests(null), []);
   });
 
   console.log(`\n========================================`);

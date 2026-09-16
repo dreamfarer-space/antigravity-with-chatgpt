@@ -14,7 +14,7 @@ import { spawnSync } from 'node:child_process';
 import { resolveSafePath, SecurityError } from '../security/path_guard.mjs';
 import { isSensitivePath, sanitizeContent } from '../security/sensitive.mjs';
 import { loadBrainIgnore } from '../security/ignore.mjs';
-import { getGitStatus } from '../git/git_helper.mjs';
+import { getGitStatus, truncateUtf8ByBytes } from '../git/git_helper.mjs';
 
 const DEFAULT_FILE_MAX_BYTES = 128 * 1024; // 128 KB per file
 const BINARY_CHECK_BYTES = 4096;
@@ -111,19 +111,20 @@ export function readFileSafe(workspaceRoot, filePath, options = {}) {
   const maxLines = options.maxLines || totalLines;
   const slicedLines = allLines.slice(startIdx, startIdx + maxLines);
 
-  let resultText = slicedLines.join('\n');
+  const rawText = slicedLines.join('\n');
+  const sanitized = sanitizeContent(rawText);
+
+  let resultText = sanitized;
   let truncated = false;
 
   if (Buffer.byteLength(resultText, 'utf8') > maxBytes) {
-    resultText = resultText.slice(0, maxBytes);
+    resultText = truncateUtf8ByBytes(resultText, maxBytes);
     truncated = true;
   }
 
-  const sanitized = sanitizeContent(resultText);
-
   return {
     path: relPath,
-    content: sanitized,
+    content: resultText,
     startLine,
     linesRead: slicedLines.length,
     totalLines,

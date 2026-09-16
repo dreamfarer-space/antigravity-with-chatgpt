@@ -709,56 +709,119 @@ export const SUBMIT_STATUS = Object.freeze({
 export async function submitMessageReliable(cdp, options = {}) {
   const checkTimeoutMs = typeof options === 'number' ? options : (options.checkTimeoutMs || 10000);
 
-  // 1. 记录发送前 User Turns 计数作为强收据基准
-  const beforeUserTurns = await evaluate(cdp, `(() => {
-    return document.querySelectorAll('[data-message-author-role="user"]').length;
-  })()`, 5000).catch(() => 0);
+  // 1. 强制获取发送前 User Turns 与流式状态作为强基准证据 (Mandatory Baseline)
+  const baselineProbeScript = `(() => {
+    const us = document.querySelectorAll('[data-message-author-role="user"]').length;
+    const stop = document.querySelector('button[data-testid="stop-button"]') ||
+                 document.querySelector('button[aria-label*="Stop" i]') ||
+                 document.querySelector('button[aria-label*="停止"]');
+    return {
+      userTurns: us,
+      isStreaming: Boolean(stop),
+    };
+  })()`;
 
-  // 2. 点击发送按钮或回车
-  let clicked = false;
+  let baseline = null;
+  try {
+    baseline = await evaluate(cdp, baselineProbeScript, 5000);
+  } catch (err) {
+    // 基准探测失败：严禁盲目假定为 0（在已有对话页面中会产生严重假阳性），直接进入 UNKNOWN
+    return {
+      status: SUBMIT_STATUS.UNKNOWN,
+      reason: 'baseline_probe_failed',
+      error: err.message,
+    };
+  }
+
+  if (!baseline || typeof baseline.userTurns !== 'number' || typeof baseline.isStreaming !== 'boolean') {
+    return {
+      status: SUBMIT_STATUS.UNKNOWN,
+      reason: 'baseline_probe_invalid',
+    };
+  }
+
+  // 2. 检查并调度发送动作 (Click vs Enter)
+  const clickProbeScript = `(() => {
+    ${PRELUDE}
+    const SEND = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
+    const b = pickVisible(SEND);
+    if (!b) return { action: 'NOT_FOUND' };
+    const disabled = Boolean(b.el.disabled || b.el.getAttribute('aria-disabled') === 'true');
+    if (disabled) return { action: 'DISABLED' };
+    try {
+      b.el.click();
+      return { action: 'CLICKED' };
+    } catch (err) {
+      return { action: 'CLICK_ERROR', error: err.message };
+    }
+  })()`;
+
+  let clickRes = null;
   const deadline = Date.now() + 3000;
   while (Date.now() < deadline) {
-    clicked = await evaluate(cdp, `(() => {
-      ${PRELUDE}
-      const SEND = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
-      const b = pickVisible(SEND);
-      if (b && !b.el.disabled && b.el.getAttribute('aria-disabled') !== 'true') {
-        b.el.click();
-        return true;
+    try {
+      clickRes = await evaluate(cdp, clickProbeScript, 3000);
+      if (clickRes && (clickRes.action === 'CLICKED' || clickRes.action === 'DISABLED')) {
+        break;
       }
-      return false;
-    })()`).catch(() => false);
-    if (clicked) break;
+    } catch (err) {
+      // evaluate 异常：无法确认 click 是否已在页面发生，标记为 CLICK_UNKNOWN
+      clickRes = { action: 'CLICK_UNKNOWN', error: err.message };
+      break;
+    }
     await sleep(200);
   }
 
-  if (!clicked) {
-    const base = { windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, code: 'Enter', key: 'Enter' };
-    await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base, text: '\r', unmodifiedText: '\r' }, 10000);
-    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base }, 10000);
+  let enterDispatched = false;
+  if (!clickRes || clickRes.action === 'NOT_FOUND') {
+    // 发送按钮确不存在，回退 Enter 键
+    try {
+      const base = { windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, code: 'Enter', key: 'Enter' };
+      await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base, text: '\r', unmodifiedText: '\r' }, 10000);
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base }, 10000);
+      enterDispatched = true;
+    } catch (err) {
+      return {
+        status: SUBMIT_STATUS.NOT_SUBMITTED,
+        reason: 'dispatch_enter_failed',
+        error: err.message,
+        beforeUserTurns: baseline.userTurns,
+      };
+    }
+  } else if (clickRes.action === 'DISABLED') {
+    // 发送按钮明确为禁用状态（如输入框为空或未就绪），严禁回车，明确返回 NOT_SUBMITTED
+    return {
+      status: SUBMIT_STATUS.NOT_SUBMITTED,
+      reason: 'send_button_disabled',
+      beforeUserTurns: baseline.userTurns,
+    };
   }
+  // 若 clickRes.action 为 'CLICK_UNKNOWN' 或 'CLICK_ERROR'，严禁盲目发送 Enter（防双重提交），直接通过后续收据验证
 
-  // 3. 强收据轮询验证 (User turn 计数递增 或 Stop 按钮出现)
+  // 3. 强收据轮询验证 (User turn 计数递增 或 流式边沿触发)
   const checkDeadline = Date.now() + checkTimeoutMs;
   while (Date.now() < checkDeadline) {
     await sleep(300);
-    const receipt = await evaluate(cdp, `(() => {
-      const us = document.querySelectorAll('[data-message-author-role="user"]').length;
-      const stop = document.querySelector('button[data-testid="stop-button"]') ||
-                   document.querySelector('button[aria-label*="Stop" i]') ||
-                   document.querySelector('button[aria-label*="停止"]');
-      return {
-        userTurns: us,
-        isStreaming: Boolean(stop),
-      };
-    })()`, 4000).catch(() => null);
+    const receipt = await evaluate(cdp, baselineProbeScript, 4000).catch(() => null);
 
-    if (receipt) {
-      if (receipt.userTurns > beforeUserTurns || receipt.isStreaming) {
+    if (receipt && typeof receipt.userTurns === 'number') {
+      // 强收据 1：User Turns 计数绝对递增
+      if (receipt.userTurns > baseline.userTurns) {
         return {
           status: SUBMIT_STATUS.SUBMITTED,
-          beforeUserTurns,
+          beforeUserTurns: baseline.userTurns,
           afterUserTurns: receipt.userTurns,
+          method: clickRes?.action === 'CLICKED' ? 'click' : (enterDispatched ? 'enter' : 'click_fallback'),
+        };
+      }
+      // 强收据 2：流式状态边沿触发 (必须从 false 跃迁至 true，排除前一条遗留流式响应)
+      if (!baseline.isStreaming && receipt.isStreaming) {
+        return {
+          status: SUBMIT_STATUS.SUBMITTED,
+          beforeUserTurns: baseline.userTurns,
+          afterUserTurns: receipt.userTurns,
+          streamingTransition: true,
+          method: clickRes?.action === 'CLICKED' ? 'click' : (enterDispatched ? 'enter' : 'click_fallback'),
         };
       }
     }
@@ -767,7 +830,10 @@ export async function submitMessageReliable(cdp, options = {}) {
   // 4. 超时未确认强收据 -> UNKNOWN 状态，严禁自动重试
   return {
     status: SUBMIT_STATUS.UNKNOWN,
-    beforeUserTurns,
+    beforeUserTurns: baseline.userTurns,
+    reason: 'receipt_timeout',
+    clickAction: clickRes?.action || 'NONE',
+    enterDispatched,
   };
 }
 
@@ -857,6 +923,10 @@ async function _sendPromptViaCdpInternal({ prompt, mode = 'reuse', timeoutS = 60
     // 可靠注入与强收据提交
     await insertTextReliable(cdp, prompt);
     const submitReceipt = await submitMessageReliable(cdp);
+
+    if (submitReceipt.status === SUBMIT_STATUS.NOT_SUBMITTED) {
+      throw new Error(`提交消息未执行 (NOT_SUBMITTED): ${submitReceipt.reason || '发送动作未触发'}`);
+    }
 
     if (submitReceipt.status === SUBMIT_STATUS.UNKNOWN) {
       // 提交状态未知：二次检查是否已在回复流中

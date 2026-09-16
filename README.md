@@ -223,7 +223,9 @@ node scripts/ask_chatgpt.mjs --doctor
 
 | Tool | Description | Key Parameters |
 | :--- | :--- | :--- |
-| **`ask_chatgpt`** | Delegates complex reasoning, planning, or review to ChatGPT Web | `prompt` (required): Prompt text<br>`mode`: `ask` / `plan` / `review` / `derive` / `diagnose`<br>`files`: Array of relative file paths to attach<br>`gitDiff`: Boolean to attach real Git diff<br>`session`: `reuse` or `new`<br>`timeout`: Max seconds to wait (default 600) |
+| **`ask_chatgpt`** | Delegates complex reasoning, planning, or review to ChatGPT Web | `prompt` (required): Prompt text<br>`mode`: `ask` / `plan` / `review` / `derive` / `diagnose`<br>`files`: Array of relative file paths to attach<br>`gitDiff`: Boolean to attach real Git diff<br>`diffOffset`: Number (byte offset for diff pagination)<br>`diffMaxBytes`: Number (max bytes per diff page, default 32768)<br>`session`: `reuse` or `new`<br>`timeout`: Max seconds to wait (default 600) |
+| **`get_git_diff_page`** | Fetches paginated real Git diff slices with strict byte budgets | `workspace`: Optional root path<br>`offset`: Starting byte offset (default 0)<br>`maxBytes`: Max bytes (default 32768, max 65536)<br>`head`: Boolean (default true)<br>`staged`: Boolean (default false)<br>`file`: Optional file path |
+| **`read_review_file`** | Safely reads local code files under path sandbox and budget limits | `path` (required): Relative file path<br>`workspace`: Optional root path<br>`maxBytes`: Max bytes (default 32768) |
 | **`chatgpt_status`** | Probes Chrome CDP 9222 connectivity and workspace readiness | `workspace`: Optional root path |
 | **`record_execution`** | Stores command execution and test results for closed-loop review | `command` (required): Executed command<br>`exitCode` (required): Process exit code<br>`output`: Output log snippet<br>`testSummary`: Test pass/fail counts |
 
@@ -240,23 +242,6 @@ Executed automatically in GitHub Actions on every push and pull request across U
 npm test
 # Equivalent to: node tests/security_adversarial.test.mjs
 ```
-
-**Automated Tests (37/37 Passing in CI):**
-- **Path Guard Security**: Relative `../` traversal, deep traversal, absolute paths, NUL byte injection, safe resolution, and symlink root containment (6/6)
-- **Sensitive Credential Redaction**: Multi-line PEM keys, spaced secret assignments, colon assignments, Bearer tokens, and sensitive path rules (5/5)
-- **Egress Sanitization**: Real-time filtering on Git diffs and command execution output (2/2)
-- **Orchestrator Defensive Contracts**: Type validation and rejection of empty/invalid inputs (2/2)
-- **Execution Recorder Contract**: Strict non-coercing integer validation on exit codes (rejecting `false`, `""`, `"0"`, `[]`, `NaN`) (4/4)
-- **CDP evaluate & awaitPromise**: Regression testing for default non-promise vs. async promise evaluation (2/2)
-- **Untracked File Evidence**: Safe text extraction, binary skipping, and sensitive masking (1/1)
-- **UTF-8 Byte Budget Truncation**: Non-destructive multi-byte UTF-8 character boundary preservation (1/1)
-- **FNV-1a Fingerprint & Order Sensitivity**: Order-sensitive hashing (`"abc"` vs `"cba"`) and 100% isomorphic parity between Node.js and browser snippet (2/2)
-- **Adaptive Injection Timeout**: Dynamic tier calculations across payload sizes (20s to 180s) (1/1)
-- **Target Selection State Machine**: Initial binding, sticky reuse, and fail-closed isolation preventing silent tab drift (4/4)
-- **Git Diff Pagination & Strict Byte Budget**: Offset slicing, remaining bytes, and strict UTF-8 byte limits (2/2)
-- **Strict Byte Accounting for Untracked Evidence**: Strict byte bounds with headers, markdown fences, and markers included (1/1)
-- **CDP Timeout Recovery & Idempotent Retry**: Recovery on evaluate timeout via fingerprint probing, preventing duplicate text insertion (2/2)
-- **Receipt-Based Submission State Machine**: SUBMITTED verification via user turns and fail-closed UNKNOWN handling (2/2)
 
 ### 2. Local Environment Verification & Live Integration (`npm run verify`)
 Runs local sanity checks and optional live end-to-end integration tests with an active Chrome session:
@@ -276,7 +261,7 @@ node scripts/verify_install.mjs --run-test
 > [!IMPORTANT]
 > **Legal & Compliance Notice:**
 > - **Personal Research & Workflow Tool**: `antigravity-with-chatgpt` is an open-source experimental developer tool designed for personal workflow augmentation, dual-brain reasoning research, and local verification pairing Antigravity with web-based LLMs.
-> - **OpenAI Terms of Use & Automated Extraction Restrictions**: OpenAI's [Terms of Use](https://openai.com/policies/terms-of-use/) and Service Terms contain explicit restrictions against automated or programmatic extraction of data or Output from web services (such as web scraping, harvesting, or scripted extraction). Personal, local, interactive, or non-commercial use should not be assumed to create an exemption from those Terms. This project connects locally via Chrome DevTools Protocol (CDP) on `127.0.0.1:9222` to an existing authenticated user session purely as a developer convenience bridge for personal, interactive pair-programming. It is **not** an official OpenAI API client, an automated scraping pipeline, or a commercial extraction tool.
+> - **OpenAI Terms of Use & Automated Extraction Restrictions**: OpenAI's [Terms of Use](https://openai.com/policies/terms-of-use/) explicitly restrict automated or programmatic extraction of data or Output; additional Service Terms and policies may also apply. Personal, local, interactive, or non-commercial use should not be assumed to create an exemption from those Terms. This project connects locally via Chrome DevTools Protocol (CDP) on `127.0.0.1:9222` to an existing authenticated user session purely as a developer convenience bridge for personal, interactive pair-programming. It is **not** an official OpenAI API client, an automated scraping pipeline, or a commercial extraction tool.
 > - **User Responsibility**: Users are solely responsible for ensuring that their use complies with all applicable OpenAI terms, policies, and fair-use guidelines. Interacting programmatically with web interfaces carries inherent risks (including session invalidation, CAPTCHA challenges, or account restrictions). For production, high-throughput, or SLA-backed programmatic access, please use official OpenAI Platform APIs.
 > - **No Warranties or Guarantees**: This project does not circumvent paywalls, rate limits, or account restrictions. The maintainers do not assume any liability for account restrictions, session termination, or any other impacts resulting from the use of this software.
 

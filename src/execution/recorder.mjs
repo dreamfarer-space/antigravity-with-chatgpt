@@ -55,8 +55,10 @@ export function recordExecution(entry) {
   };
 
   if (entry.output) {
-    const raw = String(entry.output).slice(0, 16 * 1024); // 最多保留 16KB
-    record.output = sanitizeContent(raw);
+    // P1: Canonical sanitization first!
+    // Sanitize before truncation to prevent boundary-split secrets
+    const sanitized = sanitizeContent(String(entry.output));
+    record.output = sanitized.length > 16 * 1024 ? sanitized.slice(0, 16 * 1024) : sanitized;
   }
 
   const line = JSON.stringify(record) + '\n';

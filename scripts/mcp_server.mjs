@@ -11,12 +11,27 @@
  * 严格标准：所有调试信息必须写入 stderr，stdout 严格保留给合法 JSON-RPC 消息！
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 import { runBrainTask } from '../src/brain/orchestrator.mjs';
 import { MODES } from '../src/brain/prompts.mjs';
 import { checkCdpStatus } from '../src/transport/cdp_transport.mjs';
 import { recordExecution } from '../src/execution/recorder.mjs';
-import { getWorkspaceInfo } from '../src/workspace/context_provider.mjs';
+import { getWorkspaceInfo, readFileSafe } from '../src/workspace/context_provider.mjs';
+import { getGitDiff } from '../src/git/git_helper.mjs';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PKG_VERSION = (() => {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '../package.json'), 'utf8'));
+    return pkg.version || '2.1.5';
+  } catch {
+    return '2.1.5';
+  }
+})();
 
 function log(...args) {
   process.stderr.write(`[mcp-server] ${args.join(' ')}\n`);
@@ -68,6 +83,16 @@ const TOOLS = [
           type: 'boolean',
           description: '是否自动附带工作区当前的真实 Git Diff（在 review 与 diagnose 模式下默认自动开启）',
         },
+        diffOffset: {
+          type: 'number',
+          description: 'Git Diff 分页起始偏移量（字节，从 0 开始，用于拉取后续 diff 切片）',
+          default: 0,
+        },
+        diffMaxBytes: {
+          type: 'number',
+          description: 'Git Diff 单次最大字节预算限制（默认 32768，上限 65536）',
+          default: 32768,
+        },
         timeout: {
           type: 'number',
           description: '等待 ChatGPT 回复的最长超时时间（秒），默认 600',
@@ -75,6 +100,70 @@ const TOOLS = [
         },
       },
       required: ['prompt'],
+    },
+  },
+  {
+    name: 'get_git_diff_page',
+    description:
+      '按需提取工作区真实 Git Diff 的指定分页切片（受字节预算与统一脱敏保护）。' +
+      '用于闭环审查中响应 ChatGPT 发起的 <EVIDENCE_REQUEST>，或由外部 Agent 按需翻页。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workspace: {
+          type: 'string',
+          description: '可选的工作区根目录路径（默认当前目录）',
+        },
+        offset: {
+          type: 'number',
+          description: '分页起始字节偏移量 (从 0 开始)',
+          default: 0,
+        },
+        maxBytes: {
+          type: 'number',
+          description: '单次提取的最大字节预算（默认 32768，上限 65536）',
+          default: 32768,
+        },
+        head: {
+          type: 'boolean',
+          description: '是否对比 HEAD（涵盖暂存与未暂存变更，默认 true）',
+          default: true,
+        },
+        staged: {
+          type: 'boolean',
+          description: '是否仅对比已暂存变更（默认 false）',
+          default: false,
+        },
+        file: {
+          type: 'string',
+          description: '可选的特定文件路径过滤',
+        },
+      },
+    },
+  },
+  {
+    name: 'read_review_file',
+    description:
+      '安全读取工作区内指定代码文件（受防逃逸沙箱、敏感文件过滤与字节预算保护）。' +
+      '用于响应闭环审查中对特定文件的全文或片段事实请求。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: '待读取的目标文件路径（工作区内相对路径）',
+        },
+        workspace: {
+          type: 'string',
+          description: '可选的工作区根目录路径（默认当前目录）',
+        },
+        maxBytes: {
+          type: 'number',
+          description: '最大读取字节数（默认 32768）',
+          default: 32768,
+        },
+      },
+      required: ['path'],
     },
   },
   {
@@ -162,6 +251,8 @@ async function handleAskChatGPT(args) {
       workspace: args.workspace,
       files: args.files,
       gitDiff: args.gitDiff,
+      diffOffset: args.diffOffset,
+      diffMaxBytes: args.diffMaxBytes,
       timeout: args.timeout,
     });
 
@@ -172,6 +263,53 @@ async function handleAskChatGPT(args) {
   } catch (err) {
     return {
       content: [{ type: 'text', text: `Brain Bridge 执行异常: ${err.message}` }],
+      isError: true,
+    };
+  }
+}
+
+async function handleGetGitDiffPage(args = {}) {
+  const ws = args.workspace ? path.resolve(args.workspace) : process.cwd();
+  const offset = Math.max(0, Number(args.offset) || 0);
+  const maxBytes = Math.min(Math.max(1024, Number(args.maxBytes) || 32768), 65536);
+  const head = args.head !== false;
+  const staged = Boolean(args.staged);
+  const file = typeof args.file === 'string' ? args.file : undefined;
+
+  try {
+    const diffRes = getGitDiff(ws, { offset, maxBytes, head, staged, file });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(diffRes, null, 2) }],
+      isError: !diffRes.hasDiff && Boolean(diffRes.error),
+    };
+  } catch (err) {
+    return {
+      content: [{ type: 'text', text: `获取 Git Diff 分页失败: ${err.message}` }],
+      isError: true,
+    };
+  }
+}
+
+async function handleReadReviewFile(args = {}) {
+  if (!args || typeof args.path !== 'string' || !args.path.trim()) {
+    return {
+      content: [{ type: 'text', text: '错误: read_review_file 缺少必填参数 path' }],
+      isError: true,
+    };
+  }
+
+  const ws = args.workspace ? path.resolve(args.workspace) : process.cwd();
+  const maxBytes = Math.min(Math.max(1024, Number(args.maxBytes) || 32768), 128 * 1024);
+
+  try {
+    const fileRes = readFileSafe(ws, args.path.trim(), { maxBytes });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(fileRes, null, 2) }],
+      isError: false,
+    };
+  } catch (err) {
+    return {
+      content: [{ type: 'text', text: `读取代码文件失败: ${err.message}` }],
       isError: true,
     };
   }
@@ -263,7 +401,7 @@ async function handleRpcRequest(req) {
         capabilities: { tools: {} },
         serverInfo: {
           name: 'antigravity-with-chatgpt',
-          version: '2.1.2',
+          version: PKG_VERSION,
         },
       },
     });
@@ -290,6 +428,10 @@ async function handleRpcRequest(req) {
       res = await handleCheckStatus(args);
     } else if (name === 'record_execution') {
       res = await handleRecordExecution(args);
+    } else if (name === 'get_git_diff_page') {
+      res = await handleGetGitDiffPage(args);
+    } else if (name === 'read_review_file') {
+      res = await handleReadReviewFile(args);
     } else {
       send({
         jsonrpc: '2.0',

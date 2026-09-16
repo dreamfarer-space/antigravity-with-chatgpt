@@ -121,13 +121,12 @@ export function getGitDiff(workspaceRoot, options = {}) {
     }
 
     const rawDiff = res.stdout || '';
-    const totalBytes = Buffer.byteLength(rawDiff, 'utf8');
-
     if (!rawDiff.trim()) {
       return {
         hasDiff: false,
         diff: '',
         totalBytes: 0,
+        rawTotalBytes: 0,
         returnedBytes: 0,
         offset,
         hasMore: false,
@@ -135,12 +134,20 @@ export function getGitDiff(workspaceRoot, options = {}) {
         truncated: false,
       };
     }
+
+    // P1: Canonical sanitization first!
+    // Sanitize the full canonical diff stream before any slicing or offset calculations
+    // to prevent boundary-split secrets (e.g. API keys crossing chunk boundary) from bypassing redaction regex.
+    const sanitizedFull = sanitizeContent(rawDiff);
+    const rawTotalBytes = Buffer.byteLength(rawDiff, 'utf8');
+    const totalBytes = Buffer.byteLength(sanitizedFull, 'utf8');
 
     if (offset >= totalBytes) {
       return {
         hasDiff: false,
         diff: '',
         totalBytes,
+        rawTotalBytes,
         returnedBytes: 0,
         offset,
         hasMore: false,
@@ -149,10 +156,10 @@ export function getGitDiff(workspaceRoot, options = {}) {
       };
     }
 
-    const rawBuf = Buffer.from(rawDiff, 'utf8');
+    const safeBuf = Buffer.from(sanitizedFull, 'utf8');
     // 对齐 offset 到 UTF-8 起始字节
     let sliceStart = offset;
-    while (sliceStart > 0 && (rawBuf[sliceStart] & 0b11000000) === 0b10000000) {
+    while (sliceStart > 0 && (safeBuf[sliceStart] & 0b11000000) === 0b10000000) {
       sliceStart--;
     }
 
@@ -164,7 +171,7 @@ export function getGitDiff(workspaceRoot, options = {}) {
 
     if (remainingBytes <= maxBytes) {
       // 剩余内容完全在预算内
-      diffText = rawBuf.subarray(sliceStart).toString('utf8');
+      diffText = safeBuf.subarray(sliceStart).toString('utf8');
       hasMore = false;
       nextOffset = null;
       truncated = sliceStart > 0;
@@ -179,11 +186,11 @@ export function getGitDiff(workspaceRoot, options = {}) {
       const contentBudget = Math.max(0, maxBytes - reservedMarkerBytes);
 
       let sliceEnd = sliceStart + contentBudget;
-      while (sliceEnd > sliceStart && (rawBuf[sliceEnd] & 0b11000000) === 0b10000000) {
+      while (sliceEnd > sliceStart && (safeBuf[sliceEnd] & 0b11000000) === 0b10000000) {
         sliceEnd--;
       }
 
-      const chunkBuf = rawBuf.subarray(sliceStart, sliceEnd);
+      const chunkBuf = safeBuf.subarray(sliceStart, sliceEnd);
       const chunkText = chunkBuf.toString('utf8');
       const lastNewline = chunkText.lastIndexOf('\n');
 
@@ -206,18 +213,18 @@ export function getGitDiff(workspaceRoot, options = {}) {
       diffText = sliceText + marker;
     }
 
-    // 统一敏感信息脱敏并确保绝对满足 <= maxBytes
-    let sanitized = sanitizeContent(diffText);
-    if (Buffer.byteLength(sanitized, 'utf8') > maxBytes) {
-      sanitized = truncateUtf8ByBytes(sanitized, maxBytes);
+    // 二次防御确保绝对满足 <= maxBytes
+    if (Buffer.byteLength(diffText, 'utf8') > maxBytes) {
+      diffText = truncateUtf8ByBytes(diffText, maxBytes);
     }
 
-    const returnedBytes = Buffer.byteLength(sanitized, 'utf8');
+    const returnedBytes = Buffer.byteLength(diffText, 'utf8');
 
     return {
       hasDiff: true,
-      diff: sanitized,
+      diff: diffText,
       totalBytes,
+      rawTotalBytes,
       returnedBytes,
       offset: sliceStart,
       hasMore,
@@ -229,6 +236,7 @@ export function getGitDiff(workspaceRoot, options = {}) {
       hasDiff: false,
       diff: '',
       totalBytes: 0,
+      rawTotalBytes: 0,
       returnedBytes: 0,
       offset,
       hasMore: false,
@@ -303,6 +311,10 @@ export function getUntrackedEvidence(workspaceRoot, untrackedFiles = [], maxByte
       // 简单二元探测（含 NUL 字符通常为二进制）
       if (raw.includes('\0')) continue;
 
+      // P1: Canonical sanitization first!
+      // Sanitize before computing fileBytes and applying budget truncation
+      const sanitizedFile = sanitizeContent(raw);
+
       const header = `#### [NEW UNTRACKED FILE] \`${rel}\`\n\`\`\`\n`;
       const footer = `\n\`\`\``;
       const sep = blocks.length > 0 ? '\n\n' : '';
@@ -319,22 +331,21 @@ export function getUntrackedEvidence(workspaceRoot, untrackedFiles = [], maxByte
       }
 
       const contentBudget = remainingBytes - overheadBytes;
-      const fileBytes = Buffer.byteLength(raw, 'utf8');
-      let text = raw;
+      const fileBytes = Buffer.byteLength(sanitizedFile, 'utf8');
+      let text = sanitizedFile;
 
       if (fileBytes > contentBudget) {
         truncated = true;
         const truncMarker = '\n... [file truncated]';
         const markerBytes = Buffer.byteLength(truncMarker, 'utf8');
         if (contentBudget <= markerBytes) {
-          text = truncateUtf8ByBytes(raw, contentBudget);
+          text = truncateUtf8ByBytes(sanitizedFile, contentBudget);
         } else {
-          text = truncateUtf8ByBytes(raw, contentBudget - markerBytes) + truncMarker;
+          text = truncateUtf8ByBytes(sanitizedFile, contentBudget - markerBytes) + truncMarker;
         }
       }
 
-      const safeText = sanitizeContent(text);
-      const block = `${header}${safeText}${footer}`;
+      const block = `${header}${text}${footer}`;
       const blockTotalBytes = sepBytes + Buffer.byteLength(block, 'utf8');
 
       if (accumulated + blockTotalBytes > maxBytes) {
@@ -431,6 +442,7 @@ export function getReviewEvidence(workspaceRoot, options = {}) {
     hasDiff: Boolean(diffRes.hasDiff) || Boolean(untrackedEvidence.content),
     diff: diffRes.diff || '',
     totalDiffBytes: diffRes.totalBytes || 0,
+    rawTotalDiffBytes: diffRes.rawTotalBytes || 0,
     returnedDiffBytes: diffRes.returnedBytes || Buffer.byteLength(diffRes.diff || '', 'utf8'),
     hasMoreDiff: Boolean(diffRes.hasMore),
     nextDiffOffset: diffRes.nextOffset ?? null,

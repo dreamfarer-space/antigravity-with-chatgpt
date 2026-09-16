@@ -1,6 +1,6 @@
 {
   "name": "antigravity-with-chatgpt",
-  "version": "2.1.4",
+  "version": "2.1.5",
   "description": "Zero-dependency local developer bridge connecting Google Antigravity & Gemini agents with ChatGPT Web via Chrome CDP & native MCP.",
   "type": "module",
   "main": "src/brain/orchestrator.mjs",
