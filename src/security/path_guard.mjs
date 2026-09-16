@@ -134,10 +134,14 @@ export function canonicalizeManifestPath(workspaceRoot, p) {
     const absRoot = path.resolve(workspaceRoot);
     const rel = path.relative(absRoot, safePath);
 
+    // 段敏感逃逸检测：拒绝 '.'、'..' 以及以 '../' 或 '..\\' 开头的父级逃逸，允许合法以 '..' 开头的文件名 (如 '..foo')
+    if (!rel || rel === '.' || rel === '..' || rel.startsWith(`..${path.sep}`) || rel.startsWith('../') || rel.startsWith('..\\') || path.isAbsolute(rel)) {
+      return null;
+    }
+
     // 在 Windows 下路径分隔符为反斜杠，统一规范为正斜杠便于跨环境表现
     // 在 POSIX 系统下保持真实字符身份，严禁将合法文件名中的反斜杠字符替换为斜杠 (防路径碰撞)
     const norm = process.platform === 'win32' ? rel.replace(/\\/g, '/') : rel;
-    if (!norm || norm === '.' || norm.startsWith('..')) return null;
     return norm;
   } catch {
     return null;

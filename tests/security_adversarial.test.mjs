@@ -1060,7 +1060,13 @@ Also need to check another file:
       assert.notEqual(posixBackslash, posixSlash, 'POSIX 系统下文件名中的真实反斜杠绝不能被无条件替换为正斜杠');
     }
 
-    // 3. 证据协议清单 Confused-Deputy 防护验证
+    // 3. 段敏感逃逸与合法 .. 开头文件名测试
+    assert.equal(canonicalizeManifestPath(tmp, '..foo'), '..foo', '合法文件名 ..foo 必须允许保留');
+    assert.equal(canonicalizeManifestPath(tmp, '..config'), '..config', '合法文件名 ..config 必须允许保留');
+    assert.equal(canonicalizeManifestPath(tmp, '../foo'), null, '父级目录逃逸 ../foo 必须严格返回 null');
+    assert.equal(canonicalizeManifestPath(tmp, '..'), null, '父级目录 .. 必须严格返回 null');
+
+    // 4. 证据协议清单 Confused-Deputy 防护验证
     const safeSpacedName = ' sensitive_space.txt ';
     const manifestFiles = new Set([safeSpacedName]);
 
@@ -1072,6 +1078,52 @@ Also need to check another file:
       currentAggregateBytes: 0,
     });
     assert.ok(res.snippets.some((s) => s.includes('Security policy prevents automated reading')));
+  });
+
+  test('Evidence protocol: parseEvidenceRequests -> buildEvidenceRoundSnippets 端到端完整闭环保留首尾空格字符身份', () => {
+    // 构造真实工作区，同时存在 " secret.txt " 与 "secret.txt" 两个物理文件
+    const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'space-identity-test-'));
+    try {
+      const spacedName = ' secret.txt ';
+      const unspacedName = 'secret.txt';
+      fs.writeFileSync(path.join(testDir, spacedName), 'SPACED_FILE_CONTENT', 'utf8');
+      fs.writeFileSync(path.join(testDir, unspacedName), 'UNSPACED_FILE_CONTENT', 'utf8');
+
+      // 仅将带空格的文件放入审查允许清单
+      const manifestFiles = new Set([canonicalizeManifestPath(testDir, spacedName)]);
+      assert.ok(manifestFiles.has(' secret.txt '));
+      assert.equal(manifestFiles.has('secret.txt'), false);
+
+      // 1. 通过真实 parseEvidenceRequests 解析包含首尾空格的标签
+      const rawAiResponse = '<EVIDENCE_REQUEST>{"type":"read_file","path":" secret.txt "}</EVIDENCE_REQUEST>';
+      const parsedRequests = parseEvidenceRequests(rawAiResponse);
+      assert.equal(parsedRequests[0].path, ' secret.txt ', 'parseEvidenceRequests 严禁损毁首尾空格字符身份');
+
+      // 2. 流入 buildEvidenceRoundSnippets 并执行 readFileSafe 读取
+      const roundRes = buildEvidenceRoundSnippets({
+        requests: parsedRequests,
+        workspace: testDir,
+        reviewManifestFiles: manifestFiles,
+        currentAggregateBytes: 0,
+      });
+
+      // 必须精确读取带空格的文件内容，严禁碰撞到普通文件
+      assert.ok(roundRes.snippets.some((s) => s.includes('SPACED_FILE_CONTENT')));
+      assert.equal(roundRes.snippets.some((s) => s.includes('UNSPACED_FILE_CONTENT')), false);
+
+      // 3. 反向测试：AI 请求未授权的无空格文件 "secret.txt"，必须被清单拦截
+      const rawRejectResponse = '<EVIDENCE_REQUEST>{"type":"read_file","path":"secret.txt"}</EVIDENCE_REQUEST>';
+      const rejectRequests = parseEvidenceRequests(rawRejectResponse);
+      const rejectRoundRes = buildEvidenceRoundSnippets({
+        requests: rejectRequests,
+        workspace: testDir,
+        reviewManifestFiles: manifestFiles,
+        currentAggregateBytes: 0,
+      });
+      assert.ok(rejectRoundRes.snippets.some((s) => s.includes('Security policy prevents automated reading')));
+    } finally {
+      fs.rmSync(testDir, { recursive: true, force: true });
+    }
   });
 
   test('Evidence protocol: 审查清单完整端到端接纳 Unmerged 冲突文件读取', () => {

@@ -44,12 +44,12 @@ export function parseEvidenceRequests(text) {
             type: 'git_diff',
             offset: Math.max(0, Number(parsed.offset) || 0),
             maxBytes: Math.min(Math.max(1024, Number(parsed.maxBytes) || 32768), 65536),
-            file: typeof parsed.file === 'string' ? parsed.file.trim() : undefined,
+            file: (typeof parsed.file === 'string' && parsed.file.length > 0) ? parsed.file : undefined,
           });
-        } else if (type === 'read_file' && typeof parsed.path === 'string' && parsed.path.trim()) {
+        } else if (type === 'read_file' && typeof parsed.path === 'string' && parsed.path.length > 0) {
           requests.push({
             type: 'read_file',
-            path: parsed.path.trim(),
+            path: parsed.path,
             maxBytes: Math.min(Math.max(1024, Number(parsed.maxBytes) || 32768), 128 * 1024),
           });
         }
