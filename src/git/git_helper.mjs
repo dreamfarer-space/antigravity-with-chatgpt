@@ -150,6 +150,27 @@ export function getGitDiff(workspaceRoot, options = {}) {
 }
 
 /**
+ * 按 UTF-8 字节数安全截断字符串，防止截断多字节字符且在字节维度严格受限
+ * @param {string} text
+ * @param {number} maxBytes
+ * @returns {string}
+ */
+export function truncateUtf8ByBytes(text, maxBytes) {
+  if (typeof text !== 'string') return '';
+  if (maxBytes <= 0) return '';
+  const buf = Buffer.from(text, 'utf8');
+  if (buf.length <= maxBytes) return text;
+
+  let end = maxBytes;
+  // UTF-8 续字节特征为 10xxxxxx (0x80 <= b <= 0xBF)
+  // 若切在多字节字符的后续字节中，向前回退至该字符的起始引导字节
+  while (end > 0 && (buf[end] & 0b11000000) === 0b10000000) {
+    end--;
+  }
+  return buf.subarray(0, end).toString('utf8');
+}
+
+/**
  * 安全抽取未跟踪文本文件的代码内容（受预算限制与安全沙箱脱敏）
  * @param {string} workspaceRoot
  * @param {Array<string>} untrackedFiles
@@ -193,8 +214,9 @@ export function getUntrackedEvidence(workspaceRoot, untrackedFiles = [], maxByte
 
       const fileBytes = Buffer.byteLength(raw, 'utf8');
       let text = raw;
-      if (accumulated + fileBytes > maxBytes) {
-        text = raw.slice(0, Math.max(0, maxBytes - accumulated)) + '\n... [file truncated]';
+      const remainingBytes = Math.max(0, maxBytes - accumulated);
+      if (fileBytes > remainingBytes) {
+        text = truncateUtf8ByBytes(raw, remainingBytes) + '\n... [file truncated]';
         accumulated = maxBytes;
         truncated = true;
       } else {

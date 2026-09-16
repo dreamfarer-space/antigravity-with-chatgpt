@@ -6,7 +6,7 @@
 
 **纯原生、零 npm 依赖的 Antigravity 2.0 / Gemini 云端双脑协同与独立审查架构**
 
-*让 ChatGPT 网页版（GPT-4o / o1 / o3 / Canvas）作为本地 Google Antigravity 2.0 IDE 的云端智脑与第二推理模型*
+*将您登录的 ChatGPT Web 个人账号具备的高级推理与深度思考能力，作为本地 Google Antigravity 2.0 IDE 的独立云端“外脑”与交叉验证模型*
 
 [![CI](https://github.com/dreamfarer-space/antigravity-with-chatgpt/actions/workflows/ci.yml/badge.svg)](https://github.com/dreamfarer-space/antigravity-with-chatgpt/actions/workflows/ci.yml)
 [![Node.js Version](https://img.shields.io/badge/Node.js-%3E%3D22.0.0-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
@@ -137,6 +137,11 @@ google-chrome \
 ```
 
 > **提示**：首次启动后，请在弹出的专用 Chrome 窗口中完成一次常规 ChatGPT 网页登录。登录会话 Cookie 将保存在独立 Profile 目录中，在常规会话有效期内无需重复登录。
+>
+> [!NOTE]
+> **为什么需要 `--remote-allow-origins=*` 参数**：自 Chrome 111 起，Chromium 对 CDP 调试接口（`/devtools/...`）强制实施 Origin 来源校验。命令行或外部 Node.js 原生 WebSocket 客户端发起连接时并不携带常规浏览器来源头，若不配置此参数，Chrome 会拒绝连接并返回 HTTP 403 Forbidden。
+> 
+> **本地安全边界保障**：通过同时指定 `--remote-debugging-address=127.0.0.1`，调试端口被严格限制在操作系统本地回环地址（Loopback），杜绝了任何来自外部局域网或公网的未授权访问。
 
 ### 第三步：配置 Antigravity 2.0 全局 MCP 配置文件
 
@@ -226,26 +231,36 @@ node scripts/ask_chatgpt.mjs --doctor
 
 ## 🧪 自动化测试与对抗性安全套件
 
-本项目内置完整的自检与安全对抗测试套件，执行：
+本项目针对持续集成与本地安装分别提供自动化验证方案：
+
+### 1. 自动化 CI 测试套件 (`npm test`)
+在 GitHub Actions 持续集成流水线中自动执行，覆盖 Ubuntu、Windows 与 macOS 三大主流平台（Node 22 与 Node 24 矩阵）：
 
 ```powershell
-# 运行基础自检套件
-node scripts/verify_install.mjs
-
-# 运行安全与并发对抗性测试套件
-node tests/security_adversarial.test.mjs
+npm test
+# 等价于: node tests/security_adversarial.test.mjs
 ```
 
-**测试覆盖率与结果：**
-- ✅ **55 / 55 项细分测试 100% 全部通过（0 失败，0 告警）**
-  - 路径跨目录/NUL字符/大小写语义拦截：5/5
-  - 多行 PEM 私钥/带空格密码/Bearer Token 脱敏：5/5
-  - 出口统一脱敏（Egress Sanitization）泄漏防御：2/2
-  - 编排器输入防御性契约测试：2/2
-  - 执行证据记录器输入严格契约校验：4/4
-  - CDP evaluate 与 awaitPromise 回归测试：2/2
-  - 未跟踪文件内容提取与脱敏测试：1/1
-  - 核心架构模块完整性与 CDP 探测：34/34
+**持续集成自动化测试项 (22/22 项全绿通过):**
+- **路径安全与越界对抗 (path_guard)**：相对路径 `../` 逃逸、多级嵌套越界、绝对路径跨卷、NUL 字符注入与合法路径解析 (5/5)
+- **敏感凭据与密钥脱敏 (sensitive)**：多行 PEM 私钥、带空格/引号密码赋值、冒号单引配置、Bearer Token 与敏感文件判定 (5/5)
+- **出口统一脱敏拦截 (Egress Sanitization)**：Git Diff 与命令测试输出中的密钥泄漏拦截 (2/2)
+- **编排器输入防御性契约**：空提示词拦截与非字符串入参防御 (2/2)
+- **执行证据记录器严格类型契约**：严格无强制转换的退出码整数校验（拒绝 `false`、空串、`"0"`、数组及 NaN）(4/4)
+- **CDP evaluate 与 awaitPromise 回归测试**：普通表达式同步求值与异步 Promise 调度透传 (2/2)
+- **未跟踪文件证据提取与脱敏**：安全文本抽取、二进制跳过与敏感配置过滤 (1/1)
+- **UTF-8 字节预算边界安全截断**：非破坏性多字节字符截断与严格字节上限控制 (1/1)
+
+### 2. 本地环境自检与端到端真实推理 (`npm run verify`)
+检查本机环境依赖、模块完整性、全局挂载与真实 Chrome CDP 连通性：
+
+```powershell
+# 运行本地环境与配置自检 (34 项检查)
+npm run verify
+
+# 可选：在已运行 Chrome 的环境下执行端到端多模式推理测试
+node scripts/verify_install.mjs --run-test
+```
 
 ---
 
@@ -254,8 +269,9 @@ node tests/security_adversarial.test.mjs
 > [!IMPORTANT]
 > **法律合规与使用责任告知：**
 > - **个人开发与研究工具**：`antigravity-with-chatgpt` 为开源实验性开发者辅助工具，旨在方便个人开发者探索双脑协同推理、本地代码审查与 Antigravity 自动化交互。
-> - **CDP 自动化与 OpenAI 服务条款**：本项目通过标准 Chrome DevTools Protocol (CDP) 连接本机 `127.0.0.1:9222` 端口上运行的 Chrome。用户对 ChatGPT Web 的自动化调用须自觉遵守 [OpenAI Terms of Use（服务条款）](https://openai.com/policies/terms-of-use/) 及相关速率与使用准则。严禁用于恶意并发攻击、滥用抓取或违规商业行为。
-> - **免责声明**：本项目不破解、不绕过任何官方付费限制或风控策略。因个人使用不当导致的账号受限、封号或会话终止，本项目及作者概不承担任何直接或间接法律责任。
+> - **OpenAI 服务条款与程序化提取限制说明**：OpenAI 的 [Terms of Use（服务条款）](https://openai.com/policies/terms-of-use/)（包括第 2(c) 条及服务特定条款）对针对其 Web 服务的自动化或程序化提取数据/Output（例如 Web 抓取、大规模自动化提取等）有明确限制。本项目通过标准 Chrome DevTools Protocol (CDP) 连接本机 `127.0.0.1:9222` 端口上已登录的个人浏览器会话，仅作为本地交互式结对编程与辅助研究的便利桥梁，**绝非** OpenAI 官方 API 客户端，亦非任何商业化批量抓取管道。
+> - **用户合规责任**：用户在使用本项目与 ChatGPT Web 交互时，须严格自行遵守所有适用的 OpenAI 条款、政策及合理使用频次准则。在 Web 界面上使用程序化交互存在固有的会话失效、触发人机验证（CAPTCHA）或账号受限风险。如需用于生产环境、高吞吐或具 SLA 保障的调用，请使用 OpenAI 官方提供的开放平台 API。
+> - **免责声明**：本项目不破解、不绕过任何付费限制或风控防护。因个人使用不当导致的账号受限、会话中断或任何其他影响，本项目及作者概不承担任何直接或间接法律责任。
 
 ---
 

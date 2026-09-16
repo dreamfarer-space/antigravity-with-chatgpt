@@ -207,7 +207,7 @@ async function handleRecordExecution(args) {
       isError: true,
     };
   }
-  if (args.exitCode === undefined || args.exitCode === null || !Number.isInteger(Number(args.exitCode))) {
+  if (typeof args.exitCode !== 'number' || !Number.isInteger(args.exitCode)) {
     return {
       content: [{ type: 'text', text: '错误: recordExecution 参数 exitCode 必须为有效整数' }],
       isError: true,

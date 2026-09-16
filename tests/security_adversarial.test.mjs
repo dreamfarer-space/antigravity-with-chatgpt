@@ -15,7 +15,7 @@ import { resolveSafePath, isPathContained, SecurityError } from '../src/security
 import { sanitizeContent, isSensitivePath, redactSensitive } from '../src/security/sensitive.mjs';
 import { runBrainTask } from '../src/brain/orchestrator.mjs';
 import { recordExecution } from '../src/execution/recorder.mjs';
-import { getUntrackedEvidence } from '../src/git/git_helper.mjs';
+import { getUntrackedEvidence, truncateUtf8ByBytes } from '../src/git/git_helper.mjs';
 import { evaluate } from '../src/transport/cdp_transport.mjs';
 
 let passed = 0;
@@ -180,10 +180,16 @@ async function runAsyncTests() {
     assert.throws(() => recordExecution({ command: null }), TypeError);
   });
 
-  test('recordExecution 拦截缺失或非整数 exitCode', () => {
+  test('recordExecution 拦截缺失或非整数 exitCode (防隐式类型转换)', () => {
     assert.throws(() => recordExecution({ command: 'npm test' }), TypeError);
     assert.throws(() => recordExecution({ command: 'npm test', exitCode: 'abc' }), TypeError);
     assert.throws(() => recordExecution({ command: 'npm test', exitCode: 1.5 }), TypeError);
+    assert.throws(() => recordExecution({ command: 'npm test', exitCode: false }), TypeError);
+    assert.throws(() => recordExecution({ command: 'npm test', exitCode: true }), TypeError);
+    assert.throws(() => recordExecution({ command: 'npm test', exitCode: '' }), TypeError);
+    assert.throws(() => recordExecution({ command: 'npm test', exitCode: '0' }), TypeError);
+    assert.throws(() => recordExecution({ command: 'npm test', exitCode: [] }), TypeError);
+    assert.throws(() => recordExecution({ command: 'npm test', exitCode: NaN }), TypeError);
   });
 
   test('recordExecution 合法参数成功记录', () => {
@@ -238,6 +244,41 @@ async function runAsyncTests() {
     assert.ok(evidence.files.includes('package.json'));
     assert.ok(evidence.content.includes('[NEW UNTRACKED FILE]'));
     assert.ok(evidence.content.includes('antigravity-with-chatgpt'));
+  });
+
+  // ---------------------------------------------------------------------------
+  // 8. UTF-8 字节边界安全截断测试 (truncateUtf8ByBytes)
+  // ---------------------------------------------------------------------------
+  console.log('\n8. UTF-8 字节边界安全截断测试:');
+
+  test('truncateUtf8ByBytes 不拆散多字节 UTF-8 字符且字节数严格受限', () => {
+    const mixed = 'Hello 世界! 🚀';
+    // 'Hello ' = 6 bytes
+    // '世' = 3 bytes (E4 B8 96)
+    // '界' = 3 bytes (E7 95 8C)
+    // '!' = 1 byte
+    // ' ' = 1 byte
+    // '🚀' = 4 bytes (F0 9F 9A 80)
+    // 切在 '世' 字符中间 (7 bytes) -> 必须回退到 'Hello ' (6 bytes)
+    const t1 = truncateUtf8ByBytes(mixed, 7);
+    assert.equal(t1, 'Hello ');
+    assert.ok(Buffer.byteLength(t1, 'utf8') <= 7);
+
+    // 刚好完整容纳 '世' (9 bytes) -> 'Hello 世'
+    const t2 = truncateUtf8ByBytes(mixed, 9);
+    assert.equal(t2, 'Hello 世');
+    assert.equal(Buffer.byteLength(t2, 'utf8'), 9);
+
+    // 切在 '界' 中间 (10 bytes) -> 必须回退到 'Hello 世' (9 bytes)
+    const t3 = truncateUtf8ByBytes(mixed, 10);
+    assert.equal(t3, 'Hello 世');
+    assert.ok(Buffer.byteLength(t3, 'utf8') <= 10);
+
+    // 超过长度时返回原串
+    assert.equal(truncateUtf8ByBytes(mixed, 100), mixed);
+
+    // 空串与 0 边界
+    assert.equal(truncateUtf8ByBytes(mixed, 0), '');
   });
 
   console.log(`\n========================================`);

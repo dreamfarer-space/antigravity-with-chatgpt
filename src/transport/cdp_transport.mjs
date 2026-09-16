@@ -414,23 +414,52 @@ async function ensureCdpReady(chromeExe) {
   throw new Error('等待专用 Chrome CDP 启动超时');
 }
 
-async function resolveTarget() {
+let boundTargetId = null;
+
+export function getBoundTargetId() {
+  return boundTargetId;
+}
+
+export function setBoundTargetId(id) {
+  boundTargetId = id;
+}
+
+export function resetBoundTargetId() {
+  boundTargetId = null;
+}
+
+async function resolveTarget(preferredId = null) {
   const list = await fetch(`${HTTP_BASE}/json/list`).then((r) => r.json());
   const pages = list.filter((t) => t.type === 'page');
   const cg = pages.filter((t) => /(^|\.)chatgpt\.com$/.test((() => { try { return new URL(t.url).hostname; } catch { return ''; } })()));
 
+  // 1. 优先复用当前认领绑定的 targetId，防止多 ChatGPT 标签页时发生串号
+  const candidateId = preferredId || boundTargetId;
+  if (candidateId) {
+    const bound = cg.find((t) => t.id === candidateId && t.webSocketDebuggerUrl);
+    if (bound) {
+      boundTargetId = bound.id;
+      return bound;
+    }
+  }
+
+  // 2. 若未绑定或原标签页已关闭，认领首个可用的 ChatGPT 标签页
   if (cg.length && cg[0].webSocketDebuggerUrl) {
+    boundTargetId = cg[0].id;
     return cg[0];
   }
 
-  // 若无可用标签页，开启新标签页
+  // 3. 若无可用标签页，开启新标签页并认领
   log('新建 ChatGPT 标签页...');
   for (const method of ['PUT', 'GET']) {
     try {
       const res = await fetch(`${HTTP_BASE}/json/new?${encodeURIComponent(DEFAULT_TARGET_URL)}`, { method });
       if (res.ok) {
         const created = await res.json();
-        if (created.webSocketDebuggerUrl) return created;
+        if (created.webSocketDebuggerUrl) {
+          boundTargetId = created.id;
+          return created;
+        }
       }
     } catch {}
   }
@@ -450,12 +479,25 @@ async function clearComposer(cdp) {
     if (!c) return false;
     const el = c.el;
     el.focus();
+
+    const isTextarea = el.tagName === 'TEXTAREA' || el.tagName === 'INPUT';
+    if (isTextarea) {
+      el.value = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }
+
     const sel = window.getSelection();
     const range = document.createRange();
     range.selectNodeContents(el);
     sel.removeAllRanges();
     sel.addRange(range);
     document.execCommand('insertText', false, '');
+    if ((el.innerText || el.textContent || '').trim().length > 0) {
+      el.innerHTML = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
     return true;
   })()`);
 }
@@ -475,6 +517,20 @@ async function insertTextFast(cdp, text) {
     for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
     const str = new TextDecoder('utf-8').decode(bytes);
 
+    const isTextarea = el.tagName === 'TEXTAREA' || el.tagName === 'INPUT';
+    if (isTextarea) {
+      const start = el.selectionStart ?? el.value.length;
+      const end = el.selectionEnd ?? el.value.length;
+      if (typeof el.setRangeText === 'function') {
+        el.setRangeText(str, start, end, 'end');
+      } else {
+        el.value = str;
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return (el.value || '').length > 0;
+    }
+
     const sel = window.getSelection();
     const range = document.createRange();
     range.selectNodeContents(el);
@@ -483,6 +539,11 @@ async function insertTextFast(cdp, text) {
     sel.addRange(range);
 
     document.execCommand('insertText', false, str);
+    const len = (el.innerText || el.textContent || '').length;
+    if (len === 0) {
+      el.textContent = str;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
     return (el.innerText || el.textContent || '').length > 0;
   })()`, 25000);
 
@@ -564,13 +625,13 @@ export async function sendPromptViaCdp(options) {
   return cdpMutex.runExclusive(() => _sendPromptViaCdpInternal(options));
 }
 
-async function _sendPromptViaCdpInternal({ prompt, mode = 'reuse', timeoutS = 600, lockUrl }) {
+async function _sendPromptViaCdpInternal({ prompt, mode = 'reuse', timeoutS = 600, lockUrl, targetId }) {
   const chromeExe = findChrome();
   if (!chromeExe) throw new Error('未在常用路径找到 Google Chrome 可执行文件');
 
   await ensureCdpReady(chromeExe);
 
-  const target = await resolveTarget();
+  const target = await resolveTarget(targetId);
   const cdp = new CDP(target.webSocketDebuggerUrl);
   await cdp.connect(15000);
 

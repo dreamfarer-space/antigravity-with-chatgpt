@@ -37,7 +37,7 @@ export function recordExecution(entry) {
   if (typeof entry.command !== 'string' || !entry.command.trim()) {
     throw new TypeError('recordExecution: command 必须是非空有效字符串');
   }
-  if (entry.exitCode === undefined || entry.exitCode === null || !Number.isInteger(Number(entry.exitCode))) {
+  if (typeof entry.exitCode !== 'number' || !Number.isInteger(entry.exitCode)) {
     throw new TypeError('recordExecution: exitCode 必须是有效整数');
   }
 
@@ -49,7 +49,7 @@ export function recordExecution(entry) {
     taskId: entry.taskId || null,
     workspace: entry.workspace ? path.resolve(entry.workspace) : process.cwd(),
     command: entry.command.trim(),
-    exitCode: Number(entry.exitCode),
+    exitCode: entry.exitCode,
     testSummary: entry.testSummary || null,
     notes: entry.notes || null,
   };

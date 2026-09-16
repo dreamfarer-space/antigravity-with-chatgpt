@@ -6,7 +6,7 @@
 
 **Zero-Dependency Dual-Brain Reasoning & Verification Architecture for Google Antigravity 2.0 & Gemini**
 
-*Harness the full reasoning power of ChatGPT Web (GPT-4o, o1, o3, Canvas) as an independent cloud brain for your local Antigravity 2.0 IDE.*
+*Harness the full reasoning and deep-thinking capabilities available in your authenticated ChatGPT Web account as an independent cloud brain for your local Antigravity 2.0 IDE.*
 
 [![CI](https://github.com/dreamfarer-space/antigravity-with-chatgpt/actions/workflows/ci.yml/badge.svg)](https://github.com/dreamfarer-space/antigravity-with-chatgpt/actions/workflows/ci.yml)
 [![Node.js Version](https://img.shields.io/badge/Node.js-%3E%3D22.0.0-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
@@ -137,6 +137,11 @@ google-chrome \
 ```
 
 > **Tip**: On first launch, log in to your ChatGPT account once. Your session cookies will be stored in your dedicated local Chrome profile, minimizing repeated logins across restarts (subject to normal OpenAI session lifetimes).
+>
+> [!NOTE]
+> **Why `--remote-allow-origins=*` is required**: Starting in Chrome 111, Chromium enforces strict WebSocket Origin validation on DevTools endpoints (`/devtools/...`). Non-browser processes (such as Node.js WebSocket clients) do not send standard browser origins, causing Chrome to reject the connection with HTTP 403 Forbidden without this flag.
+> 
+> **Security Boundary**: The debug socket binds strictly to `--remote-debugging-address=127.0.0.1` (loopback only). Because it is not exposed on any external network interface, remote connections from the local network or internet are blocked at the OS socket level.
 
 ### Step 3: Configure Antigravity 2.0 Global MCP Config
 
@@ -226,26 +231,36 @@ node scripts/ask_chatgpt.mjs --doctor
 
 ## 🧪 Testing & Verification
 
-Run the comprehensive test suite:
+The project includes both an automated cross-platform test suite for continuous integration and an environment verification suite for local setup:
+
+### 1. Automated CI Test Suite (`npm test`)
+Executed automatically in GitHub Actions on every push and pull request across Ubuntu, Windows, and macOS (Node 22 & 24):
 
 ```powershell
-# Run baseline installation & component verification
-node scripts/verify_install.mjs
-
-# Run adversarial security & concurrency tests
-node tests/security_adversarial.test.mjs
+npm test
+# Equivalent to: node tests/security_adversarial.test.mjs
 ```
 
-**Results:**
-- ✅ **55 / 55 Tests Passed (100%)**
-  - Path traversal, NUL injection & case-sensitivity: 5/5
-  - Multi-line PEM, spaced secret assignment & Bearer token redaction: 5/5
-  - Egress sanitization leakage prevention: 2/2
-  - Orchestrator defensive contract validation: 2/2
-  - Execution recorder strict input validation: 4/4
-  - CDP evaluate & awaitPromise regression tests: 2/2
-  - Untracked files content evidence extraction & sensitive masking: 1/1
-  - Core component integrity & CDP live probing: 34/34
+**Automated Tests (22/22 Passing in CI):**
+- **Path Guard Security**: Relative `../` traversal, deep traversal, absolute paths, NUL byte injection, and safe resolution (5/5)
+- **Sensitive Credential Redaction**: Multi-line PEM keys, spaced secret assignments, colon assignments, Bearer tokens, and sensitive path rules (5/5)
+- **Egress Sanitization**: Real-time filtering on Git diffs and command execution output (2/2)
+- **Orchestrator Defensive Contracts**: Type validation and rejection of empty/invalid inputs (2/2)
+- **Execution Recorder Contract**: Strict non-coercing integer validation on exit codes (rejecting `false`, `""`, `"0"`, `[]`, `NaN`) (4/4)
+- **CDP evaluate & awaitPromise**: Regression testing for default non-promise vs. async promise evaluation (2/2)
+- **Untracked File Evidence**: Safe text extraction, binary skipping, and sensitive masking (1/1)
+- **UTF-8 Byte Budget Truncation**: Non-destructive multi-byte UTF-8 character boundary preservation (1/1)
+
+### 2. Local Environment Verification & Live Integration (`npm run verify`)
+Runs local sanity checks and optional live end-to-end integration tests with an active Chrome session:
+
+```powershell
+# Verify local module structure, configuration, and CDP connectivity (34 checks)
+npm run verify
+
+# Optional: Run live end-to-end multi-mode execution against an active Chrome session
+node scripts/verify_install.mjs --run-test
+```
 
 ---
 
@@ -254,8 +269,9 @@ node tests/security_adversarial.test.mjs
 > [!IMPORTANT]
 > **Legal & Compliance Notice:**
 > - **Personal Research & Workflow Tool**: `antigravity-with-chatgpt` is an open-source experimental developer tool designed for personal workflow augmentation, dual-brain reasoning research, and local verification pairing Antigravity with web-based LLMs.
-> - **CDP Automation & OpenAI Terms**: This project interfaces with a locally running Chrome browser instance via standard Chrome DevTools Protocol (CDP) on `127.0.0.1:9222`. Automating browser interactions with web services is governed by the [OpenAI Terms of Use](https://openai.com/policies/terms-of-use/). Users are solely responsible for ensuring their usage adheres to OpenAI's policies and standard rate limits.
-> - **No Guarantees**: This project does not circumvent paywalls, rate limits, or account restrictions. The maintainers do not assume any liability for account restrictions, session termination, or any other impacts resulting from the use of this software.
+> - **OpenAI Terms of Use & Automated Extraction Restrictions**: OpenAI's [Terms of Use](https://openai.com/policies/terms-of-use/) (including Section 2(c) and Service Terms) contain explicit restrictions against automated or programmatic extraction of data or Output from web services (such as web scraping or harvesting). This project connects locally via Chrome DevTools Protocol (CDP) on `127.0.0.1:9222` to an existing authenticated user session purely as a developer convenience bridge for personal, interactive pair-programming. It is **not** an official OpenAI API client, an automated scraping pipeline, or a commercial extraction tool.
+> - **User Responsibility**: Users are solely responsible for ensuring that their use complies with all applicable OpenAI terms, policies, and fair-use guidelines. Interacting programmatically with web interfaces carries inherent risks (including session invalidation, CAPTCHA challenges, or account restrictions). For production, high-throughput, or SLA-backed programmatic access, please use official OpenAI Platform APIs.
+> - **No Warranties or Guarantees**: This project does not circumvent paywalls, rate limits, or account restrictions. The maintainers do not assume any liability for account restrictions, session termination, or any other impacts resulting from the use of this software.
 
 ---
 
