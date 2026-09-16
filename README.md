@@ -8,6 +8,7 @@
 
 *Harness the full reasoning power of ChatGPT Web (GPT-4o, o1, o3, Canvas) as an independent cloud brain for your local Antigravity 2.0 IDE.*
 
+[![CI](https://github.com/dreamfarer-space/antigravity-with-chatgpt/actions/workflows/ci.yml/badge.svg)](https://github.com/dreamfarer-space/antigravity-with-chatgpt/actions/workflows/ci.yml)
 [![Node.js Version](https://img.shields.io/badge/Node.js-%3E%3D22.0.0-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/Dependencies-0%20(Pure%20Native)-brightgreen)](#-key-features)
