@@ -2,7 +2,7 @@
  * recorder.mjs - 本地执行证据记录器
  * ---------------------------------------------------------------------------
  * 记录构建、测试、终端命令的实际执行结果（exit code, test count, output），
- * 为 ChatGPT 的闭环独立审查 (Closed-Loop Review) 提供不可篡改的事实记录。
+ * 为 ChatGPT 的闭环独立审查 (Closed-Loop Review) 提供本地代理上报的执行证据 (Agent-Reported Evidence)。
  */
 
 import fs from 'node:fs';
@@ -94,7 +94,7 @@ export function getRecentExecutions(workspace, limit = 5) {
 export function formatExecutionSummary(records) {
   if (!records || records.length === 0) return '';
 
-  const lines = ['### Recent Execution Records (Evidence for Review):'];
+  const lines = ['### Local Execution Evidence (Agent-Reported Records):'];
   for (const r of records) {
     const statusText = r.exitCode === 0 ? '✓ SUCCESS (code 0)' : `✗ FAILED (code ${r.exitCode})`;
     lines.push(`- **${r.timestamp.slice(11, 19)}** | \`${r.command}\` -> ${statusText}`);
@@ -103,6 +103,14 @@ export function formatExecutionSummary(records) {
     }
     if (r.notes) {
       lines.push(`  - Note: ${r.notes}`);
+    }
+    if (r.output) {
+      // 携带受预算控制并脱敏的关键输出/报错堆栈（每条记录最多 4KB）
+      const snippet = r.output.length > 4096 ? r.output.slice(0, 4096) + '\n... [output truncated]' : r.output;
+      lines.push('  - Output snippet:');
+      lines.push('```text');
+      lines.push(snippet.trim());
+      lines.push('```');
     }
   }
   return lines.join('\n');

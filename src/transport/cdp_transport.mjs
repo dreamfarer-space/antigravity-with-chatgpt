@@ -9,22 +9,49 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
 
-const ROOT = 'D:\\ChatGPT-Brain-Bridge';
-const PROFILE_DIR = path.join(ROOT, 'chrome-profile');
+function resolveProfileDir() {
+  if (process.env.CHATGPT_BRAIN_PROFILE_DIR) {
+    return process.env.CHATGPT_BRAIN_PROFILE_DIR;
+  }
+  // 保留原有 Windows 专用路径向后兼容
+  const legacyWindowsPath = 'D:\\ChatGPT-Brain-Bridge\\chrome-profile';
+  if (process.platform === 'win32' && fs.existsSync(legacyWindowsPath)) {
+    return legacyWindowsPath;
+  }
+  return path.join(os.homedir(), '.antigravity-with-chatgpt', 'chrome-profile');
+}
+
+const PROFILE_DIR = resolveProfileDir();
 const DEBUG_PORT = Number(process.env.CHATGPT_BRAIN_PORT || 9222);
 const DEBUG_HOST = '127.0.0.1';
 const HTTP_BASE = `http://${DEBUG_HOST}:${DEBUG_PORT}`;
 const DEFAULT_TARGET_URL = 'https://chatgpt.com/';
 
 const CHROME_PATHS = [
+  // Windows
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   process.env.LOCALAPPDATA
     ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe')
     : null,
+  process.env.PROGRAMFILES
+    ? path.join(process.env.PROGRAMFILES, 'Google', 'Chrome', 'Application', 'chrome.exe')
+    : null,
+  // macOS (Darwin)
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  path.join(os.homedir(), 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+  '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  // Linux
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/snap/bin/chromium',
 ].filter(Boolean);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -32,6 +59,12 @@ const log = (...a) => process.stderr.write(`[brain-transport] ${a.join(' ')}\n`)
 const warn = (...a) => process.stderr.write(`[brain-transport][warn] ${a.join(' ')}\n`);
 
 export function findChrome() {
+  if (process.env.CHATGPT_BRAIN_CHROME_PATH && fs.existsSync(process.env.CHATGPT_BRAIN_CHROME_PATH)) {
+    return process.env.CHATGPT_BRAIN_CHROME_PATH;
+  }
+  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) {
+    return process.env.CHROME_PATH;
+  }
   return CHROME_PATHS.find((p) => fs.existsSync(p)) || null;
 }
 
@@ -308,13 +341,17 @@ export class CDP {
   }
 }
 
-async function evaluate(cdp, expression, timeoutMs = 20000) {
+async function evaluate(cdp, expression, optionsOrTimeout = 20000) {
+  const opts = typeof optionsOrTimeout === 'number'
+    ? { timeoutMs: optionsOrTimeout, awaitPromise: false }
+    : { timeoutMs: 20000, awaitPromise: false, ...optionsOrTimeout };
+
   const r = await cdp.send('Runtime.evaluate', {
     expression,
     returnByValue: true,
-    awaitPromise: false,
+    awaitPromise: Boolean(opts.awaitPromise),
     userGesture: true,
-  }, timeoutMs);
+  }, opts.timeoutMs);
   if (r.exceptionDetails) {
     const msg = r.exceptionDetails.exception?.description || r.exceptionDetails.text || 'unknown';
     throw new Error(`页面脚本异常: ${msg}`);
@@ -350,11 +387,13 @@ async function ensureCdpReady(chromeExe) {
   if (status.running) return;
 
   log(`专用 Chrome 未运行，正在从 ${chromeExe} 启动...`);
+  try { fs.mkdirSync(PROFILE_DIR, { recursive: true }); } catch {}
+
   const args = [
     `--remote-debugging-port=${DEBUG_PORT}`,
     `--remote-debugging-address=${DEBUG_HOST}`,
     '--remote-allow-origins=*',
-    `--user-data-dir="${PROFILE_DIR}"`,
+    process.platform === 'win32' ? `--user-data-dir="${PROFILE_DIR}"` : `--user-data-dir=${PROFILE_DIR}`,
     DEFAULT_TARGET_URL,
   ];
 
@@ -405,8 +444,11 @@ async function resolveTarget() {
 
 async function clearComposer(cdp) {
   await evaluate(cdp, `(() => {
-    const el = document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]');
-    if (!el) return false;
+    ${PRELUDE}
+    const COMPOSER = ${JSON.stringify(COMPOSER_SELECTORS)};
+    const c = pickVisible(COMPOSER);
+    if (!c) return false;
+    const el = c.el;
     el.focus();
     const sel = window.getSelection();
     const range = document.createRange();
@@ -605,7 +647,7 @@ async function _sendPromptViaCdpInternal({ prompt, mode = 'reuse', timeoutS = 60
             });
             obs.observe(document.body, { childList: true, subtree: true, characterData: true });
             setTimeout(() => { obs.disconnect(); resolve(false); }, 1500);
-          })`, 2500).catch(() => false);
+          })`, { timeoutMs: 2500, awaitPromise: true }).catch(() => false);
 
           if (quiet) {
             const text = await evaluate(cdp, GET_LAST_TEXT_JS, 20000);

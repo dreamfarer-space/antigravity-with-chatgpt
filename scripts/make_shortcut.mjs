@@ -26,22 +26,34 @@ import os from 'node:os';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
 
+if (process.platform !== 'win32') {
+  console.log('[make_shortcut] Windows .lnk 快捷方式生成仅在 Windows 平台生效，当前非 Windows 环境优雅跳过。');
+  process.exit(0);
+}
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
 
-const ROOT = 'D:\\ChatGPT-Brain-Bridge';
+function resolveDefaultProfileDir() {
+  if (process.env.CHATGPT_BRAIN_PROFILE_DIR) return process.env.CHATGPT_BRAIN_PROFILE_DIR;
+  if (fs.existsSync('D:\\ChatGPT-Brain-Bridge\\chrome-profile')) return 'D:\\ChatGPT-Brain-Bridge\\chrome-profile';
+  return path.join(os.homedir(), '.antigravity-with-chatgpt', 'chrome-profile');
+}
+
+const PROFILE_DIR = resolveDefaultProfileDir();
 const CHROME_CANDIDATES = [
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : null,
+  process.env.PROGRAMFILES ? path.join(process.env.PROGRAMFILES, 'Google', 'Chrome', 'Application', 'chrome.exe') : null,
 ].filter(Boolean);
 
 const DEFAULT_ARGS = [
   '--remote-debugging-port=9222',
   '--remote-debugging-address=127.0.0.1',
   '--remote-allow-origins=*',
-  `--user-data-dir="${path.join(ROOT, 'chrome-profile')}"`,
+  `--user-data-dir="${PROFILE_DIR}"`,
   'https://chatgpt.com',
 ].join(' ');
 
@@ -60,7 +72,7 @@ const opt = (flag, def) => {
 
 const targetExe = opt('--target', CHROME_CANDIDATES.find((p) => fs.existsSync(p)) || CHROME_CANDIDATES[0]);
 const targetArgs = opt('--args', DEFAULT_ARGS);
-const workDir = opt('--workdir', ROOT);
+const workDir = opt('--workdir', process.cwd());
 const iconLoc = opt('--icon', `${targetExe},0`);
 const description = opt('--desc', DEFAULT_DESC);
 const outName = opt('--name', DEFAULT_NAME);

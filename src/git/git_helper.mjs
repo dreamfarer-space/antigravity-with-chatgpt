@@ -77,7 +77,9 @@ export function getGitDiff(workspaceRoot, options = {}) {
   const maxBytes = options.maxBytes || DEFAULT_DIFF_MAX_BYTES;
   const args = ['-C', workspaceRoot, 'diff'];
 
-  if (options.staged) {
+  if (options.head) {
+    args.push('HEAD');
+  } else if (options.staged) {
     args.push('--staged');
   }
 
@@ -93,6 +95,10 @@ export function getGitDiff(workspaceRoot, options = {}) {
     });
 
     if (res.status !== 0) {
+      if (options.head) {
+        // HEAD 对比失败（可能尚无初始提交），降级回退普通 diff
+        return getGitDiff(workspaceRoot, { ...options, head: false });
+      }
       return { hasDiff: false, error: res.stderr || 'git diff failed' };
     }
 
@@ -136,4 +142,54 @@ export function getGitDiff(workspaceRoot, options = {}) {
   } catch (err) {
     return { hasDiff: false, error: err.message };
   }
+}
+
+/**
+ * 完整提取工作区闭环审查证据（Git 状态、HEAD Diff 与未跟踪文件清单）
+ * @param {string} workspaceRoot
+ * @param {object} options
+ * @returns {object}
+ */
+export function getReviewEvidence(workspaceRoot, options = {}) {
+  const status = getGitStatus(workspaceRoot);
+  const maxBytes = options.maxBytes || DEFAULT_DIFF_MAX_BYTES;
+
+  if (!status.isGitRepo) {
+    return {
+      isGitRepo: false,
+      summary: 'Not a git repository',
+      hasDiff: false,
+      diff: '',
+      untracked: [],
+      staged: [],
+      modified: [],
+    };
+  }
+
+  // 优先对比 HEAD（同时覆盖已暂存与未暂存变更）
+  let diffRes = getGitDiff(workspaceRoot, { ...options, head: true, maxBytes });
+  if (!diffRes.hasDiff && !diffRes.error) {
+    const stagedRes = getGitDiff(workspaceRoot, { ...options, staged: true, maxBytes });
+    const unstagedRes = getGitDiff(workspaceRoot, { ...options, staged: false, maxBytes });
+    if (stagedRes.hasDiff || unstagedRes.hasDiff) {
+      diffRes = {
+        hasDiff: true,
+        diff: [stagedRes.diff, unstagedRes.diff].filter(Boolean).join('\n'),
+        truncated: stagedRes.truncated || unstagedRes.truncated,
+      };
+    }
+  }
+
+  return {
+    isGitRepo: true,
+    branch: status.branch,
+    summary: status.summary,
+    staged: status.staged,
+    modified: status.modified,
+    untracked: status.untracked,
+    hasDiff: Boolean(diffRes.hasDiff),
+    diff: diffRes.diff || '',
+    truncated: diffRes.truncated || false,
+    error: diffRes.error || null,
+  };
 }

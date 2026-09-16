@@ -35,8 +35,7 @@ const TOOLS = [
     name: 'ask_chatgpt',
     description:
       '向 ChatGPT 网页版（通过独立隔离 Chrome 专用 CDP 通道）发送提问并获取完整回复。' +
-      '零 API Key 消耗，独享云端超强大脑能力。' +
-      '支持 5 大工作模式：ask（通用对话）、plan（任务规划）、review（闭环审查，自动结合真实 Git Diff 与测试记录）、derive（算法与数学纯推导）、diagnose（故障根因排查）。',
+      '支持 5 大工作模式：ask（通用对话）、plan（任务规划）、review（闭环审查，自动结合真实 Git 状态与测试记录）、derive（算法与数学推导）、diagnose（故障根因排查）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -147,6 +146,14 @@ async function handleAskChatGPT(args) {
     };
   }
 
+  const MAX_INPUT_BYTES = 256 * 1024;
+  if (Buffer.byteLength(prompt, 'utf8') > MAX_INPUT_BYTES) {
+    return {
+      content: [{ type: 'text', text: '错误: prompt 超过最大安全字节限制 (256 KB)' }],
+      isError: true,
+    };
+  }
+
   try {
     const res = await runBrainTask({
       prompt,
@@ -231,15 +238,19 @@ async function handleRpcRequest(req) {
   }
 
   if (method === 'initialize') {
+    const requestedVersion = params?.protocolVersion;
+    const supportedVersions = ['2024-11-05', '2026-07-28'];
+    const protocolVersion = supportedVersions.includes(requestedVersion) ? requestedVersion : '2024-11-05';
+
     send({
       jsonrpc: '2.0',
       id,
       result: {
-        protocolVersion: '2024-11-05',
+        protocolVersion,
         capabilities: { tools: {} },
         serverInfo: {
           name: 'antigravity-with-chatgpt',
-          version: '2.1.0',
+          version: '2.1.1',
         },
       },
     });

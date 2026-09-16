@@ -10,7 +10,7 @@
 import path from 'node:path';
 import { MODES, buildPromptEnvelope } from './prompts.mjs';
 import { buildAttachmentsBlock, getWorkspaceInfo } from '../workspace/context_provider.mjs';
-import { getGitDiff } from '../git/git_helper.mjs';
+import { getGitDiff, getReviewEvidence } from '../git/git_helper.mjs';
 import { getRecentExecutions, formatExecutionSummary } from '../execution/recorder.mjs';
 import { sanitizeContent } from '../security/sensitive.mjs';
 import { sendPromptViaCdp } from '../transport/cdp_transport.mjs';
@@ -53,12 +53,22 @@ export async function runBrainTask(options = {}) {
       attachmentsBlock = buildAttachmentsBlock(workspace, options.files);
     }
 
-    // 处理 Git Diff (review 与 diagnose 模式下默认自动附带，或显式要求)
+    // 处理 Git 变更与审查证据 (review 与 diagnose 模式下默认自动附带，或显式要求)
     const needDiff = options.gitDiff === true || mode === MODES.REVIEW || (mode === MODES.DIAGNOSE && options.gitDiff !== false);
     if (needDiff) {
-      const diffRes = getGitDiff(workspace);
-      if (diffRes.hasDiff && diffRes.diff) {
-        gitDiffBlock = diffRes.diff;
+      const evidence = getReviewEvidence(workspace);
+      const diffParts = [];
+      if (evidence.summary) {
+        diffParts.push(`Git Status: ${evidence.summary}`);
+      }
+      if (evidence.untracked && evidence.untracked.length > 0) {
+        diffParts.push(`Untracked files (${evidence.untracked.length}):\n${evidence.untracked.slice(0, 20).map((f) => `  - ${f}`).join('\n')}${evidence.untracked.length > 20 ? '\n  ... and more' : ''}`);
+      }
+      if (evidence.hasDiff && evidence.diff) {
+        diffParts.push(evidence.diff);
+      }
+      if (diffParts.length > 0) {
+        gitDiffBlock = diffParts.join('\n\n');
       }
     }
 
@@ -84,6 +94,11 @@ export async function runBrainTask(options = {}) {
 
   // 3. 统一出口脱敏 (Egress Sanitization): 确保越过浏览器边界的所有内容均经过脱敏
   const safePrompt = sanitizeContent(finalPrompt);
+
+  const MAX_PROMPT_BYTES = 256 * 1024;
+  if (Buffer.byteLength(safePrompt, 'utf8') > MAX_PROMPT_BYTES) {
+    throw new Error(`组装后的提示词超出安全传输大小限制 (${Buffer.byteLength(safePrompt, 'utf8')} 字节 > ${MAX_PROMPT_BYTES} 字节)`);
+  }
 
   // 4. 调度 CDP 传输层
   const cdpRes = await sendPromptViaCdp({

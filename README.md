@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 <img src="./assets/banner.png" alt="antigravity-with-chatgpt Banner" width="100%" />
 
@@ -28,7 +28,7 @@ Inspired by the notable community project `XiaoDuoYa/codex-with-chatgpt` (**"Cha
 
 - **Local Agent Owns Execution**: File edits, shell terminal commands, build pipelines, and unit tests strictly belong to Antigravity.
 - **ChatGPT Owns Reasoning & Review**: High-level task planning, mathematical derivations, and adversarial code reviews are delegated to ChatGPT Web.
-- **Zero API Key Consumption**: Reuses your existing authenticated ChatGPT Plus/Pro web session in a dedicated Chrome profile—unlimited access to GPT-4o, o1, and o3 without API costs.
+- **Local Session Reuse**: Connects directly to your authenticated browser session (Free, Plus, or Pro) running in an isolated local Chrome profile—no separate API key required, operating strictly within standard personal web session parameters.
 - **Zero npm Dependencies**: Written entirely in native Node.js 22+ standard library (native WebSocket, fetch, crypto, child_process)—lightning fast startup, zero supply-chain attack surface.
 
 ---
@@ -36,7 +36,7 @@ Inspired by the notable community project `XiaoDuoYa/codex-with-chatgpt` (**"Cha
 ## 🌟 Key Features
 
 - ⚡ **Sub-Millisecond DOM Injection**: Utilizes `execCommand('insertText')` combined with Base64 encoding to bypass ProseMirror per-character event overhead, injecting 10,000+ characters in under 5ms.
-- 🛡️ **Production-Grade Security Boundary**:
+- 🛡️ **Defense-in-Depth Local Security Boundary**:
   - **`path_guard.mjs`**: Platform-aware relative path containment, strictly preventing `../` traversal, NUL byte injection, and symlink breakout.
   - **`sensitive.mjs`**: Blocks `.env*`, SSH keys, and certificates; automatically redacts OpenAI API keys, GitHub tokens, AWS credentials, and Bearer tokens.
   - **`Egress Sanitization`**: Ensures every character crossing the browser boundary—including Git diffs and execution test output—passes through an ultimate redaction filter.
@@ -103,7 +103,7 @@ Google Antigravity 2.0 natively integrates external tools via the standard Model
 - **Google Chrome**: Standard desktop installation.
 
 ### Step 2: Start the Dedicated Chrome Session
-To keep your daily browser data separate, launch Chrome with an isolated user profile (`chrome-profile`) and local CDP remote debugging on port `9222`:
+To keep your daily browser data separate, launch Chrome with an isolated user profile (`~/.antigravity-with-chatgpt/chrome-profile` or custom directory) and local CDP remote debugging on port `9222`:
 
 **Windows PowerShell:**
 ```powershell
@@ -111,11 +111,31 @@ To keep your daily browser data separate, launch Chrome with an isolated user pr
   --remote-debugging-port=9222 `
   --remote-debugging-address=127.0.0.1 `
   --remote-allow-origins=* `
-  --user-data-dir="D:\ChatGPT-Brain-Bridge\chrome-profile" `
+  --user-data-dir="$HOME\.antigravity-with-chatgpt\chrome-profile" `
   https://chatgpt.com
 ```
 
-> **Tip**: On first launch, log in to your ChatGPT account once. Your session will be permanently preserved in `chrome-profile`, requiring no future logins.
+**macOS Terminal:**
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-allow-origins=* \
+  --user-data-dir="$HOME/.antigravity-with-chatgpt/chrome-profile" \
+  https://chatgpt.com
+```
+
+**Linux Bash:**
+```bash
+google-chrome \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-allow-origins=* \
+  --user-data-dir="$HOME/.antigravity-with-chatgpt/chrome-profile" \
+  https://chatgpt.com
+```
+
+> **Tip**: On first launch, log in to your ChatGPT account once. Your session cookies will be stored in your dedicated local Chrome profile, minimizing repeated logins across restarts (subject to normal OpenAI session lifetimes).
 
 ### Step 3: Configure Antigravity 2.0 Global MCP Config
 
@@ -222,6 +242,16 @@ node tests/security_adversarial.test.mjs
   - Egress sanitization leakage prevention: 2/2
   - Orchestrator defensive contract validation: 2/2
   - Core component integrity & CDP live probing: 34/34
+
+---
+
+## ⚖️ Terms of Service & Responsible Use Notice
+
+> [!IMPORTANT]
+> **Legal & Compliance Notice:**
+> - **Personal Research & Workflow Tool**: `antigravity-with-chatgpt` is an open-source experimental developer tool designed for personal workflow augmentation, dual-brain reasoning research, and local verification pairing Antigravity with web-based LLMs.
+> - **CDP Automation & OpenAI Terms**: This project interfaces with a locally running Chrome browser instance via standard Chrome DevTools Protocol (CDP) on `127.0.0.1:9222`. Automating browser interactions with web services is governed by the [OpenAI Terms of Use](https://openai.com/policies/terms-of-use/). Users are solely responsible for ensuring their usage adheres to OpenAI's policies and standard rate limits.
+> - **No Guarantees**: This project does not circumvent paywalls, rate limits, or account restrictions. The maintainers do not assume any liability for account restrictions, session termination, or any other impacts resulting from the use of this software.
 
 ---
 

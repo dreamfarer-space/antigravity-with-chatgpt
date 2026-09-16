@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 <img src="./assets/banner.png" alt="antigravity-with-chatgpt Banner" width="100%" />
 
@@ -28,7 +28,7 @@
 
 - **执行权归本地（Antigravity Owns Local Execution）**：文件读写、Shell 终端、单元测试严格属于本地 Antigravity Agent；
 - **思考与审查归云端（ChatGPT Owns Reasoning & Review）**：高阶规划、纯脑力推导与闭环交叉审查委托给 ChatGPT 网页版；
-- **零 API Key 消耗**：直接复用本地 Chrome 已登录的 ChatGPT Plus/Pro 网页会话，无限次畅享 GPT-4o、o1、o3 级长思考模型；
+- **本地会话复用（Local Session Reuse）**：复用独立 Chrome Profile 中已登录的个人 ChatGPT 网页会话（Free / Plus / Pro），无需单独申请 API Key，严格在正常个人 Web 会话范畴内运行；
 - **零 npm 依赖（Zero Dependencies）**：纯 Node.js 22+ 原生标准库（原生 WebSocket、Fetch、Crypto、ChildProcess），秒级启动，免除供应链依赖安全风险。
 
 ---
@@ -36,7 +36,7 @@
 ## 🌟 核心特性
 
 - ⚡ **毫秒级极速注入**：采用 `execCommand('insertText')` + Base64 编码，绕过海量单字符输入事件，万字提示词 4ms 内极速注入 ProseMirror。
-- 🛡️ **生产级安全防御层**：
+- 🛡️ **纵深防御型本地安全边界（Defense-in-Depth Local Security Boundary）**：
   - **`path_guard.mjs`**：跨平台原生路径相对化计算，拦截 `../` 目录逃逸、NUL 字符注入及符号链接（Symlink）越界；
   - **`sensitive.mjs`**：严格拦截 `.env*`、私钥、证书；外发前自动对 OpenAI Key、GitHub Token、AWS 凭据、Bearer Token 进行全局脱敏；
   - **`egress sanitizer`**：确保所有跨越浏览器边界的上下文（包括 Git Diff、测试输出日志）全部强制经过终极脱敏。
@@ -103,7 +103,7 @@ Antigravity 2.0 原生支持通过标准 Model Context Protocol (MCP) 加载外�
 - **Google Chrome**：正常安装的 Google Chrome 浏览器。
 
 ### 第二步：启动独立隔离的 ChatGPT Chrome 会话
-为避免污染您日常使用的 Chrome，本项目使用专用数据目录（`chrome-profile`）运行独立 Chrome，并开放本地 CDP 调试端口 `9222`：
+为避免污染您日常使用的 Chrome，本项目使用专用数据目录（默认为 `~/.antigravity-with-chatgpt/chrome-profile` 或自定义路径）运行独立 Chrome，并开放本地 CDP 调试端口 `9222`：
 
 **Windows PowerShell 启动命令：**
 ```powershell
@@ -111,11 +111,31 @@ Antigravity 2.0 原生支持通过标准 Model Context Protocol (MCP) 加载外�
   --remote-debugging-port=9222 `
   --remote-debugging-address=127.0.0.1 `
   --remote-allow-origins=* `
-  --user-data-dir="D:\ChatGPT-Brain-Bridge\chrome-profile" `
+  --user-data-dir="$HOME\.antigravity-with-chatgpt\chrome-profile" `
   https://chatgpt.com
 ```
 
-> **提示**：首次启动后，请在弹出的专用 Chrome 窗口中完成一次常规 ChatGPT 网页登录。登录状态会被永久持久化在 `chrome-profile` 目录中，后续启动无需重复登录。
+**macOS Terminal 启动命令：**
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-allow-origins=* \
+  --user-data-dir="$HOME/.antigravity-with-chatgpt/chrome-profile" \
+  https://chatgpt.com
+```
+
+**Linux Bash 启动命令：**
+```bash
+google-chrome \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-allow-origins=* \
+  --user-data-dir="$HOME/.antigravity-with-chatgpt/chrome-profile" \
+  https://chatgpt.com
+```
+
+> **提示**：首次启动后，请在弹出的专用 Chrome 窗口中完成一次常规 ChatGPT 网页登录。登录会话 Cookie 将保存在独立 Profile 目录中，在常规会话有效期内无需重复登录。
 
 ### 第三步：配置 Antigravity 2.0 全局 MCP 配置文件
 
@@ -222,6 +242,16 @@ node tests/security_adversarial.test.mjs
   - 出口统一脱敏（Egress Sanitization）泄漏防御：2/2
   - 编排器输入防御性契约测试：2/2
   - 核心架构模块完整性与 CDP 探测：34/34
+
+---
+
+## ⚖️ 服务条款合规与使用免责声明
+
+> [!IMPORTANT]
+> **法律合规与使用责任告知：**
+> - **个人开发与研究工具**：`antigravity-with-chatgpt` 为开源实验性开发者辅助工具，旨在方便个人开发者探索双脑协同推理、本地代码审查与 Antigravity 自动化交互。
+> - **CDP 自动化与 OpenAI 服务条款**：本项目通过标准 Chrome DevTools Protocol (CDP) 连接本机 `127.0.0.1:9222` 端口上运行的 Chrome。用户对 ChatGPT Web 的自动化调用须自觉遵守 [OpenAI Terms of Use（服务条款）](https://openai.com/policies/terms-of-use/) 及相关速率与使用准则。严禁用于恶意并发攻击、滥用抓取或违规商业行为。
+> - **免责声明**：本项目不破解、不绕过任何官方付费限制或风控策略。因个人使用不当导致的账号受限、封号或会话终止，本项目及作者概不承担任何直接或间接法律责任。
 
 ---
 

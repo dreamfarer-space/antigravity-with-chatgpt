@@ -1,7 +1,7 @@
-﻿{
+{
   "name": "antigravity-with-chatgpt",
-  "version": "2.1.0",
-  "description": "Zero-dependency bridge turning ChatGPT Web into a dedicated reasoning brain for Google Antigravity 2.0 & Gemini via Chrome CDP & native MCP.",
+  "version": "2.1.1",
+  "description": "Zero-dependency local developer bridge connecting Google Antigravity & Gemini agents with ChatGPT Web via Chrome CDP & native MCP.",
   "type": "module",
   "main": "src/brain/orchestrator.mjs",
   "bin": {
@@ -9,7 +9,8 @@
     "antigravity-chatgpt-mcp": "scripts/mcp_server.mjs"
   },
   "scripts": {
-    "test": "node tests/security_adversarial.test.mjs && node scripts/verify_install.mjs",
+    "test": "node tests/security_adversarial.test.mjs",
+    "verify": "node scripts/verify_install.mjs",
     "doctor": "node scripts/ask_chatgpt.mjs --doctor",
     "mcp": "node scripts/mcp_server.mjs"
   },

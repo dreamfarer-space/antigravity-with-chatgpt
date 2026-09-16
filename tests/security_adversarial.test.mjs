@@ -11,9 +11,9 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
-import { resolveSafePath, isPathContained, SecurityError } from 'file:///D:/ChatGPT-Brain-Bridge/gemini-skill/antigravity-with-chatgpt/src/security/path_guard.mjs';
-import { sanitizeContent, isSensitivePath, redactSensitive } from 'file:///D:/ChatGPT-Brain-Bridge/gemini-skill/antigravity-with-chatgpt/src/security/sensitive.mjs';
-import { runBrainTask } from 'file:///D:/ChatGPT-Brain-Bridge/gemini-skill/antigravity-with-chatgpt/src/brain/orchestrator.mjs';
+import { resolveSafePath, isPathContained, SecurityError } from '../src/security/path_guard.mjs';
+import { sanitizeContent, isSensitivePath, redactSensitive } from '../src/security/sensitive.mjs';
+import { runBrainTask } from '../src/brain/orchestrator.mjs';
 
 let passed = 0;
 let total = 0;
