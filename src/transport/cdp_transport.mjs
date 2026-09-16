@@ -522,7 +522,7 @@ export async function clearComposer(cdp) {
       el.dispatchEvent(new Event('input', { bubbles: true }));
     }
     return true;
-  })()`, 5000);
+  })()`, 15000);
 }
 
 export async function insertTextReliable(cdp, text) {
@@ -586,8 +586,9 @@ export async function insertTextReliable(cdp, text) {
   };
 
   // 尝试初次注入
+  let singleShotRes = null;
   try {
-    await runSingleShot(timeoutMs);
+    singleShotRes = await runSingleShot(timeoutMs);
   } catch (err) {
     if (err.message && err.message.includes('CDP 调用超时')) {
       timedOut = true;
@@ -596,14 +597,24 @@ export async function insertTextReliable(cdp, text) {
     }
   }
 
-  // 注入操作结束后探针校验指纹
-  let probe = await evaluate(cdp, PROBE_COMPOSER_JS, 5000).catch(() => null);
+  let probe = null;
+  let fingerprintMatched = false;
 
-  let fingerprintMatched = Boolean(
-    probe && probe.found &&
-    probe.length === expected.length &&
-    probe.hash === expected.hash
-  );
+  if (singleShotRes && singleShotRes.ok && singleShotRes.length === expected.length && singleShotRes.hash === expected.hash) {
+    fingerprintMatched = true;
+    probe = singleShotRes;
+  } else {
+    // 若初次注入发生 CDP evaluate 超时或返回值异常，启动探针轮询比对指纹
+    const probeTimeout = Math.max(10000, Math.min(timeoutMs, 25000));
+    for (let i = 0; i < 3; i++) {
+      probe = await evaluate(cdp, PROBE_COMPOSER_JS, probeTimeout).catch(() => null);
+      if (probe && probe.found && probe.length === expected.length && probe.hash === expected.hash) {
+        fingerprintMatched = true;
+        break;
+      }
+      if (i < 2) await sleep(500);
+    }
+  }
 
   if (timedOut && fingerprintMatched) {
     verifiedAfterTimeout = true;
@@ -614,27 +625,36 @@ export async function insertTextReliable(cdp, text) {
     retryCount = 1;
     warn(`注入指纹不匹配 (期望: len=${expected.length}, hash=${expected.hash}; 实际: len=${probe?.length}, hash=${probe?.hash})，清空并受控重试...`);
     await clearComposer(cdp);
-    await sleep(300);
+    await sleep(400);
 
-    const emptyProbe = await evaluate(cdp, PROBE_COMPOSER_JS, 5000).catch(() => null);
+    const emptyProbe = await evaluate(cdp, PROBE_COMPOSER_JS, 10000).catch(() => null);
     if (emptyProbe && !emptyProbe.empty) {
       throw new Error('清空 Composer 失败，中止注入重试以防 Prompt 污染');
     }
 
+    let retryRes = null;
     try {
-      await runSingleShot(timeoutMs);
+      retryRes = await runSingleShot(timeoutMs);
     } catch (err) {
       if (err.message && err.message.includes('CDP 调用超时')) {
         timedOut = true;
       }
     }
 
-    probe = await evaluate(cdp, PROBE_COMPOSER_JS, 5000).catch(() => null);
-    fingerprintMatched = Boolean(
-      probe && probe.found &&
-      probe.length === expected.length &&
-      probe.hash === expected.hash
-    );
+    if (retryRes && retryRes.ok && retryRes.length === expected.length && retryRes.hash === expected.hash) {
+      fingerprintMatched = true;
+      probe = retryRes;
+    } else {
+      const probeTimeout = Math.max(10000, Math.min(timeoutMs, 25000));
+      for (let i = 0; i < 3; i++) {
+        probe = await evaluate(cdp, PROBE_COMPOSER_JS, probeTimeout).catch(() => null);
+        if (probe && probe.found && probe.length === expected.length && probe.hash === expected.hash) {
+          fingerprintMatched = true;
+          break;
+        }
+        if (i < 2) await sleep(500);
+      }
+    }
 
     if (!fingerprintMatched) {
       const elapsedMs = Math.round(performance.now() - t0);
