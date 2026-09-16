@@ -45,25 +45,27 @@ export function parseGitStatusOutput(stdout) {
       const file = token.slice(3);
       i++;
 
-      const stagedRename = code[0] === 'R' || code[0] === 'C';
-      const worktreeRename = code[1] === 'R' || code[1] === 'C';
+      const hasExtraPath = code[0] === 'R' || code[0] === 'C' || code[1] === 'R' || code[1] === 'C';
+      const otherFile = hasExtraPath ? (rawTokens[i++] || '') : '';
 
-      if (stagedRename || worktreeRename) {
-        // porcelain -z 在 X 位或 Y 位为 R/C 时，均携带第二个 NUL 路径
-        const otherFile = rawTokens[i++] || '';
-        if (stagedRename) {
-          if (file) staged.push(file);
-          if (otherFile) staged.push(otherFile);
-        }
-        if (worktreeRename) {
-          if (file) modified.push(file);
-          if (otherFile) modified.push(otherFile);
-        }
-      } else if (code.startsWith('?') || code.startsWith('U')) {
+      if (code.startsWith('?') || code.startsWith('U')) {
         if (file) untracked.push(file);
       } else {
-        if (code[0] !== ' ' && code[0] !== '?') staged.push(file);
-        if (code[1] !== ' ' && code[1] !== '?') modified.push(file);
+        // X 轴 (Index / Staged)
+        if (code[0] === 'R' || code[0] === 'C') {
+          if (file) staged.push(file);
+          if (otherFile) staged.push(otherFile);
+        } else if (code[0] !== ' ' && code[0] !== '?') {
+          if (file) staged.push(file);
+        }
+
+        // Y 轴 (Worktree / Unstaged)
+        if (code[1] === 'R' || code[1] === 'C') {
+          if (file) modified.push(file);
+          if (otherFile) modified.push(otherFile);
+        } else if (code[1] !== ' ' && code[1] !== '?') {
+          if (file) modified.push(file);
+        }
       }
     }
   } else {
@@ -71,18 +73,28 @@ export function parseGitStatusOutput(stdout) {
     for (const line of stdout.split('\n').filter(Boolean)) {
       const code = line.slice(0, 2);
       let file = line.slice(3).trim();
-      const stagedRename = code[0] === 'R' || code[0] === 'C';
-      const worktreeRename = code[1] === 'R' || code[1] === 'C';
 
-      if (file.includes(' -> ')) {
-        const parts = file.split(' -> ').map((p) => p.replace(/^"(.*)"$/, '$1').trim());
-        if (stagedRename) staged.push(...parts);
-        if (worktreeRename) modified.push(...parts);
+      if (code.startsWith('?') || code.startsWith('U')) {
+        file = file.replace(/^"(.*)"$/, '$1');
+        if (file) untracked.push(file);
+      } else if (file.includes(' -> ')) {
+        const parts = file.split(' -> ').map((p) => p.replace(/^"(.*)"$/, '$1').trim()).filter(Boolean);
+        // X 轴 (Index / Staged)
+        if (code[0] === 'R' || code[0] === 'C') {
+          staged.push(...parts);
+        } else if (code[0] !== ' ' && code[0] !== '?') {
+          if (parts[1]) staged.push(parts[1]);
+        }
+
+        // Y 轴 (Worktree / Unstaged)
+        if (code[1] === 'R' || code[1] === 'C') {
+          modified.push(...parts);
+        } else if (code[1] !== ' ' && code[1] !== '?') {
+          if (parts[1]) modified.push(parts[1]);
+        }
       } else {
         file = file.replace(/^"(.*)"$/, '$1');
-        if (code.startsWith('?') || code.startsWith('U')) {
-          untracked.push(file);
-        } else {
+        if (file) {
           if (code[0] !== ' ' && code[0] !== '?') staged.push(file);
           if (code[1] !== ' ' && code[1] !== '?') modified.push(file);
         }

@@ -919,6 +919,21 @@ Also need to check another file:
       },
     };
 
+    // submitReceipt 为 null 或 undefined
+    await assert.rejects(
+      async () => {
+        await verifyUnknownReceiptOrThrow(mockCdpPreExisting, null, 5);
+      },
+      /submitReceipt 必须为非空对象/
+    );
+
+    await assert.rejects(
+      async () => {
+        await verifyUnknownReceiptOrThrow(mockCdpPreExisting, undefined, 5);
+      },
+      /submitReceipt 必须为非空对象/
+    );
+
     // beforeUserTurns 缺失
     await assert.rejects(
       async () => {
@@ -927,13 +942,15 @@ Also need to check another file:
       /submitReceipt 缺少合法的 user-turn 基准计数/
     );
 
-    // beforeUserTurns 为非法负数
-    await assert.rejects(
-      async () => {
-        await verifyUnknownReceiptOrThrow(mockCdpPreExisting, { status: SUBMIT_STATUS.UNKNOWN, reason: 'receipt_timeout', beforeUserTurns: -1 }, 5);
-      },
-      /submitReceipt 缺少合法的 user-turn 基准计数/
-    );
+    // beforeUserTurns 为 null / NaN / 小数 / 字符串 / 负数
+    for (const badValue of [null, NaN, 1.5, '5', -1]) {
+      await assert.rejects(
+        async () => {
+          await verifyUnknownReceiptOrThrow(mockCdpPreExisting, { status: SUBMIT_STATUS.UNKNOWN, reason: 'receipt_timeout', beforeUserTurns: badValue }, 5);
+        },
+        /submitReceipt 缺少合法的 user-turn 基准计数/
+      );
+    }
   });
 
   // ---------------------------------------------------------------------------
@@ -1068,12 +1085,41 @@ Also need to check another file:
     assert.ok(parsed.modified.includes('old-both.js'));
   });
 
-  test('parseGitStatusOutput: 正确兼容换行分隔 porcelain 回退输出 (含 "old -> new" 与引号)', () => {
-    const v1Payload = 'R  "old file with space.js" -> "new file with space.js"\n M "another file.js"\n?? untracked.txt\n';
+  test('parseGitStatusOutput: 正确独立处理暂存重命名与工作区修改/删除复合状态 (RM 与 RD)', () => {
+    // 真实 Git 产生状态：git mv a.txt b.txt 后修改 b.txt => "RM b.txt\0a.txt\0"
+    const rmPayload = 'RM b.txt\0a.txt\0';
+    const parsedRM = parseGitStatusOutput(rmPayload);
+    assert.deepEqual(parsedRM.staged.sort(), ['a.txt', 'b.txt'].sort(), 'staged 必须包含新旧路径');
+    assert.deepEqual(parsedRM.modified, ['b.txt'], 'modified 必须包含工作区修改的新路径 b.txt，绝不丢失 Y 轴状态');
+
+    // 暂存重命名后工作区删除 => "RD b.txt\0a.txt\0"
+    const rdPayload = 'RD b.txt\0a.txt\0';
+    const parsedRD = parseGitStatusOutput(rdPayload);
+    assert.deepEqual(parsedRD.staged.sort(), ['a.txt', 'b.txt'].sort(), 'staged 必须包含新旧路径');
+    assert.deepEqual(parsedRD.modified, ['b.txt'], 'modified 必须包含工作区删除的新路径 b.txt');
+  });
+
+  test('parseGitStatusOutput: 正确独立处理暂存拷贝与工作区修改/删除复合状态 (CM 与 CD)', () => {
+    const cmPayload = 'CM copy.txt\0src.txt\0';
+    const parsedCM = parseGitStatusOutput(cmPayload);
+    assert.deepEqual(parsedCM.staged.sort(), ['copy.txt', 'src.txt'].sort(), 'staged 必须包含拷贝新旧路径');
+    assert.deepEqual(parsedCM.modified, ['copy.txt'], 'modified 必须包含工作区修改的新路径');
+
+    const cdPayload = 'CD copy.txt\0src.txt\0';
+    const parsedCD = parseGitStatusOutput(cdPayload);
+    assert.deepEqual(parsedCD.staged.sort(), ['copy.txt', 'src.txt'].sort(), 'staged 必须包含拷贝新旧路径');
+    assert.deepEqual(parsedCD.modified, ['copy.txt'], 'modified 必须包含工作区删除的新路径');
+  });
+
+  test('parseGitStatusOutput: 正确兼容换行分隔 porcelain 回退输出 (含 "old -> new" 与 RM/RD)', () => {
+    const v1Payload = 'R  "old file with space.js" -> "new file with space.js"\nRM "old2.js" -> "new2.js"\n M "another file.js"\n?? untracked.txt\n';
     const parsed = parseGitStatusOutput(v1Payload);
 
     assert.ok(parsed.staged.includes('old file with space.js'));
     assert.ok(parsed.staged.includes('new file with space.js'));
+    assert.ok(parsed.staged.includes('old2.js'));
+    assert.ok(parsed.staged.includes('new2.js'));
+    assert.ok(parsed.modified.includes('new2.js'), '回退模式下 RM 的 Y 轴工作区修改亦不得丢失');
     assert.ok(parsed.modified.includes('another file.js'));
     assert.ok(parsed.untracked.includes('untracked.txt'));
   });

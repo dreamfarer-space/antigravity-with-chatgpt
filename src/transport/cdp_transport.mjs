@@ -847,12 +847,16 @@ export const submitMessage = submitMessageReliable;
  * @returns {Promise<object>}
  */
 export async function verifyUnknownReceiptOrThrow(cdp, submitReceipt, beforeTurns) {
+  if (!submitReceipt || typeof submitReceipt !== 'object') {
+    throw new Error('提交消息状态未知 (UNKNOWN): submitReceipt 必须为非空对象，立即中止以防重复提交');
+  }
+
   if (submitReceipt.reason === 'baseline_probe_failed' || submitReceipt.reason === 'baseline_probe_invalid') {
     throw new Error(`提交基准获取失败 (UNKNOWN/${submitReceipt.reason})：无法确立确定性状态基准，立即中止以防重复提交`);
   }
 
   // 严格基准有效性校验：beforeUserTurns 必须为非负整数，缺少或非法时立即 fail-closed 抛错
-  if (!submitReceipt || !Number.isInteger(submitReceipt.beforeUserTurns) || submitReceipt.beforeUserTurns < 0) {
+  if (!Number.isInteger(submitReceipt.beforeUserTurns) || submitReceipt.beforeUserTurns < 0) {
     throw new Error(`提交消息状态未知 (UNKNOWN): submitReceipt 缺少合法的 user-turn 基准计数，立即中止以防重复提交`);
   }
 
