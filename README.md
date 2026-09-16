@@ -21,21 +21,22 @@
 
 ---
 
-## ⚡ Quick Install (一段话极速安装)
+## ⚡ One-Sentence AI Installation (一句话让 AI 帮忙安装)
 
-Ensure you have **Node.js (>= 22.0.0)** and **Google Chrome** installed (zero npm packages required). Run this single command in your terminal to clone and configure everything automatically:
+You don't even need to open a terminal or run shell commands manually. Simply copy and paste this **single sentence** into your **Google Antigravity 2.0 / Gemini / Claude Code** chat box:
 
-```bash
-git clone https://github.com/dreamfarer-space/antigravity-with-chatgpt.git && cd antigravity-with-chatgpt && node scripts/setup.mjs
-```
+> **Set up antigravity-with-chatgpt for me: clone https://github.com/dreamfarer-space/antigravity-with-chatgpt.git and run node scripts/setup.mjs to configure the environment and verify.**
 
-> **What `setup.mjs` configures in seconds:**
-> 1. Registers the native MCP server into Antigravity's global config (`~/.gemini/config/mcp_config.json`);
-> 2. Mounts the Antigravity 2.0 Skill junction (`~/.gemini/config/skills/antigravity-with-chatgpt`);
-> 3. Creates the desktop shortcut for an isolated Chrome debugging session (`127.0.0.1:9222`);
-> 4. Runs full self-tests (36/36 checks passing).
->
-> **To start pairing**: Double-click the newly created **"ChatGPT (Antigravity智脑)"** desktop shortcut (or launch Chrome with port 9222), log in once to your ChatGPT Web account, and start pairing directly inside Antigravity 2.0!
+Your AI Agent will handle the entire installation automatically:
+1. 🛠️ **Clone & Inspect**: Clones the repository and verifies the Node.js (>= 22) and Chrome environment;
+2. 🔌 **Register Native MCP Server**: Automatically updates `~/.gemini/config/mcp_config.json`;
+3. 🔗 **Mount Global Antigravity Skill**: Creates the skill junction in `~/.gemini/config/skills/antigravity-with-chatgpt`;
+4. 🖥️ **Generate Dedicated Chrome Shortcut**: Creates a desktop launcher with isolated profile and port `9222`;
+5. ✅ **Run Full Self-Checks**: Executes the 37-point architectural test suite to ensure 100% readiness.
+
+After setup, double-click the **"ChatGPT (Antigravity智脑)"** desktop shortcut to log in to your ChatGPT Web account once, and you can immediately delegate deep reasoning and adversarial code reviews to ChatGPT from within Antigravity 2.0!
+
+*(Manual terminal alternative: `git clone https://github.com/dreamfarer-space/antigravity-with-chatgpt.git && cd antigravity-with-chatgpt && node scripts/setup.mjs`)*
 
 ---
 

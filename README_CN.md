@@ -21,21 +21,22 @@
 
 ---
 
-## ⚡ 一句话极速安装 (Quick Install)
+## ⚡ 一句话让 AI 帮忙安装 (Prompt to Install via AI)
 
-环境要求仅需 **Node.js (>= 22.0.0)** 与 **Google Chrome**（无需 `npm install`，零第三方依赖）。在终端直接执行一行命令完成克隆与全自动配置：
+你不需要自己打开终端敲命令。直接将下面这**一句话**复制发送给你的 **Google Antigravity 2.0 / Gemini / Claude Code** 编程助手：
 
-```bash
-git clone https://github.com/dreamfarer-space/antigravity-with-chatgpt.git && cd antigravity-with-chatgpt && node scripts/setup.mjs
-```
+> **帮我接入 antigravity-with-chatgpt：克隆 https://github.com/dreamfarer-space/antigravity-with-chatgpt.git 并执行 node scripts/setup.mjs 完成环境配置与自检。**
 
-> **自动化配置过程：**
-> 1. 自动写入 Antigravity 2.0 全局 MCP 配置 (`~/.gemini/config/mcp_config.json`)；
-> 2. 自动挂载 Antigravity 全局 Skill 软链接 (`~/.gemini/config/skills/antigravity-with-chatgpt`)；
-> 3. 自动生成独立 Profile 的 Chrome 桌面快捷方式（绑定 `127.0.0.1:9222` 调试端口与专用数据目录）；
-> 4. 自动运行 36 项架构自检，确认 100% 就绪。
->
-> **极速上手**：双击桌面的 **「ChatGPT (Antigravity智脑)」** 快捷方式，在弹出的窗口中登录一次您的个人 ChatGPT 账号，即可在 Antigravity 2.0 中直接输入例如 *“请让 ChatGPT 帮我 review 当前代码”* 开启双脑协同！
+AI 助手收到后，会自动为你全流程完成：
+1. 🛠️ **自动克隆与环境就绪确认**：克隆仓库并确认 Node.js (>= 22) 与 Chrome 环境；
+2. 🔌 **自动注册全局 MCP 服务**：自动写入 `~/.gemini/config/mcp_config.json`；
+3. 🔗 **自动挂载 Antigravity 全局 Skill**：软链接至 `~/.gemini/config/skills/antigravity-with-chatgpt`；
+4. 🖥️ **自动创建专用 Chrome 快捷方式**：在桌面生成独立 Profile 调试会话图标（端口 `9222`）；
+5. ✅ **自动执行 37 项架构自检**：确认通信与安全边界 100% 准备就绪。
+
+配置完成后，双击桌面的 **「ChatGPT (Antigravity智脑)」** 登录一次你的 ChatGPT 个人账号，即可在 Antigravity 2.0 中随时通过例如 *“请让 ChatGPT 帮我 review 当前代码”* 开启双脑协同！
+
+*(注：如果你喜欢自己在终端手动操作，也可以直接运行：`git clone https://github.com/dreamfarer-space/antigravity-with-chatgpt.git && cd antigravity-with-chatgpt && node scripts/setup.mjs`)*
 
 ---
 
