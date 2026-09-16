@@ -852,8 +852,12 @@ export async function verifyUnknownReceiptOrThrow(cdp, submitReceipt, beforeTurn
   }
 
   const p = await evaluate(cdp, PROBE_JS, 3000).catch(() => null);
-  if (!p || (p.assistant?.count ?? 0) <= beforeTurns) {
-    throw new Error(`提交消息状态未知 (UNKNOWN/${submitReceipt.reason || 'timeout'})：未能在时限内获取新增回合证据，已中止以防重复提交`);
+  const userTurns = p?.userTurn?.count ?? p?.userTurns ?? 0;
+  const beforeUserTurns = typeof submitReceipt.beforeUserTurns === 'number' ? submitReceipt.beforeUserTurns : 0;
+
+  // 因果性强收据：必须有当前会话的 User Turn 实际增加证据，绝不能单独由 Assistant Turn 替代
+  if (!p || userTurns <= beforeUserTurns) {
+    throw new Error(`提交消息状态未知 (UNKNOWN/${submitReceipt.reason || 'timeout'})：未能在时限内获取 User Turn 递增因果证据 (baseline: ${beforeUserTurns}, current: ${userTurns})，已中止以防重复提交`);
   }
   return p;
 }

@@ -19,6 +19,74 @@ const DEFAULT_DIFF_MAX_BYTES = 64 * 1024; // 64 KB
 const DEFAULT_UNTRACKED_MAX_BYTES = 32 * 1024; // 32 KB
 
 /**
+ * 解析 Git porcelain 输出（全面兼容 -z NUL 分隔、重命名 old -> new、引号与特殊字符）
+ * @param {string} stdout
+ * @returns {{ staged: string[], modified: string[], untracked: string[] }}
+ */
+export function parseGitStatusOutput(stdout) {
+  const staged = [];
+  const modified = [];
+  const untracked = [];
+
+  if (typeof stdout !== 'string' || !stdout) {
+    return { staged, modified, untracked };
+  }
+
+  if (stdout.includes('\0')) {
+    const rawTokens = stdout.split('\0');
+    let i = 0;
+    while (i < rawTokens.length) {
+      const token = rawTokens[i];
+      if (!token) {
+        i++;
+        continue;
+      }
+      const code = token.slice(0, 2);
+      const file = token.slice(3);
+      i++;
+
+      if (code[0] === 'R' || code[0] === 'C') {
+        // porcelain -z 重命名/拷贝格式：XY <newPath>\0<oldPath>\0
+        const oldFile = rawTokens[i] || '';
+        i++;
+        if (file) staged.push(file);
+        if (oldFile) staged.push(oldFile);
+      } else if (code.startsWith('?') || code.startsWith('U')) {
+        if (file) untracked.push(file);
+      } else {
+        if (code[0] !== ' ' && code[0] !== '?') staged.push(file);
+        if (code[1] !== ' ' && code[1] !== '?') modified.push(file);
+      }
+    }
+  } else {
+    // 换行分隔 porcelain 回退兼容
+    for (const line of stdout.split('\n').filter(Boolean)) {
+      const code = line.slice(0, 2);
+      let file = line.slice(3).trim();
+      if (file.includes(' -> ')) {
+        const parts = file.split(' -> ').map((p) => p.replace(/^"(.*)"$/, '$1').trim());
+        if (code[0] !== ' ' && code[0] !== '?') staged.push(...parts);
+        if (code[1] !== ' ' && code[1] !== '?') modified.push(...parts);
+      } else {
+        file = file.replace(/^"(.*)"$/, '$1');
+        if (code.startsWith('?') || code.startsWith('U')) {
+          untracked.push(file);
+        } else {
+          if (code[0] !== ' ' && code[0] !== '?') staged.push(file);
+          if (code[1] !== ' ' && code[1] !== '?') modified.push(file);
+        }
+      }
+    }
+  }
+
+  return {
+    staged: Array.from(new Set(staged)),
+    modified: Array.from(new Set(modified)),
+    untracked: Array.from(new Set(untracked)),
+  };
+}
+
+/**
  * 获取 Git 状态摘要
  * @param {string} workspaceRoot
  * @returns {object} { isGitRepo, branch, staged: [], modified: [], untracked: [], summary }
@@ -35,34 +103,20 @@ export function getGitStatus(workspaceRoot) {
 
     const branch = (branchRes.stdout || '').trim();
 
-    const statusRes = spawnSync('git', ['-C', workspaceRoot, 'status', '--porcelain=v1'], {
+    const statusRes = spawnSync('git', ['-C', workspaceRoot, 'status', '--porcelain=v1', '-z'], {
       encoding: 'utf8',
       shell: false,
     });
 
-    const lines = (statusRes.stdout || '').split('\n').filter(Boolean);
-    const staged = [];
-    const modified = [];
-    const untracked = [];
-
-    for (const line of lines) {
-      const code = line.slice(0, 2);
-      const file = line.slice(3).trim();
-      if (code.startsWith('?') || code.startsWith('U')) {
-        untracked.push(file);
-      } else {
-        if (code[0] !== ' ' && code[0] !== '?') staged.push(file);
-        if (code[1] !== ' ' && code[1] !== '?') modified.push(file);
-      }
-    }
+    const parsed = parseGitStatusOutput(statusRes.stdout || '');
 
     return {
       isGitRepo: true,
       branch,
-      staged,
-      modified,
-      untracked,
-      summary: `Branch: ${branch} | Staged: ${staged.length}, Modified: ${modified.length}, Untracked: ${untracked.length}`,
+      staged: parsed.staged,
+      modified: parsed.modified,
+      untracked: parsed.untracked,
+      summary: `Branch: ${branch} | Staged: ${parsed.staged.length}, Modified: ${parsed.modified.length}, Untracked: ${parsed.untracked.length}`,
     };
   } catch (err) {
     return { isGitRepo: false, error: err.message };

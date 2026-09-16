@@ -15,9 +15,9 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { resolveSafePath, isPathContained, SecurityError } from '../src/security/path_guard.mjs';
 import { sanitizeContent, isSensitivePath, redactSensitive } from '../src/security/sensitive.mjs';
-import { runBrainTask, parseEvidenceRequests } from '../src/brain/orchestrator.mjs';
+import { runBrainTask, parseEvidenceRequests, buildEvidenceRoundSnippets, MAX_AGGREGATE_EVIDENCE_BYTES } from '../src/brain/orchestrator.mjs';
 import { recordExecution } from '../src/execution/recorder.mjs';
-import { getUntrackedEvidence, truncateUtf8ByBytes, getGitDiff, getReviewEvidence } from '../src/git/git_helper.mjs';
+import { getUntrackedEvidence, truncateUtf8ByBytes, getGitDiff, getReviewEvidence, parseGitStatusOutput } from '../src/git/git_helper.mjs';
 import { evaluate, getInjectionTimeout, SUBMIT_STATUS, insertTextReliable, submitMessageReliable, verifyUnknownReceiptOrThrow } from '../src/transport/cdp_transport.mjs';
 import { readFileSafe } from '../src/workspace/context_provider.mjs';
 import { computeFingerprint, BROWSER_FINGERPRINT_SNIPPET } from '../src/transport/fingerprint.mjs';
@@ -799,10 +799,44 @@ Also need to check another file:
     }
   });
 
+  test('readFileSafe 拦截指向 .env 的工作区内符号链接别名并抛出 E_SENSITIVE_FILE', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-symlink-alias-'));
+    try {
+      const envPath = path.join(tmpDir, '.env');
+      fs.writeFileSync(envPath, 'SECRET_KEY=leak_attempt_via_symlink', 'utf8');
+      const aliasPath = path.join(tmpDir, 'harmless_alias.txt');
+      fs.symlinkSync(envPath, aliasPath, 'file');
+      assert.throws(
+        () => readFileSafe(tmpDir, 'harmless_alias.txt'),
+        (err) => err instanceof SecurityError && err.code === 'E_SENSITIVE_FILE'
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('readFileSafe 拦截指向 .brainignore 忽略文件的符号链接别名并抛出 E_IGNORED_FILE', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-symlink-ignore-'));
+    try {
+      fs.writeFileSync(path.join(tmpDir, '.brainignore'), 'ignored_dir/\n', 'utf8');
+      fs.mkdirSync(path.join(tmpDir, 'ignored_dir'));
+      const secretFile = path.join(tmpDir, 'ignored_dir', 'hidden.txt');
+      fs.writeFileSync(secretFile, 'confidential data', 'utf8');
+      const aliasPath = path.join(tmpDir, 'innocent_alias.txt');
+      fs.symlinkSync(secretFile, aliasPath, 'file');
+      assert.throws(
+        () => readFileSafe(tmpDir, 'innocent_alias.txt'),
+        (err) => err instanceof SecurityError && err.code === 'E_IGNORED_FILE'
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   // ---------------------------------------------------------------------------
-  // 19. UNKNOWN 提交收据绝对 Fail-Closed 校验测试
+  // 19. UNKNOWN 提交收据因果性 Fail-Closed 校验测试
   // ---------------------------------------------------------------------------
-  console.log('\n19. UNKNOWN 提交收据绝对 Fail-Closed 校验测试:');
+  console.log('\n19. UNKNOWN 提交收据因果性 Fail-Closed 校验测试:');
 
   await testAsync('verifyUnknownReceiptOrThrow: baseline_probe_failed 立即抛错中止，严禁二次弱证据放行', async () => {
     const dummyCdp = {
@@ -818,16 +852,17 @@ Also need to check another file:
     );
   });
 
-  await testAsync('verifyUnknownReceiptOrThrow: receipt_timeout 时即便 stopButton 存在但 turns 未递增也必须中止', async () => {
+  await testAsync('verifyUnknownReceiptOrThrow: receipt_timeout 时即便 stopButton 存在且 assistant 回合增加，但 userTurns 未递增也必须中止 (防因果断裂)', async () => {
     const mockCdpOldStreaming = {
       send: async (method, params) => {
         if (params?.expression) {
-          // 旧的流式输出：stopButton 为 true，但 assistant.count 为 1 (未递增)
+          // 旧的流式输出：stopButton 为 true，assistant.count 为 2 (递增)，但 userTurn.count 仍为 1 (未因本次提交递增)
           return {
             result: {
               value: {
                 stopButton: { found: true },
-                assistant: { count: 1, len: 100, hash: 123 },
+                assistant: { count: 2, len: 100, hash: 123 },
+                userTurn: { count: 1 },
               },
             },
           };
@@ -838,13 +873,13 @@ Also need to check another file:
 
     await assert.rejects(
       async () => {
-        await verifyUnknownReceiptOrThrow(mockCdpOldStreaming, { status: SUBMIT_STATUS.UNKNOWN, reason: 'receipt_timeout' }, 1);
+        await verifyUnknownReceiptOrThrow(mockCdpOldStreaming, { status: SUBMIT_STATUS.UNKNOWN, reason: 'receipt_timeout', beforeUserTurns: 1 }, 1);
       },
       /提交消息状态未知/
     );
   });
 
-  await testAsync('verifyUnknownReceiptOrThrow: receipt_timeout 时明确探测到 turns 递增才允许通过', async () => {
+  await testAsync('verifyUnknownReceiptOrThrow: receipt_timeout 时明确探测到 userTurn 递增才允许通过 (因果强收据)', async () => {
     const mockCdpTurnIncrement = {
       send: async (method, params) => {
         if (params?.expression) {
@@ -853,6 +888,7 @@ Also need to check another file:
               value: {
                 stopButton: { found: true },
                 assistant: { count: 2, len: 50, hash: 456 },
+                userTurn: { count: 2 },
               },
             },
           };
@@ -861,55 +897,105 @@ Also need to check another file:
       },
     };
 
-    const res = await verifyUnknownReceiptOrThrow(mockCdpTurnIncrement, { status: SUBMIT_STATUS.UNKNOWN, reason: 'receipt_timeout' }, 1);
-    assert.equal(res.assistant.count, 2);
+    const res = await verifyUnknownReceiptOrThrow(mockCdpTurnIncrement, { status: SUBMIT_STATUS.UNKNOWN, reason: 'receipt_timeout', beforeUserTurns: 1 }, 1);
+    assert.equal(res.userTurn.count, 2);
   });
 
   // ---------------------------------------------------------------------------
-  // 20. 闭环证据拉取 Confused-Deputy 防护与 128KB 预算钳位测试
+  // 20. 闭环证据拉取生产实现测试 (128KB 序列化预算记账、截断与 Confused-Deputy)
   // ---------------------------------------------------------------------------
-  console.log('\n20. 闭环证据拉取安全性测试 (Confused-Deputy 与 128KB 预算钳位):');
+  console.log('\n20. 闭环证据拉取安全性测试 (生产 buildEvidenceRoundSnippets 序列化总上限记账):');
 
-  test('Evidence protocol: 严格限制仅能自动拉取 Manifest 清单内文件 (防 Confused-Deputy)', () => {
-    const manifestFiles = new Set(['src/index.js', 'package.json']);
-    const attackPaths = [
-      '../outside.env',
-      '../../secret.pem',
-      'src/other_sensitive.key',
-      '.env',
-    ];
-    for (const p of attackPaths) {
-      const norm = path.normalize(p).replace(/\\/g, '/').replace(/^\.\//, '');
-      assert.equal(manifestFiles.has(norm), false, `路径 ${p} 应被 Confused-Deputy 白名单拦截`);
+  test('Evidence protocol: 生产 buildEvidenceRoundSnippets 限制单轮上限 (8项) 且拒绝片段全额计入预算', () => {
+    const manifestFiles = new Set(['src/index.js']);
+    // 构造 100 个清单外的恶意读取请求
+    const attackRequests = [];
+    for (let i = 1; i <= 100; i++) {
+      attackRequests.push({
+        type: 'read_file',
+        path: `outside-file-${String(i).padStart(4, '0')}.txt`,
+      });
     }
-    assert.equal(manifestFiles.has('src/index.js'), true);
+
+    // 单轮处理：必须被截断至最多 8 个请求
+    const round1 = buildEvidenceRoundSnippets({
+      requests: attackRequests,
+      workspace: os.tmpdir(),
+      reviewManifestFiles: manifestFiles,
+      currentAggregateBytes: 0,
+      maxAggregateBytes: MAX_AGGREGATE_EVIDENCE_BYTES,
+      round: 1,
+    });
+
+    // 应该包含 1 条截断提示 + 8 条拒绝证据
+    assert.ok(round1.snippets.length <= 9);
+    assert.ok(round1.snippets.some((s) => s.includes('Per-round evidence request cap')));
+    assert.ok(round1.snippets.some((s) => s.includes('outside-file-0001.txt')));
+
+    // 核心断言：拒绝片段必须全额增加 aggregateBytes，严禁保持为 0！
+    assert.ok(round1.newAggregateBytes > 0, '拒绝片段必须消耗序列化字节预算');
+
+    // 持续多轮累加测试：当累积达到 128KB 预算时，触发 budgetReached 且字节永不超上限
+    let rollingBytes = round1.newAggregateBytes;
+    let roundNum = 2;
+    let finalBudgetReached = false;
+
+    for (let loop = 0; loop < 200; loop++) {
+      const res = buildEvidenceRoundSnippets({
+        requests: attackRequests,
+        workspace: os.tmpdir(),
+        reviewManifestFiles: manifestFiles,
+        currentAggregateBytes: rollingBytes,
+        maxAggregateBytes: MAX_AGGREGATE_EVIDENCE_BYTES,
+        round: roundNum++,
+      });
+      rollingBytes = res.newAggregateBytes;
+      if (res.budgetReached) {
+        finalBudgetReached = true;
+        break;
+      }
+    }
+
+    assert.equal(finalBudgetReached, true, '多轮攻击后必须触发 budgetReached 截断');
+    assert.ok(rollingBytes <= MAX_AGGREGATE_EVIDENCE_BYTES, `总序列化证据字节 (${rollingBytes}) 必须严格 <= ${MAX_AGGREGATE_EVIDENCE_BYTES}`);
   });
 
-  test('Evidence protocol: 128KB 动态预算钳位测试确保永不发生预算膨胀', () => {
-    const MAX_AGGREGATE_BYTES = 128 * 1024;
-    let aggregateBytes = 0;
+  test('Evidence protocol: MAX_PATH_LENGTH 超长请求路径拦截', () => {
+    const manifestFiles = new Set(['src/index.js']);
+    const longPath = 'a/'.repeat(200) + 'test.js'; // > 400 字符
+    const res = buildEvidenceRoundSnippets({
+      requests: [{ type: 'read_file', path: longPath }],
+      workspace: os.tmpdir(),
+      reviewManifestFiles: manifestFiles,
+      currentAggregateBytes: 0,
+    });
+    assert.ok(res.snippets.some((s) => s.includes('exceeds maximum allowed length')));
+  });
 
-    // 假设第一轮返回 70KB
-    const r1Requested = 100 * 1024;
-    const r1Budget = MAX_AGGREGATE_BYTES - aggregateBytes;
-    const r1Allowed = Math.min(r1Requested, r1Budget);
-    assert.equal(r1Allowed, 100 * 1024);
-    aggregateBytes += 70 * 1024;
+  // ---------------------------------------------------------------------------
+  // 21. Git Status porcelain -z 与重命名/特殊字符健壮性测试
+  // ---------------------------------------------------------------------------
+  console.log('\n21. Git Status porcelain -z 与重命名/特殊字符健壮性测试:');
 
-    // 第二轮请求 100KB，剩余 58KB，必须钳位至 58KB
-    const r2Requested = 100 * 1024;
-    const r2Budget = MAX_AGGREGATE_BYTES - aggregateBytes;
-    assert.equal(r2Budget, 58 * 1024);
-    const r2Allowed = Math.min(r2Requested, r2Budget);
-    assert.equal(r2Allowed, 58 * 1024);
-    aggregateBytes += r2Allowed;
+  test('parseGitStatusOutput: 正确解析 porcelain -z 重命名、空格路径与未跟踪文件', () => {
+    // 构造标准的 porcelain -z NUL 分隔流：
+    // R  new name.js\0old name.js\0 M normal with space.js\0?? untracked unicode 中文.txt\0
+    const zPayload = 'R  new name.js\0old name.js\0 M normal with space.js\0?? untracked unicode 中文.txt\0';
+    const parsed = parseGitStatusOutput(zPayload);
 
-    // 此时 aggregateBytes 达到 128KB 上限
-    assert.equal(aggregateBytes, MAX_AGGREGATE_BYTES);
+    assert.deepEqual(parsed.staged.sort(), ['new name.js', 'old name.js'].sort(), '重命名文件新旧路径均应纳入 manifest');
+    assert.deepEqual(parsed.modified, ['normal with space.js'], '带空格文件名正确提取');
+    assert.deepEqual(parsed.untracked, ['untracked unicode 中文.txt'], '多字节 Unicode 文件名正确提取');
+  });
 
-    // 第三轮预算剩余 0，必须直接拒绝
-    const r3Budget = MAX_AGGREGATE_BYTES - aggregateBytes;
-    assert.equal(r3Budget, 0);
+  test('parseGitStatusOutput: 正确兼容换行分隔 porcelain 回退输出 (含 "old -> new" 与引号)', () => {
+    const v1Payload = 'R  "old file with space.js" -> "new file with space.js"\n M "another file.js"\n?? untracked.txt\n';
+    const parsed = parseGitStatusOutput(v1Payload);
+
+    assert.ok(parsed.staged.includes('old file with space.js'));
+    assert.ok(parsed.staged.includes('new file with space.js'));
+    assert.ok(parsed.modified.includes('another file.js'));
+    assert.ok(parsed.untracked.includes('untracked.txt'));
   });
 
   console.log(`\n========================================`);

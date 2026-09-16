@@ -79,18 +79,29 @@ export function readFileSafe(workspaceRoot, filePath, options = {}) {
   const safePath = resolveSafePath(workspaceRoot, filePath);
   const relPath = path.relative(workspaceRoot, safePath).replace(/\\/g, '/');
 
-  // 1. 检查是否为敏感文件
-  if (isSensitivePath(relPath)) {
-    throw new SecurityError(`安全拦截: 禁止读取敏感文件 "${relPath}"`, 'E_SENSITIVE_FILE');
+  // 符号链接与真实物理路径解析 (防 in-workspace symlink alias 绕过敏感文件与 .brainignore 规则)
+  let canonicalPath = safePath;
+  let canonicalRelPath = relPath;
+  try {
+    canonicalPath = fs.realpathSync(safePath);
+    const realRoot = fs.existsSync(workspaceRoot) ? fs.realpathSync(workspaceRoot) : path.resolve(workspaceRoot);
+    canonicalRelPath = path.relative(realRoot, canonicalPath).replace(/\\/g, '/');
+  } catch (err) {
+    throw new SecurityError(`无法解析文件物理路径: "${relPath}" (${err.message})`, 'E_INVALID_PATH');
   }
 
-  // 2. 检查 .brainignore
+  // 1. 词法路径与真实物理路径双重检查：敏感文件拦截
+  if (isSensitivePath(relPath) || isSensitivePath(canonicalRelPath)) {
+    throw new SecurityError(`安全拦截: 禁止读取敏感文件 "${relPath}"${canonicalRelPath !== relPath ? ` (指向敏感目标 "${canonicalRelPath}")` : ''}`, 'E_SENSITIVE_FILE');
+  }
+
+  // 2. 词法路径与真实物理路径双重检查：.brainignore 规则拦截
   const ignore = loadBrainIgnore(workspaceRoot);
-  if (ignore.ignores(relPath, false)) {
-    throw new SecurityError(`规则拦截: 文件 "${relPath}" 匹配 .brainignore`, 'E_IGNORED_FILE');
+  if (ignore.ignores(relPath, false) || ignore.ignores(canonicalRelPath, false)) {
+    throw new SecurityError(`规则拦截: 文件 "${relPath}"${canonicalRelPath !== relPath ? ` (指向忽略目标 "${canonicalRelPath}")` : ''} 匹配 .brainignore`, 'E_IGNORED_FILE');
   }
 
-  const stat = fs.statSync(safePath);
+  const stat = fs.statSync(canonicalPath);
   if (!stat.isFile()) {
     throw new SecurityError(`无法读取非普通文件: "${relPath}"`, stat.isDirectory() ? 'E_IS_DIRECTORY' : 'E_NOT_A_FILE');
   }
@@ -101,7 +112,7 @@ export function readFileSafe(workspaceRoot, filePath, options = {}) {
   }
 
   const maxBytes = options.maxBytes || DEFAULT_FILE_MAX_BYTES;
-  const buf = fs.readFileSync(safePath);
+  const buf = fs.readFileSync(canonicalPath);
 
   if (isBinary(buf)) {
     throw new SecurityError(`安全拦截: 拒绝读取二进制文件 "${relPath}"`, 'E_BINARY_FILE');

@@ -61,6 +61,152 @@ export function parseEvidenceRequests(text) {
   return requests;
 }
 
+export const MAX_AGGREGATE_EVIDENCE_BYTES = 128 * 1024; // 128 KB 证据总开销上限
+export const MAX_REQUESTS_PER_ROUND = 8;
+export const MAX_PATH_LENGTH = 256;
+
+/**
+ * 处理单轮证据请求，生成严格受控且有界的序列化证据内容
+ * @param {object} params
+ * @param {Array<object>} params.requests
+ * @param {string} params.workspace
+ * @param {Set<string>} params.reviewManifestFiles
+ * @param {number} [params.currentAggregateBytes=0]
+ * @param {number} [params.maxAggregateBytes=131072]
+ * @param {number} [params.round=1]
+ * @returns {{ snippets: string[], newAggregateBytes: number, audit: object[], budgetReached: boolean }}
+ */
+export function buildEvidenceRoundSnippets({
+  requests,
+  workspace,
+  reviewManifestFiles,
+  currentAggregateBytes = 0,
+  maxAggregateBytes = MAX_AGGREGATE_EVIDENCE_BYTES,
+  round = 1,
+}) {
+  let aggregateBytes = currentAggregateBytes;
+  const snippets = [];
+  const audit = [];
+  let budgetReached = false;
+
+  const boundedRequests = (requests || []).slice(0, MAX_REQUESTS_PER_ROUND);
+  if ((requests || []).length > MAX_REQUESTS_PER_ROUND) {
+    const notice = `[NOTICE: Per-round evidence request cap (${MAX_REQUESTS_PER_ROUND}) applied; remaining requests deferred.]`;
+    const noticeBytes = Buffer.byteLength(notice, 'utf8') + 2;
+    if (aggregateBytes + noticeBytes <= maxAggregateBytes) {
+      snippets.push(notice);
+      aggregateBytes += noticeBytes;
+    }
+  }
+
+  function tryAppendSnippet(snippet) {
+    const snippetBytes = Buffer.byteLength(snippet, 'utf8') + 2; // 含换行符开销
+    if (aggregateBytes + snippetBytes > maxAggregateBytes) {
+      if (!budgetReached) {
+        budgetReached = true;
+        const ceilingNotice = `[NOTICE: Aggregate evidence budget ceiling (${maxAggregateBytes}B) reached. Truncating further evidence.]`;
+        const ceilingBytes = Buffer.byteLength(ceilingNotice, 'utf8') + 2;
+        if (aggregateBytes + ceilingBytes <= maxAggregateBytes) {
+          snippets.push(ceilingNotice);
+          aggregateBytes += ceilingBytes;
+        }
+      }
+      return false;
+    }
+    snippets.push(snippet);
+    aggregateBytes += snippetBytes;
+    return true;
+  }
+
+  for (const req of boundedRequests) {
+    if (budgetReached || aggregateBytes >= maxAggregateBytes) {
+      budgetReached = true;
+      break;
+    }
+
+    if (req.type === 'git_diff') {
+      const remaining = maxAggregateBytes - aggregateBytes;
+      if (remaining <= 256) {
+        budgetReached = true;
+        break;
+      }
+      const reqOffset = Math.max(0, Number(req.offset) || 0);
+      const requestedMax = Math.min(Math.max(1024, Number(req.maxBytes) || 32768), 65536);
+      // 为 Markdown 标题与分隔符预留 256 字节裕量
+      const allowedPayload = Math.max(512, Math.min(requestedMax, remaining - 256));
+
+      const diffRes = getGitDiff(workspace, {
+        offset: reqOffset,
+        maxBytes: allowedPayload,
+        head: true,
+        file: req.file,
+      });
+
+      const snippet = `### [EVIDENCE: GIT DIFF PAGE (offset: ${reqOffset}, returned: ${diffRes.returnedBytes}B)]\n${diffRes.diff}`;
+      if (!tryAppendSnippet(snippet)) break;
+
+      audit.push({
+        round,
+        type: 'git_diff',
+        offset: reqOffset,
+        returnedBytes: diffRes.returnedBytes,
+        hasMore: diffRes.hasMore,
+        nextOffset: diffRes.nextOffset,
+      });
+    } else if (req.type === 'read_file' && req.path) {
+      const rawPathStr = String(req.path).trim();
+      if (rawPathStr.length > MAX_PATH_LENGTH) {
+        const snippet = `### [EVIDENCE: REJECTED \`${rawPathStr.slice(0, 32)}...\`]\nError: Requested path exceeds maximum allowed length (${MAX_PATH_LENGTH} chars).`;
+        tryAppendSnippet(snippet);
+        continue;
+      }
+
+      const normPath = path.normalize(rawPathStr).replace(/\\/g, '/').replace(/^\.\//, '');
+      if (reviewManifestFiles && !reviewManifestFiles.has(normPath)) {
+        const snippet = `### [EVIDENCE: REJECTED \`${normPath}\`]\nError: Security policy prevents automated reading of files outside the active change/attachment manifest.`;
+        tryAppendSnippet(snippet);
+        continue;
+      }
+
+      const remaining = maxAggregateBytes - aggregateBytes;
+      if (remaining <= 256) {
+        budgetReached = true;
+        break;
+      }
+      const requestedMax = Math.min(Math.max(512, Number(req.maxBytes) || 32768), 65536);
+      const allowedPayload = Math.max(256, Math.min(requestedMax, remaining - 256));
+
+      try {
+        const fileRes = readFileSafe(workspace, normPath, { maxBytes: allowedPayload });
+        const snippet = `### [EVIDENCE: FILE CONTENT \`${normPath}\`]\n\`\`\`\n${fileRes.content}\n\`\`\``;
+        if (!tryAppendSnippet(snippet)) break;
+
+        audit.push({
+          round,
+          type: 'read_file',
+          path: normPath,
+          bytes: Buffer.byteLength(fileRes.content, 'utf8'),
+        });
+      } catch (err) {
+        const snippet = `### [EVIDENCE: FAILED TO READ \`${normPath}\`]\nError: ${err.message}`;
+        tryAppendSnippet(snippet);
+      }
+    }
+  }
+
+  // 严格硬性不变式断言 (Hard Invariant)
+  if (aggregateBytes > maxAggregateBytes) {
+    throw new Error(`Aggregate evidence bytes (${aggregateBytes}) strictly exceeded ceiling (${maxAggregateBytes})`);
+  }
+
+  return {
+    snippets,
+    newAggregateBytes: aggregateBytes,
+    audit,
+    budgetReached,
+  };
+}
+
 /**
  * 运行一次完整的大脑推理任务
  * @param {object} options
@@ -208,95 +354,45 @@ export async function runBrainTask(options = {}) {
       }
 
       evidenceRounds++;
-      const evidenceSnippets = [];
+      const roundRes = buildEvidenceRoundSnippets({
+        requests,
+        workspace,
+        reviewManifestFiles,
+        currentAggregateBytes: aggregateBytes,
+        maxAggregateBytes: MAX_AGGREGATE_EVIDENCE_BYTES,
+        round: evidenceRounds,
+      });
 
-      for (const req of requests) {
-        const remainingBudget = MAX_AGGREGATE_BYTES - aggregateBytes;
-        if (remainingBudget <= 0) {
-          evidenceSnippets.push(`[NOTICE: Aggregate evidence budget (${MAX_AGGREGATE_BYTES}B) reached. Proceeding with review.]`);
-          break;
-        }
+      aggregateBytes = roundRes.newAggregateBytes;
+      evidenceAudit.push(...roundRes.audit);
 
-        if (req.type === 'git_diff') {
-          const reqOffset = Math.max(0, Number(req.offset) || 0);
-          const requestedMax = Math.min(Math.max(1024, Number(req.maxBytes) || 32768), 65536);
-          const allowedMax = Math.min(requestedMax, remainingBudget);
-          if (allowedMax <= 0) {
-            evidenceSnippets.push(`[NOTICE: Aggregate evidence budget reached for git_diff.]`);
-            break;
-          }
-
-          const diffRes = getGitDiff(workspace, {
-            offset: reqOffset,
-            maxBytes: allowedMax,
-            head: true,
-            file: req.file,
-          });
-
-          aggregateBytes += diffRes.returnedBytes;
-          evidenceAudit.push({
-            round: evidenceRounds,
-            type: 'git_diff',
-            offset: reqOffset,
-            returnedBytes: diffRes.returnedBytes,
-            hasMore: diffRes.hasMore,
-            nextOffset: diffRes.nextOffset,
-          });
-
-          evidenceSnippets.push(`### [EVIDENCE: GIT DIFF PAGE (offset: ${reqOffset}, returned: ${diffRes.returnedBytes}B)]\n${diffRes.diff}`);
-        } else if (req.type === 'read_file' && req.path) {
-          const normPath = path.normalize(String(req.path).trim()).replace(/\\/g, '/').replace(/^\.\//, '');
-          if (!reviewManifestFiles.has(normPath)) {
-            evidenceSnippets.push(`### [EVIDENCE: REJECTED \`${req.path}\`]\nError: Security policy prevents automated reading of files outside the active change/attachment manifest.`);
-            continue;
-          }
-
-          const requestedMax = Math.min(Math.max(512, Number(req.maxBytes) || 32768), 65536);
-          const allowedMax = Math.min(requestedMax, remainingBudget);
-          if (allowedMax <= 0) {
-            evidenceSnippets.push(`[NOTICE: Aggregate evidence budget reached for read_file.]`);
-            break;
-          }
-
-          try {
-            const fileRes = readFileSafe(workspace, req.path, { maxBytes: allowedMax });
-            const bytes = Buffer.byteLength(fileRes.content, 'utf8');
-            aggregateBytes += bytes;
-            evidenceAudit.push({
-              round: evidenceRounds,
-              type: 'read_file',
-              path: req.path,
-              bytes,
-            });
-            evidenceSnippets.push(`### [EVIDENCE: FILE CONTENT \`${req.path}\`]\n\`\`\`\n${fileRes.content}\n\`\`\``);
-          } catch (err) {
-            evidenceSnippets.push(`### [EVIDENCE: FAILED TO READ \`${req.path}\`]\nError: ${err.message}`);
-          }
-        }
-      }
-
-      // 硬性不变式断言 (Hard Invariant Assertion)
-      if (aggregateBytes > MAX_AGGREGATE_BYTES) {
-        throw new Error(`Aggregate evidence bytes (${aggregateBytes}) exceeded hard invariant ceiling (${MAX_AGGREGATE_BYTES})`);
-      }
-
-      if (evidenceSnippets.length === 0) break;
+      if (roundRes.snippets.length === 0) break;
 
       const followUpPrompt = [
         '[ANTIGRAVITY-BRIDGE/EVIDENCE_RESPONSE]',
         'Here is the requested workspace evidence:',
         '',
-        evidenceSnippets.join('\n\n'),
+        roundRes.snippets.join('\n\n'),
         '',
         'Please incorporate this empirical evidence and finalize your review with an explicit verdict ([APPROVED] or [CHANGES REQUESTED]).',
       ].join('\n');
 
       const safeFollowUp = sanitizeContent(followUpPrompt);
+      const followUpBytes = Buffer.byteLength(safeFollowUp, 'utf8');
+
+      // 严格硬性不变式断言 (Hard Post-Serialization Invariant)
+      const MAX_FOLLOWUP_PROMPT_BYTES = 256 * 1024;
+      if (followUpBytes > MAX_FOLLOWUP_PROMPT_BYTES) {
+        throw new Error(`Follow-up evidence prompt (${followUpBytes}B) exceeded maximum safe prompt limit (${MAX_FOLLOWUP_PROMPT_BYTES}B)`);
+      }
+
       cdpRes = await sendPromptViaCdp({
         prompt: safeFollowUp,
         mode: 'reuse',
         timeoutS,
       });
+
+      if (roundRes.budgetReached) break;
     }
   }
 
