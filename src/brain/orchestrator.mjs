@@ -67,6 +67,9 @@ export async function runBrainTask(options = {}) {
       if (evidence.hasDiff && evidence.diff) {
         diffParts.push(evidence.diff);
       }
+      if (evidence.untrackedContent) {
+        diffParts.push(`### Untracked Files Content Evidence:\n${evidence.untrackedContent}`);
+      }
       if (diffParts.length > 0) {
         gitDiffBlock = diffParts.join('\n\n');
       }

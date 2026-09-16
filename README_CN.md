@@ -29,13 +29,13 @@
 - **执行权归本地（Antigravity Owns Local Execution）**：文件读写、Shell 终端、单元测试严格属于本地 Antigravity Agent；
 - **思考与审查归云端（ChatGPT Owns Reasoning & Review）**：高阶规划、纯脑力推导与闭环交叉审查委托给 ChatGPT 网页版；
 - **本地会话复用（Local Session Reuse）**：复用独立 Chrome Profile 中已登录的个人 ChatGPT 网页会话（Free / Plus / Pro），无需单独申请 API Key，严格在正常个人 Web 会话范畴内运行；
-- **零 npm 依赖（Zero Dependencies）**：纯 Node.js 22+ 原生标准库（原生 WebSocket、Fetch、Crypto、ChildProcess），秒级启动，免除供应链依赖安全风险。
+- **零 npm 依赖（Zero Dependencies）**：纯 Node.js 22+ 原生标准库（原生 WebSocket、Fetch、Crypto、ChildProcess），秒级启动，零第三方 npm 运行时依赖攻击面。
 
 ---
 
 ## 🌟 核心特性
 
-- ⚡ **毫秒级极速注入**：采用 `execCommand('insertText')` + Base64 编码，绕过海量单字符输入事件，万字提示词 4ms 内极速注入 ProseMirror。
+- ⚡ **毫秒级极速注入**：采用 `execCommand('insertText')` + Base64 编码，绕过海量单字符输入事件，万字提示词 5ms 内极速注入 ProseMirror。
 - 🛡️ **纵深防御型本地安全边界（Defense-in-Depth Local Security Boundary）**：
   - **`path_guard.mjs`**：跨平台原生路径相对化计算，拦截 `../` 目录逃逸、NUL 字符注入及符号链接（Symlink）越界；
   - **`sensitive.mjs`**：严格拦截 `.env*`、私钥、证书；外发前自动对 OpenAI Key、GitHub Token、AWS 凭据、Bearer Token 进行全局脱敏；
@@ -236,11 +236,14 @@ node tests/security_adversarial.test.mjs
 ```
 
 **测试覆盖率与结果：**
-- ✅ **48 / 48 项细分测试 100% 全部通过（0 失败，0 告警）**
+- ✅ **55 / 55 项细分测试 100% 全部通过（0 失败，0 告警）**
   - 路径跨目录/NUL字符/大小写语义拦截：5/5
   - 多行 PEM 私钥/带空格密码/Bearer Token 脱敏：5/5
   - 出口统一脱敏（Egress Sanitization）泄漏防御：2/2
   - 编排器输入防御性契约测试：2/2
+  - 执行证据记录器输入严格契约校验：4/4
+  - CDP evaluate 与 awaitPromise 回归测试：2/2
+  - 未跟踪文件内容提取与脱敏测试：1/1
   - 核心架构模块完整性与 CDP 探测：34/34
 
 ---

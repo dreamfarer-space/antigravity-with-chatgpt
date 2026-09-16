@@ -29,13 +29,13 @@ Inspired by the notable community project `XiaoDuoYa/codex-with-chatgpt` (**"Cha
 - **Local Agent Owns Execution**: File edits, shell terminal commands, build pipelines, and unit tests strictly belong to Antigravity.
 - **ChatGPT Owns Reasoning & Review**: High-level task planning, mathematical derivations, and adversarial code reviews are delegated to ChatGPT Web.
 - **Local Session Reuse**: Connects directly to your authenticated browser session (Free, Plus, or Pro) running in an isolated local Chrome profile—no separate API key required, operating strictly within standard personal web session parameters.
-- **Zero npm Dependencies**: Written entirely in native Node.js 22+ standard library (native WebSocket, fetch, crypto, child_process)—lightning fast startup, zero supply-chain attack surface.
+- **Zero npm Dependencies**: Written entirely in native Node.js 22+ standard library (native WebSocket, fetch, crypto, child_process)—lightning fast startup, zero third-party npm runtime dependency surface.
 
 ---
 
 ## 🌟 Key Features
 
-- ⚡ **Sub-Millisecond DOM Injection**: Utilizes `execCommand('insertText')` combined with Base64 encoding to bypass ProseMirror per-character event overhead, injecting 10,000+ characters in under 5ms.
+- ⚡ **Millisecond-Scale DOM Injection**: Utilizes `execCommand('insertText')` combined with Base64 encoding to bypass ProseMirror per-character event overhead, injecting 10,000+ characters in under 5ms.
 - 🛡️ **Defense-in-Depth Local Security Boundary**:
   - **`path_guard.mjs`**: Platform-aware relative path containment, strictly preventing `../` traversal, NUL byte injection, and symlink breakout.
   - **`sensitive.mjs`**: Blocks `.env*`, SSH keys, and certificates; automatically redacts OpenAI API keys, GitHub tokens, AWS credentials, and Bearer tokens.
@@ -236,11 +236,14 @@ node tests/security_adversarial.test.mjs
 ```
 
 **Results:**
-- ✅ **48 / 48 Tests Passed (100%)**
+- ✅ **55 / 55 Tests Passed (100%)**
   - Path traversal, NUL injection & case-sensitivity: 5/5
   - Multi-line PEM, spaced secret assignment & Bearer token redaction: 5/5
   - Egress sanitization leakage prevention: 2/2
   - Orchestrator defensive contract validation: 2/2
+  - Execution recorder strict input validation: 4/4
+  - CDP evaluate & awaitPromise regression tests: 2/2
+  - Untracked files content evidence extraction & sensitive masking: 1/1
   - Core component integrity & CDP live probing: 34/34
 
 ---

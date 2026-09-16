@@ -341,7 +341,7 @@ export class CDP {
   }
 }
 
-async function evaluate(cdp, expression, optionsOrTimeout = 20000) {
+export async function evaluate(cdp, expression, optionsOrTimeout = 20000) {
   const opts = typeof optionsOrTimeout === 'number'
     ? { timeoutMs: optionsOrTimeout, awaitPromise: false }
     : { timeoutMs: 20000, awaitPromise: false, ...optionsOrTimeout };

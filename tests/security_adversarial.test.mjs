@@ -14,6 +14,9 @@ import fs from 'node:fs';
 import { resolveSafePath, isPathContained, SecurityError } from '../src/security/path_guard.mjs';
 import { sanitizeContent, isSensitivePath, redactSensitive } from '../src/security/sensitive.mjs';
 import { runBrainTask } from '../src/brain/orchestrator.mjs';
+import { recordExecution } from '../src/execution/recorder.mjs';
+import { getUntrackedEvidence } from '../src/git/git_helper.mjs';
+import { evaluate } from '../src/transport/cdp_transport.mjs';
 
 let passed = 0;
 let total = 0;
@@ -158,6 +161,83 @@ async function runAsyncTests() {
     await assert.rejects(async () => {
       await runBrainTask({ prompt: 12345 });
     }, TypeError);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 5. 执行证据记录器严格输入契约校验 (recordExecution Input Validation)
+  // ---------------------------------------------------------------------------
+  console.log('\n5. 执行证据记录器输入契约校验:');
+
+  test('recordExecution 拦截非对象或空参数', () => {
+    assert.throws(() => recordExecution(null), TypeError);
+    assert.throws(() => recordExecution(undefined), TypeError);
+    assert.throws(() => recordExecution('invalid'), TypeError);
+  });
+
+  test('recordExecution 拦截缺失或空 command', () => {
+    assert.throws(() => recordExecution({ command: '' }), TypeError);
+    assert.throws(() => recordExecution({ command: '   ' }), TypeError);
+    assert.throws(() => recordExecution({ command: null }), TypeError);
+  });
+
+  test('recordExecution 拦截缺失或非整数 exitCode', () => {
+    assert.throws(() => recordExecution({ command: 'npm test' }), TypeError);
+    assert.throws(() => recordExecution({ command: 'npm test', exitCode: 'abc' }), TypeError);
+    assert.throws(() => recordExecution({ command: 'npm test', exitCode: 1.5 }), TypeError);
+  });
+
+  test('recordExecution 合法参数成功记录', () => {
+    const rec = recordExecution({ command: 'npm test', exitCode: 0 });
+    assert.equal(rec.command, 'npm test');
+    assert.equal(rec.exitCode, 0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 6. CDP evaluate 与 awaitPromise 回归测试 (awaitPromise Regression Tests)
+  // ---------------------------------------------------------------------------
+  console.log('\n6. CDP evaluate 与 awaitPromise 调度回归测试:');
+
+  await testAsync('evaluate 默认设置 awaitPromise: false', async () => {
+    const calls = [];
+    const mockCdp = {
+      send: async (method, params, timeout) => {
+        calls.push({ method, params, timeout });
+        return { result: { value: 42 } };
+      },
+    };
+    const res = await evaluate(mockCdp, '1 + 1');
+    assert.equal(res, 42);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, 'Runtime.evaluate');
+    assert.equal(calls[0].params.awaitPromise, false);
+  });
+
+  await testAsync('evaluate 显式传递 awaitPromise: true 时正确透传', async () => {
+    const calls = [];
+    const mockCdp = {
+      send: async (method, params, timeout) => {
+        calls.push({ method, params, timeout });
+        return { result: { value: true } };
+      },
+    };
+    const res = await evaluate(mockCdp, 'new Promise(...)', { timeoutMs: 2500, awaitPromise: true });
+    assert.equal(res, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].params.awaitPromise, true);
+    assert.equal(calls[0].timeout, 2500);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 7. 未跟踪文件内容证据提取与脱敏测试 (Untracked Files Content Evidence)
+  // ---------------------------------------------------------------------------
+  console.log('\n7. 未跟踪文件内容证据提取与脱敏测试:');
+
+  test('getUntrackedEvidence 自动跳过敏感文件并提取普通文本', () => {
+    const evidence = getUntrackedEvidence(process.cwd(), ['.env', 'package.json', 'nonexistent.txt']);
+    assert.ok(!evidence.files.includes('.env'));
+    assert.ok(evidence.files.includes('package.json'));
+    assert.ok(evidence.content.includes('[NEW UNTRACKED FILE]'));
+    assert.ok(evidence.content.includes('antigravity-with-chatgpt'));
   });
 
   console.log(`\n========================================`);

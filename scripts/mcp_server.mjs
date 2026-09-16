@@ -201,6 +201,19 @@ async function handleCheckStatus(args) {
 }
 
 async function handleRecordExecution(args) {
+  if (!args || typeof args.command !== 'string' || !args.command.trim()) {
+    return {
+      content: [{ type: 'text', text: '错误: recordExecution 缺少必填参数 command' }],
+      isError: true,
+    };
+  }
+  if (args.exitCode === undefined || args.exitCode === null || !Number.isInteger(Number(args.exitCode))) {
+    return {
+      content: [{ type: 'text', text: '错误: recordExecution 参数 exitCode 必须为有效整数' }],
+      isError: true,
+    };
+  }
+
   try {
     const rec = recordExecution(args);
     return {
@@ -238,9 +251,9 @@ async function handleRpcRequest(req) {
   }
 
   if (method === 'initialize') {
-    const requestedVersion = params?.protocolVersion;
-    const supportedVersions = ['2024-11-05', '2026-07-28'];
-    const protocolVersion = supportedVersions.includes(requestedVersion) ? requestedVersion : '2024-11-05';
+    // 严格遵循 Antigravity 2.0 经实测验证的 MCP 规范版本 (2024-11-05)
+    // 避免对 2026-07-28 产生不符合无握手架构的假兼容声明
+    const protocolVersion = '2024-11-05';
 
     send({
       jsonrpc: '2.0',
@@ -250,7 +263,7 @@ async function handleRpcRequest(req) {
         capabilities: { tools: {} },
         serverInfo: {
           name: 'antigravity-with-chatgpt',
-          version: '2.1.1',
+          version: '2.1.2',
         },
       },
     });

@@ -31,6 +31,16 @@ function ensureStoreDir() {
  * @param {string} [entry.notes] 补充说明
  */
 export function recordExecution(entry) {
+  if (!entry || typeof entry !== 'object') {
+    throw new TypeError('recordExecution: entry 必须为有效对象');
+  }
+  if (typeof entry.command !== 'string' || !entry.command.trim()) {
+    throw new TypeError('recordExecution: command 必须是非空有效字符串');
+  }
+  if (entry.exitCode === undefined || entry.exitCode === null || !Number.isInteger(Number(entry.exitCode))) {
+    throw new TypeError('recordExecution: exitCode 必须是有效整数');
+  }
+
   ensureStoreDir();
 
   const record = {
@@ -38,8 +48,8 @@ export function recordExecution(entry) {
     timestamp: new Date().toISOString(),
     taskId: entry.taskId || null,
     workspace: entry.workspace ? path.resolve(entry.workspace) : process.cwd(),
-    command: entry.command,
-    exitCode: Number(entry.exitCode ?? 0),
+    command: entry.command.trim(),
+    exitCode: Number(entry.exitCode),
     testSummary: entry.testSummary || null,
     notes: entry.notes || null,
   };

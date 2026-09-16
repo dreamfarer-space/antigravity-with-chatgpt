@@ -8,10 +8,15 @@
  *   - 自动应用敏感内容脱敏
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { sanitizeContent } from '../security/sensitive.mjs';
+import { sanitizeContent, isSensitivePath } from '../security/sensitive.mjs';
+import { resolveSafePath } from '../security/path_guard.mjs';
+import { loadBrainIgnore } from '../security/ignore.mjs';
 
 const DEFAULT_DIFF_MAX_BYTES = 64 * 1024; // 64 KB
+const DEFAULT_UNTRACKED_MAX_BYTES = 32 * 1024; // 32 KB
 
 /**
  * 获取 Git 状态摘要
@@ -145,7 +150,72 @@ export function getGitDiff(workspaceRoot, options = {}) {
 }
 
 /**
- * 完整提取工作区闭环审查证据（Git 状态、HEAD Diff 与未跟踪文件清单）
+ * 安全抽取未跟踪文本文件的代码内容（受预算限制与安全沙箱脱敏）
+ * @param {string} workspaceRoot
+ * @param {Array<string>} untrackedFiles
+ * @param {number} [maxBytes=32768]
+ * @returns {object} { files: [], content: '', truncated: boolean }
+ */
+export function getUntrackedEvidence(workspaceRoot, untrackedFiles = [], maxBytes = DEFAULT_UNTRACKED_MAX_BYTES) {
+  if (!untrackedFiles || untrackedFiles.length === 0) {
+    return { files: [], content: '', truncated: false };
+  }
+
+  let ignoreChecker = null;
+  try {
+    ignoreChecker = loadBrainIgnore(workspaceRoot);
+  } catch {}
+
+  let accumulated = 0;
+  let truncated = false;
+  const blocks = [];
+  const included = [];
+
+  for (const rel of untrackedFiles) {
+    if (accumulated >= maxBytes) {
+      truncated = true;
+      break;
+    }
+
+    if (isSensitivePath(rel)) continue;
+    if (ignoreChecker && ignoreChecker.ignores(rel)) continue;
+
+    try {
+      const full = resolveSafePath(workspaceRoot, rel);
+      const stat = fs.statSync(full);
+      if (!stat.isFile() || stat.size === 0) continue;
+      // 忽略过大的单个文件 (> 256 KB)
+      if (stat.size > 256 * 1024) continue;
+
+      const raw = fs.readFileSync(full, 'utf8');
+      // 简单二元探测（含 NUL 字符通常为二进制）
+      if (raw.includes('\0')) continue;
+
+      const fileBytes = Buffer.byteLength(raw, 'utf8');
+      let text = raw;
+      if (accumulated + fileBytes > maxBytes) {
+        text = raw.slice(0, Math.max(0, maxBytes - accumulated)) + '\n... [file truncated]';
+        accumulated = maxBytes;
+        truncated = true;
+      } else {
+        accumulated += fileBytes;
+      }
+
+      const safeText = sanitizeContent(text);
+      blocks.push(`#### [NEW UNTRACKED FILE] \`${rel}\`\n\`\`\`\n${safeText}\n\`\`\``);
+      included.push(rel);
+    } catch {}
+  }
+
+  return {
+    files: included,
+    content: blocks.join('\n\n'),
+    truncated,
+  };
+}
+
+/**
+ * 完整提取工作区闭环审查证据（Git 状态、HEAD Diff 与未跟踪文件内容清单）
  * @param {string} workspaceRoot
  * @param {object} options
  * @returns {object}
@@ -153,6 +223,7 @@ export function getGitDiff(workspaceRoot, options = {}) {
 export function getReviewEvidence(workspaceRoot, options = {}) {
   const status = getGitStatus(workspaceRoot);
   const maxBytes = options.maxBytes || DEFAULT_DIFF_MAX_BYTES;
+  const untrackedMaxBytes = options.untrackedMaxBytes || DEFAULT_UNTRACKED_MAX_BYTES;
 
   if (!status.isGitRepo) {
     return {
@@ -161,6 +232,7 @@ export function getReviewEvidence(workspaceRoot, options = {}) {
       hasDiff: false,
       diff: '',
       untracked: [],
+      untrackedContent: '',
       staged: [],
       modified: [],
     };
@@ -180,6 +252,8 @@ export function getReviewEvidence(workspaceRoot, options = {}) {
     }
   }
 
+  const untrackedEvidence = getUntrackedEvidence(workspaceRoot, status.untracked, untrackedMaxBytes);
+
   return {
     isGitRepo: true,
     branch: status.branch,
@@ -187,9 +261,10 @@ export function getReviewEvidence(workspaceRoot, options = {}) {
     staged: status.staged,
     modified: status.modified,
     untracked: status.untracked,
-    hasDiff: Boolean(diffRes.hasDiff),
+    untrackedContent: untrackedEvidence.content,
+    hasDiff: Boolean(diffRes.hasDiff) || Boolean(untrackedEvidence.content),
     diff: diffRes.diff || '',
-    truncated: diffRes.truncated || false,
+    truncated: diffRes.truncated || untrackedEvidence.truncated,
     error: diffRes.error || null,
   };
 }
