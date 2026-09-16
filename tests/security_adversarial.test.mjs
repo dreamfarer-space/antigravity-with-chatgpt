@@ -1063,6 +1063,9 @@ Also need to check another file:
     // 3. 段敏感逃逸与合法 .. 开头文件名测试
     assert.equal(canonicalizeManifestPath(tmp, '..foo'), '..foo', '合法文件名 ..foo 必须允许保留');
     assert.equal(canonicalizeManifestPath(tmp, '..config'), '..config', '合法文件名 ..config 必须允许保留');
+    if (process.platform !== 'win32') {
+      assert.equal(canonicalizeManifestPath(tmp, '..\\foo'), '..\\foo', 'POSIX 下合法文件名 ..\\foo 必须允许保留');
+    }
     assert.equal(canonicalizeManifestPath(tmp, '../foo'), null, '父级目录逃逸 ../foo 必须严格返回 null');
     assert.equal(canonicalizeManifestPath(tmp, '..'), null, '父级目录 .. 必须严格返回 null');
 
@@ -1125,6 +1128,34 @@ Also need to check another file:
       fs.rmSync(testDir, { recursive: true, force: true });
     }
   });
+
+  if (process.platform !== 'win32') {
+    test('Evidence protocol: POSIX 物理文件 "..\\\\foo" 闭环保留字符身份并成功读取', () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'posix-backslash-test-'));
+      try {
+        const backslashName = '..\\foo';
+        fs.writeFileSync(path.join(testDir, backslashName), 'POSIX_BACKSLASH_CONTENT', 'utf8');
+
+        const manifestFiles = new Set([canonicalizeManifestPath(testDir, backslashName)]);
+        assert.ok(manifestFiles.has('..\\foo'));
+
+        const rawAiResponse = '<EVIDENCE_REQUEST>{"type":"read_file","path":"..\\\\foo"}</EVIDENCE_REQUEST>';
+        const parsedRequests = parseEvidenceRequests(rawAiResponse);
+        assert.equal(parsedRequests[0].path, '..\\foo');
+
+        const roundRes = buildEvidenceRoundSnippets({
+          requests: parsedRequests,
+          workspace: testDir,
+          reviewManifestFiles: manifestFiles,
+          currentAggregateBytes: 0,
+        });
+
+        assert.ok(roundRes.snippets.some((s) => s.includes('POSIX_BACKSLASH_CONTENT')));
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+  }
 
   test('Evidence protocol: 审查清单完整端到端接纳 Unmerged 冲突文件读取', () => {
     // 验证 unmerged 冲突文件能被合法纳入 reviewManifestFiles 并被正常请求

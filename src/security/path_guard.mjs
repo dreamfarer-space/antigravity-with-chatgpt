@@ -134,8 +134,9 @@ export function canonicalizeManifestPath(workspaceRoot, p) {
     const absRoot = path.resolve(workspaceRoot);
     const rel = path.relative(absRoot, safePath);
 
-    // 段敏感逃逸检测：拒绝 '.'、'..' 以及以 '../' 或 '..\\' 开头的父级逃逸，允许合法以 '..' 开头的文件名 (如 '..foo')
-    if (!rel || rel === '.' || rel === '..' || rel.startsWith(`..${path.sep}`) || rel.startsWith('../') || rel.startsWith('..\\') || path.isAbsolute(rel)) {
+    // 段敏感逃逸检测：使用当前操作系统原生分隔符，拒绝 '.'、'..' 以及以 `..${path.sep}` 开头的父级逃逸
+    // 在 POSIX 系统下，'..\\foo' 是包含反斜杠的合法单个文件名，绝不能因硬编码反斜杠被误杀
+    if (!rel || rel === '.' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
       return null;
     }
 
