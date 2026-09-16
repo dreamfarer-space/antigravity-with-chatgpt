@@ -74,7 +74,7 @@ export function resolveSafePath(workspaceRoot, requestedPath) {
   };
 
   // 4. 词法边界校验：目标路径必须收敛在工作区绝对根路径内
-  if (!isContained(absRoot, absTarget) || !isContained(realRoot, absTarget)) {
+  if (!isContained(absRoot, absTarget)) {
     throw new SecurityError(
       `路径逃逸拦截: "${requestedPath}" 超出工作区边界 "${workspaceRoot}"`,
       'E_WORKSPACE_ESCAPE'

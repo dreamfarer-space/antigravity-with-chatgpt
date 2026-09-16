@@ -106,7 +106,8 @@ export function formatExecutionSummary(records) {
 
   const lines = ['### Local Execution Evidence (Agent-Reported Records):'];
   for (const r of records) {
-    const statusText = r.exitCode === 0 ? '✓ SUCCESS (code 0)' : `✗ FAILED (code ${r.exitCode})`;
+    const isSuccess = r.exitCode === 0 && (!r.testSummary || (r.testSummary.failed ?? 0) === 0);
+    const statusText = isSuccess ? '✓ SUCCESS (code 0)' : `✗ FAILED (code ${r.exitCode})`;
     lines.push(`- **${r.timestamp.slice(11, 19)}** | \`${r.command}\` -> ${statusText}`);
     if (r.testSummary) {
       lines.push(`  - Tests: passed=${r.testSummary.passed ?? '?'}, failed=${r.testSummary.failed ?? 0}`);
@@ -114,10 +115,10 @@ export function formatExecutionSummary(records) {
     if (r.notes) {
       lines.push(`  - Note: ${r.notes}`);
     }
-    if (r.output) {
-      // 携带受预算控制并脱敏的关键输出/报错堆栈（每条记录最多 4KB）
+    // 仅在执行失败时附加输出片段与报错信息，防止大量成功日志膨胀 Prompt
+    if (!isSuccess && r.output) {
       const snippet = r.output.length > 4096 ? r.output.slice(0, 4096) + '\n... [output truncated]' : r.output;
-      lines.push('  - Output snippet:');
+      lines.push('  - Output / Error snippet:');
       lines.push('```text');
       lines.push(snippet.trim());
       lines.push('```');

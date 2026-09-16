@@ -12,6 +12,8 @@ import path from 'node:path';
 import os from 'node:os';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
+import { computeFingerprint, BROWSER_FINGERPRINT_SNIPPET } from './fingerprint.mjs';
+import { selectTargetPage } from './target_selector.mjs';
 
 function resolveProfileDir() {
   if (process.env.CHATGPT_BRAIN_PROFILE_DIR) {
@@ -428,28 +430,17 @@ export function resetBoundTargetId() {
   boundTargetId = null;
 }
 
-async function resolveTarget(preferredId = null) {
+export async function resolveTarget(preferredId = null, allowRebind = false) {
   const list = await fetch(`${HTTP_BASE}/json/list`).then((r) => r.json());
-  const pages = list.filter((t) => t.type === 'page');
-  const cg = pages.filter((t) => /(^|\.)chatgpt\.com$/.test((() => { try { return new URL(t.url).hostname; } catch { return ''; } })()));
-
-  // 1. 优先复用当前认领绑定的 targetId，防止多 ChatGPT 标签页时发生串号
-  const candidateId = preferredId || boundTargetId;
-  if (candidateId) {
-    const bound = cg.find((t) => t.id === candidateId && t.webSocketDebuggerUrl);
-    if (bound) {
-      boundTargetId = bound.id;
-      return bound;
+  const selection = selectTargetPage(list, boundTargetId, { preferredId, allowRebind });
+  if (selection.target) {
+    if (selection.isNewBinding) {
+      boundTargetId = selection.target.id;
     }
+    return selection.target;
   }
 
-  // 2. 若未绑定或原标签页已关闭，认领首个可用的 ChatGPT 标签页
-  if (cg.length && cg[0].webSocketDebuggerUrl) {
-    boundTargetId = cg[0].id;
-    return cg[0];
-  }
-
-  // 3. 若无可用标签页，开启新标签页并认领
+  // 若无可用标签页，开启新标签页并认领
   log('新建 ChatGPT 标签页...');
   for (const method of ['PUT', 'GET']) {
     try {
@@ -471,7 +462,39 @@ async function resolveTarget(preferredId = null) {
 // Fast Text Injection & Send
 // ---------------------------------------------------------------------------
 
-async function clearComposer(cdp) {
+export function getInjectionTimeout(text) {
+  const bytes = typeof text === 'string' ? Buffer.byteLength(text, 'utf8') : 0;
+  if (bytes <= 8 * 1024) return 20_000;
+  if (bytes <= 32 * 1024) return 60_000;
+  if (bytes <= 64 * 1024) return 90_000;
+  if (bytes <= 128 * 1024) return 120_000;
+  return 180_000;
+}
+
+export const PROBE_COMPOSER_JS = `(() => {
+  ${PRELUDE}
+  ${BROWSER_FINGERPRINT_SNIPPET}
+  const COMPOSER = ${JSON.stringify(COMPOSER_SELECTORS)};
+  const c = pickVisible(COMPOSER);
+  if (!c) return { found: false, empty: true, length: 0, hash: '811c9dc5', isTextarea: false };
+
+  const el = c.el;
+  const isTextarea = el.tagName === 'TEXTAREA' || el.tagName === 'INPUT';
+  const content = isTextarea ? (el.value || '') : (el.innerText || el.textContent || '');
+  const trimmed = content.trim();
+  const fp = computeFingerprint(content);
+
+  return {
+    found: true,
+    sel: c.sel,
+    isTextarea,
+    empty: trimmed.length === 0,
+    length: fp.length,
+    hash: fp.hash,
+  };
+})()`;
+
+export async function clearComposer(cdp) {
   await evaluate(cdp, `(() => {
     ${PRELUDE}
     const COMPOSER = ${JSON.stringify(COMPOSER_SELECTORS)};
@@ -499,61 +522,162 @@ async function clearComposer(cdp) {
       el.dispatchEvent(new Event('input', { bubbles: true }));
     }
     return true;
-  })()`);
+  })()`, 5000);
 }
 
-async function insertTextFast(cdp, text) {
+export async function insertTextReliable(cdp, text) {
+  const bytes = Buffer.byteLength(text, 'utf8');
+  const expected = computeFingerprint(text);
+  const timeoutMs = getInjectionTimeout(text);
   const b64 = Buffer.from(text, 'utf8').toString('base64');
-  const inserted = await evaluate(cdp, `(() => {
-    ${PRELUDE}
-    const COMPOSER = ${JSON.stringify(COMPOSER_SELECTORS)};
-    const c = pickVisible(COMPOSER);
-    if (!c) return false;
-    const el = c.el;
-    el.focus();
 
-    const raw = atob(${JSON.stringify(b64)});
-    const bytes = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-    const str = new TextDecoder('utf-8').decode(bytes);
+  let timedOut = false;
+  let verifiedAfterTimeout = false;
+  let retryCount = 0;
+  const t0 = performance.now();
 
-    const isTextarea = el.tagName === 'TEXTAREA' || el.tagName === 'INPUT';
-    if (isTextarea) {
-      const start = el.selectionStart ?? el.value.length;
-      const end = el.selectionEnd ?? el.value.length;
-      if (typeof el.setRangeText === 'function') {
-        el.setRangeText(str, start, end, 'end');
-      } else {
-        el.value = str;
+  const runSingleShot = async (attemptTimeoutMs) => {
+    return evaluate(cdp, `(() => {
+      ${PRELUDE}
+      ${BROWSER_FINGERPRINT_SNIPPET}
+      const COMPOSER = ${JSON.stringify(COMPOSER_SELECTORS)};
+      const c = pickVisible(COMPOSER);
+      if (!c) return { error: 'no_composer' };
+      const el = c.el;
+      el.focus();
+
+      const raw = atob(${JSON.stringify(b64)});
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      const str = new TextDecoder('utf-8').decode(bytes);
+
+      const isTextarea = el.tagName === 'TEXTAREA' || el.tagName === 'INPUT';
+      if (isTextarea) {
+        const start = el.selectionStart ?? el.value.length;
+        const end = el.selectionEnd ?? el.value.length;
+        if (typeof el.setRangeText === 'function') {
+          el.setRangeText(str, start, end, 'end');
+        } else {
+          el.value = str;
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        const fp = computeFingerprint(el.value || '');
+        return { ok: true, length: fp.length, hash: fp.hash, isTextarea: true };
       }
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return (el.value || '').length > 0;
+
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+
+      document.execCommand('insertText', false, str);
+      const content = el.innerText || el.textContent || '';
+      if (content.length === 0) {
+        el.textContent = str;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      const finalContent = el.innerText || el.textContent || '';
+      const fp = computeFingerprint(finalContent);
+      return { ok: true, length: fp.length, hash: fp.hash, isTextarea: false };
+    })()`, attemptTimeoutMs);
+  };
+
+  // 尝试初次注入
+  try {
+    await runSingleShot(timeoutMs);
+  } catch (err) {
+    if (err.message && err.message.includes('CDP 调用超时')) {
+      timedOut = true;
+    } else {
+      throw err;
     }
-
-    const sel = window.getSelection();
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    range.collapse(false);
-    sel.removeAllRanges();
-    sel.addRange(range);
-
-    document.execCommand('insertText', false, str);
-    const len = (el.innerText || el.textContent || '').length;
-    if (len === 0) {
-      el.textContent = str;
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-    return (el.innerText || el.textContent || '').length > 0;
-  })()`, 25000);
-
-  if (!inserted) {
-    // 降级回退
-    await cdp.send('Input.insertText', { text }, 20000);
   }
+
+  // 注入操作结束后探针校验指纹
+  let probe = await evaluate(cdp, PROBE_COMPOSER_JS, 5000).catch(() => null);
+
+  let fingerprintMatched = Boolean(
+    probe && probe.found &&
+    probe.length === expected.length &&
+    probe.hash === expected.hash
+  );
+
+  if (timedOut && fingerprintMatched) {
+    verifiedAfterTimeout = true;
+  }
+
+  // 若指纹不匹配（部分写入、空或被污染）：清空后执行一次受控重试
+  if (!fingerprintMatched) {
+    retryCount = 1;
+    warn(`注入指纹不匹配 (期望: len=${expected.length}, hash=${expected.hash}; 实际: len=${probe?.length}, hash=${probe?.hash})，清空并受控重试...`);
+    await clearComposer(cdp);
+    await sleep(300);
+
+    const emptyProbe = await evaluate(cdp, PROBE_COMPOSER_JS, 5000).catch(() => null);
+    if (emptyProbe && !emptyProbe.empty) {
+      throw new Error('清空 Composer 失败，中止注入重试以防 Prompt 污染');
+    }
+
+    try {
+      await runSingleShot(timeoutMs);
+    } catch (err) {
+      if (err.message && err.message.includes('CDP 调用超时')) {
+        timedOut = true;
+      }
+    }
+
+    probe = await evaluate(cdp, PROBE_COMPOSER_JS, 5000).catch(() => null);
+    fingerprintMatched = Boolean(
+      probe && probe.found &&
+      probe.length === expected.length &&
+      probe.hash === expected.hash
+    );
+
+    if (!fingerprintMatched) {
+      const elapsedMs = Math.round(performance.now() - t0);
+      const telemetry = `[brain-transport] inject strategy=execCommand chars=${expected.length} bytes=${bytes} timeoutMs=${timeoutMs} elapsedMs=${elapsedMs} timedOut=${timedOut} verifiedAfterTimeout=false fingerprintMatched=false retryCount=${retryCount}`;
+      process.stderr.write(telemetry + '\n');
+      throw new Error(`注入完整性校验失败 (期望: 长度 ${expected.length}, 哈希 ${expected.hash}; 实际: 长度 ${probe?.length}, 哈希 ${probe?.hash})`);
+    }
+  }
+
+  const elapsedMs = Math.round(performance.now() - t0);
+  const telemetry = `[brain-transport] inject strategy=execCommand chars=${expected.length} bytes=${bytes} timeoutMs=${timeoutMs} elapsedMs=${elapsedMs} timedOut=${timedOut} verifiedAfterTimeout=${verifiedAfterTimeout} fingerprintMatched=true retryCount=${retryCount}`;
+  process.stderr.write(telemetry + '\n');
+
+  return {
+    status: 'inserted',
+    expectedLength: expected.length,
+    actualLength: probe.length,
+    expectedHash: expected.hash,
+    actualHash: probe.hash,
+    timedOut,
+    verifiedAfterTimeout,
+    elapsedMs,
+    retryCount,
+  };
 }
 
-async function submitMessage(cdp) {
+export const insertTextFast = insertTextReliable;
+
+export const SUBMIT_STATUS = Object.freeze({
+  NOT_SUBMITTED: 'NOT_SUBMITTED',
+  SUBMITTED: 'SUBMITTED',
+  UNKNOWN: 'UNKNOWN',
+});
+
+export async function submitMessageReliable(cdp, options = {}) {
+  const checkTimeoutMs = typeof options === 'number' ? options : (options.checkTimeoutMs || 10000);
+
+  // 1. 记录发送前 User Turns 计数作为强收据基准
+  const beforeUserTurns = await evaluate(cdp, `(() => {
+    return document.querySelectorAll('[data-message-author-role="user"]').length;
+  })()`, 5000).catch(() => 0);
+
+  // 2. 点击发送按钮或回车
   let clicked = false;
   const deadline = Date.now() + 3000;
   while (Date.now() < deadline) {
@@ -572,12 +696,45 @@ async function submitMessage(cdp) {
   }
 
   if (!clicked) {
-    // 回退到 Enter 键
     const base = { windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, code: 'Enter', key: 'Enter' };
     await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base, text: '\r', unmodifiedText: '\r' }, 10000);
     await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base }, 10000);
   }
+
+  // 3. 强收据轮询验证 (User turn 计数递增 或 Stop 按钮出现)
+  const checkDeadline = Date.now() + checkTimeoutMs;
+  while (Date.now() < checkDeadline) {
+    await sleep(300);
+    const receipt = await evaluate(cdp, `(() => {
+      const us = document.querySelectorAll('[data-message-author-role="user"]').length;
+      const stop = document.querySelector('button[data-testid="stop-button"]') ||
+                   document.querySelector('button[aria-label*="Stop" i]') ||
+                   document.querySelector('button[aria-label*="停止"]');
+      return {
+        userTurns: us,
+        isStreaming: Boolean(stop),
+      };
+    })()`, 4000).catch(() => null);
+
+    if (receipt) {
+      if (receipt.userTurns > beforeUserTurns || receipt.isStreaming) {
+        return {
+          status: SUBMIT_STATUS.SUBMITTED,
+          beforeUserTurns,
+          afterUserTurns: receipt.userTurns,
+        };
+      }
+    }
+  }
+
+  // 4. 超时未确认强收据 -> UNKNOWN 状态，严禁自动重试
+  return {
+    status: SUBMIT_STATUS.UNKNOWN,
+    beforeUserTurns,
+  };
 }
+
+export const submitMessage = submitMessageReliable;
 
 async function waitForComposer(cdp, deadlineMs = 30000) {
   const deadline = Date.now() + deadlineMs;
@@ -660,11 +817,19 @@ async function _sendPromptViaCdpInternal({ prompt, mode = 'reuse', timeoutS = 60
 
     const beforeTurns = p.assistant.found ? p.assistant.count : 0;
 
-    // 极速注入与发送
-    await insertTextFast(cdp, prompt);
-    await submitMessage(cdp);
+    // 可靠注入与强收据提交
+    await insertTextReliable(cdp, prompt);
+    const submitReceipt = await submitMessageReliable(cdp);
 
-    // 等待开始
+    if (submitReceipt.status === SUBMIT_STATUS.UNKNOWN) {
+      // 提交状态未知：二次检查是否已在回复流中
+      p = await evaluate(cdp, PROBE_JS, 3000).catch(() => null);
+      if (!p || (!p.stopButton?.found && (p.assistant?.count ?? 0) <= beforeTurns)) {
+        throw new Error('提交消息状态未知 (UNKNOWN)：未能在时限内获取 User Turn 递增或回复流启动收据，已中止以防重复提交');
+      }
+    }
+
+    // 等待回复流启动
     const startDeadline = Date.now() + 45000;
     let started = false;
     while (Date.now() < startDeadline) {

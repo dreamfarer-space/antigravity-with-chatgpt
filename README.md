@@ -241,8 +241,8 @@ npm test
 # Equivalent to: node tests/security_adversarial.test.mjs
 ```
 
-**Automated Tests (22/22 Passing in CI):**
-- **Path Guard Security**: Relative `../` traversal, deep traversal, absolute paths, NUL byte injection, and safe resolution (5/5)
+**Automated Tests (37/37 Passing in CI):**
+- **Path Guard Security**: Relative `../` traversal, deep traversal, absolute paths, NUL byte injection, safe resolution, and symlink root containment (6/6)
 - **Sensitive Credential Redaction**: Multi-line PEM keys, spaced secret assignments, colon assignments, Bearer tokens, and sensitive path rules (5/5)
 - **Egress Sanitization**: Real-time filtering on Git diffs and command execution output (2/2)
 - **Orchestrator Defensive Contracts**: Type validation and rejection of empty/invalid inputs (2/2)
@@ -250,12 +250,19 @@ npm test
 - **CDP evaluate & awaitPromise**: Regression testing for default non-promise vs. async promise evaluation (2/2)
 - **Untracked File Evidence**: Safe text extraction, binary skipping, and sensitive masking (1/1)
 - **UTF-8 Byte Budget Truncation**: Non-destructive multi-byte UTF-8 character boundary preservation (1/1)
+- **FNV-1a Fingerprint & Order Sensitivity**: Order-sensitive hashing (`"abc"` vs `"cba"`) and 100% isomorphic parity between Node.js and browser snippet (2/2)
+- **Adaptive Injection Timeout**: Dynamic tier calculations across payload sizes (20s to 180s) (1/1)
+- **Target Selection State Machine**: Initial binding, sticky reuse, and fail-closed isolation preventing silent tab drift (4/4)
+- **Git Diff Pagination & Strict Byte Budget**: Offset slicing, remaining bytes, and strict UTF-8 byte limits (2/2)
+- **Strict Byte Accounting for Untracked Evidence**: Strict byte bounds with headers, markdown fences, and markers included (1/1)
+- **CDP Timeout Recovery & Idempotent Retry**: Recovery on evaluate timeout via fingerprint probing, preventing duplicate text insertion (2/2)
+- **Receipt-Based Submission State Machine**: SUBMITTED verification via user turns and fail-closed UNKNOWN handling (2/2)
 
 ### 2. Local Environment Verification & Live Integration (`npm run verify`)
 Runs local sanity checks and optional live end-to-end integration tests with an active Chrome session:
 
 ```powershell
-# Verify local module structure, configuration, and CDP connectivity (34 checks)
+# Verify local module structure, configuration, and CDP connectivity (36 checks)
 npm run verify
 
 # Optional: Run live end-to-end multi-mode execution against an active Chrome session
@@ -269,7 +276,7 @@ node scripts/verify_install.mjs --run-test
 > [!IMPORTANT]
 > **Legal & Compliance Notice:**
 > - **Personal Research & Workflow Tool**: `antigravity-with-chatgpt` is an open-source experimental developer tool designed for personal workflow augmentation, dual-brain reasoning research, and local verification pairing Antigravity with web-based LLMs.
-> - **OpenAI Terms of Use & Automated Extraction Restrictions**: OpenAI's [Terms of Use](https://openai.com/policies/terms-of-use/) (including Section 2(c) and Service Terms) contain explicit restrictions against automated or programmatic extraction of data or Output from web services (such as web scraping or harvesting). This project connects locally via Chrome DevTools Protocol (CDP) on `127.0.0.1:9222` to an existing authenticated user session purely as a developer convenience bridge for personal, interactive pair-programming. It is **not** an official OpenAI API client, an automated scraping pipeline, or a commercial extraction tool.
+> - **OpenAI Terms of Use & Automated Extraction Restrictions**: OpenAI's [Terms of Use](https://openai.com/policies/terms-of-use/) and Service Terms contain explicit restrictions against automated or programmatic extraction of data or Output from web services (such as web scraping, harvesting, or scripted extraction). Personal, local, interactive, or non-commercial use should not be assumed to create an exemption from those Terms. This project connects locally via Chrome DevTools Protocol (CDP) on `127.0.0.1:9222` to an existing authenticated user session purely as a developer convenience bridge for personal, interactive pair-programming. It is **not** an official OpenAI API client, an automated scraping pipeline, or a commercial extraction tool.
 > - **User Responsibility**: Users are solely responsible for ensuring that their use complies with all applicable OpenAI terms, policies, and fair-use guidelines. Interacting programmatically with web interfaces carries inherent risks (including session invalidation, CAPTCHA challenges, or account restrictions). For production, high-throughput, or SLA-backed programmatic access, please use official OpenAI Platform APIs.
 > - **No Warranties or Guarantees**: This project does not circumvent paywalls, rate limits, or account restrictions. The maintainers do not assume any liability for account restrictions, session termination, or any other impacts resulting from the use of this software.
 

@@ -45,6 +45,7 @@ export async function runBrainTask(options = {}) {
   let attachmentsBlock = '';
   let gitDiffBlock = '';
   let executionBlock = '';
+  let manifestBlock = '';
 
   // 1. 根据模式与参数决定是否拉取工作区证据
   if (mode !== MODES.DERIVE) {
@@ -56,8 +57,23 @@ export async function runBrainTask(options = {}) {
     // 处理 Git 变更与审查证据 (review 与 diagnose 模式下默认自动附带，或显式要求)
     const needDiff = options.gitDiff === true || mode === MODES.REVIEW || (mode === MODES.DIAGNOSE && options.gitDiff !== false);
     if (needDiff) {
-      const evidence = getReviewEvidence(workspace);
+      const evidence = getReviewEvidence(workspace, { maxBytes: 32768, untrackedMaxBytes: 16384 });
       const diffParts = [];
+
+      if (mode === MODES.REVIEW) {
+        const manifestLines = [
+          '### Evidence Manifest (Bounded Review Context):',
+          `- Branch: \`${evidence.branch || 'unknown'}\``,
+          `- Staged Files (${evidence.staged?.length ?? 0}): ${evidence.staged?.slice(0, 10).join(', ') || 'none'}`,
+          `- Modified Files (${evidence.modified?.length ?? 0}): ${evidence.modified?.slice(0, 10).join(', ') || 'none'}`,
+          `- Untracked Files (${evidence.untracked?.length ?? 0}): ${evidence.untracked?.slice(0, 10).join(', ') || 'none'}`,
+          `- Diff Total Bytes: ${evidence.totalDiffBytes ?? 0}`,
+          `- Diff Returned Bytes: ${evidence.returnedDiffBytes ?? 0}`,
+          `- Has More Diff: ${evidence.hasMoreDiff ? `yes (nextOffset: ${evidence.nextDiffOffset})` : 'no'}`,
+        ];
+        manifestBlock = manifestLines.join('\n');
+      }
+
       if (evidence.summary) {
         diffParts.push(`Git Status: ${evidence.summary}`);
       }
@@ -90,6 +106,7 @@ export async function runBrainTask(options = {}) {
     mode,
     prompt,
     workspace: mode !== MODES.DERIVE ? workspace : null,
+    manifestBlock,
     attachmentsBlock,
     gitDiffBlock,
     executionBlock,

@@ -15,8 +15,10 @@ import { resolveSafePath, isPathContained, SecurityError } from '../src/security
 import { sanitizeContent, isSensitivePath, redactSensitive } from '../src/security/sensitive.mjs';
 import { runBrainTask } from '../src/brain/orchestrator.mjs';
 import { recordExecution } from '../src/execution/recorder.mjs';
-import { getUntrackedEvidence, truncateUtf8ByBytes } from '../src/git/git_helper.mjs';
-import { evaluate } from '../src/transport/cdp_transport.mjs';
+import { getUntrackedEvidence, truncateUtf8ByBytes, getGitDiff, getReviewEvidence } from '../src/git/git_helper.mjs';
+import { evaluate, getInjectionTimeout, SUBMIT_STATUS, insertTextReliable, submitMessageReliable } from '../src/transport/cdp_transport.mjs';
+import { computeFingerprint, BROWSER_FINGERPRINT_SNIPPET } from '../src/transport/fingerprint.mjs';
+import { selectTargetPage, filterChatGptPages } from '../src/transport/target_selector.mjs';
 
 let passed = 0;
 let total = 0;
@@ -281,8 +283,310 @@ async function runAsyncTests() {
     assert.equal(truncateUtf8ByBytes(mixed, 0), '');
   });
 
+  // ---------------------------------------------------------------------------
+  // 9. FNV-1a 指纹同构性与顺序敏感性测试
+  // ---------------------------------------------------------------------------
+  console.log('\n9. FNV-1a 指纹同构性与顺序敏感性测试:');
+
+  test('computeFingerprint 顺序敏感性 ("abc" 与 "cba" 产生不同哈希)', () => {
+    const fp1 = computeFingerprint('abc');
+    const fp2 = computeFingerprint('cba');
+    assert.equal(fp1.length, 3);
+    assert.equal(fp2.length, 3);
+    assert.notEqual(fp1.hash, fp2.hash);
+  });
+
+  test('computeFingerprint 与浏览器内联实现 100% 同构对齐', () => {
+    const browserFn = new Function(BROWSER_FINGERPRINT_SNIPPET + '; return computeFingerprint;')();
+    const testSamples = [
+      '',
+      'a',
+      'hello world',
+      'const x = 123;\nconst y = 456;',
+      '中文字符测试：🚀 零依赖双脑架构！',
+      'x'.repeat(25000),
+    ];
+    for (const sample of testSamples) {
+      const nodeRes = computeFingerprint(sample);
+      const browserRes = browserFn(sample);
+      assert.deepEqual(nodeRes, browserRes, `Sample "${sample.slice(0, 20)}" 同构校验失败`);
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 10. 传输层自适应注入超时动态阶梯测试
+  // ---------------------------------------------------------------------------
+  console.log('\n10. 传输层自适应注入超时动态阶梯测试:');
+
+  test('getInjectionTimeout 阶梯阈值计算验证 (20s ~ 180s)', () => {
+    assert.equal(getInjectionTimeout(''), 20_000);
+    assert.equal(getInjectionTimeout('x'.repeat(8192)), 20_000);
+    assert.equal(getInjectionTimeout('x'.repeat(8193)), 60_000);
+    assert.equal(getInjectionTimeout('x'.repeat(32768)), 60_000);
+    assert.equal(getInjectionTimeout('x'.repeat(32769)), 90_000);
+    assert.equal(getInjectionTimeout('x'.repeat(65536)), 90_000);
+    assert.equal(getInjectionTimeout('x'.repeat(65537)), 120_000);
+    assert.equal(getInjectionTimeout('x'.repeat(131072)), 120_000);
+    assert.equal(getInjectionTimeout('x'.repeat(131073)), 180_000);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 11. 目标选择纯函数与 Fail-Closed 状态机测试
+  // ---------------------------------------------------------------------------
+  console.log('\n11. 目标选择纯函数与 Fail-Closed 状态机测试:');
+
+  test('selectTargetPage 过滤非 ChatGPT 页面与初次绑定', () => {
+    const pages = [
+      { id: 'g1', type: 'page', url: 'https://www.google.com/', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/g1' },
+      { id: 'c1', type: 'page', url: 'https://chatgpt.com/', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/c1' },
+      { id: 'c2', type: 'page', url: 'https://chatgpt.com/c/6aaa-test', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/c2' },
+    ];
+    const r1 = selectTargetPage(pages, null);
+    assert.equal(r1.target?.id, 'c1');
+    assert.equal(r1.isNewBinding, true);
+
+    const rPreferred = selectTargetPage(pages, null, { preferredId: 'c2' });
+    assert.equal(rPreferred.target?.id, 'c2');
+    assert.equal(rPreferred.isNewBinding, true);
+  });
+
+  test('selectTargetPage 粘性绑定维持 (Sticky Binding)', () => {
+    const pages = [
+      { id: 'c1', type: 'page', url: 'https://chatgpt.com/', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/c1' },
+      { id: 'c2', type: 'page', url: 'https://chatgpt.com/c/6aaa-test', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/c2' },
+    ];
+    const rSticky = selectTargetPage(pages, 'c2');
+    assert.equal(rSticky.target?.id, 'c2');
+    assert.equal(rSticky.isNewBinding, false);
+  });
+
+  test('selectTargetPage 已绑定目标丢失时抛错 (Fail-Closed 严禁静默漂移)', () => {
+    const pages = [
+      { id: 'c1', type: 'page', url: 'https://chatgpt.com/', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/c1' },
+    ];
+    assert.throws(
+      () => selectTargetPage(pages, 'c2_closed', { allowRebind: false }),
+      /已绑定的 ChatGPT 目标标签页已关闭或丢失/
+    );
+  });
+
+  test('selectTargetPage 显式允许重绑时平滑认领新标签页', () => {
+    const pages = [
+      { id: 'c1', type: 'page', url: 'https://chatgpt.com/', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/c1' },
+    ];
+    const rRebind = selectTargetPage(pages, 'c2_closed', { allowRebind: true });
+    assert.equal(rRebind.target?.id, 'c1');
+    assert.equal(rRebind.isNewBinding, true);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 12. Git Diff 分页接口与预算受限测试
+  // ---------------------------------------------------------------------------
+  console.log('\n12. Git Diff 分页接口与预算受限测试:');
+
+  test('getGitDiff 分页与 UTF-8 字节预算控制', () => {
+    const diffRes = getGitDiff(process.cwd(), { maxBytes: 500, offset: 0 });
+    assert.ok(typeof diffRes.hasDiff === 'boolean');
+    assert.ok(diffRes.returnedBytes <= 500);
+    assert.ok(Buffer.byteLength(diffRes.diff, 'utf8') <= 500);
+  });
+
+  test('getGitDiff 越界 offset 优雅返回空 diff', () => {
+    const diffEmpty = getGitDiff(process.cwd(), { offset: 99999999 });
+    assert.equal(diffEmpty.hasDiff, false);
+    assert.equal(diffEmpty.diff, '');
+    assert.equal(diffEmpty.hasMore, false);
+    assert.equal(diffEmpty.nextOffset, null);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 13. 未跟踪文件证据绝对严格 Byte Budget 测试
+  // ---------------------------------------------------------------------------
+  console.log('\n13. 未跟踪文件证据绝对严格 Byte Budget 测试:');
+
+  test('getUntrackedEvidence 严格全额预算测试 (含 Header、Fences、Truncation Marker)', () => {
+    const tmpPath = path.join(process.cwd(), 'tests', 'fixtures_temp_budget_test.txt');
+    fs.writeFileSync(tmpPath, 'A'.repeat(500), 'utf8');
+    try {
+      const res = getUntrackedEvidence(process.cwd(), ['tests/fixtures_temp_budget_test.txt'], 100);
+      assert.ok(res.content.length > 0);
+      const contentBytes = Buffer.byteLength(res.content, 'utf8');
+      assert.ok(contentBytes <= 100, `contentBytes (${contentBytes}) 超出预算 100 字节`);
+      assert.equal(res.truncated, true);
+    } finally {
+      try { fs.unlinkSync(tmpPath); } catch {}
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 14. 词法路径安全防御软链接假阳性回归测试
+  // ---------------------------------------------------------------------------
+  console.log('\n14. 词法路径安全防御软链接假阳性回归测试:');
+
+  test('resolveSafePath 词法收敛与子目录解析无物理路径误杀', () => {
+    const testRoot = process.cwd();
+    const safeFile = resolveSafePath(testRoot, 'package.json');
+    assert.ok(safeFile.toLowerCase().endsWith('package.json'));
+    assert.throws(() => resolveSafePath(testRoot, '../escape.js'), SecurityError);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 15. 注入超时恢复与指纹校验状态机测试 (insertTextReliable)
+  // ---------------------------------------------------------------------------
+  console.log('\n15. 注入超时恢复与指纹校验状态机测试:');
+
+  await testAsync('insertTextReliable: evaluate 超时但探针发现指纹匹配视为成功，坚决不重试', async () => {
+    const testText = 'Hello reliable world';
+    const expectedFp = computeFingerprint(testText);
+    let callCount = 0;
+    const mockCdp = {
+      send: async (method, params) => {
+        callCount++;
+        if (params.expression.includes('pickVisible(COMPOSER)') && params.expression.includes('execCommand')) {
+          // 模拟首次 evaluate 发生超时
+          throw new Error('CDP 调用超时 (60000ms): Runtime.evaluate');
+        }
+        if (params.expression.includes('computeFingerprint(content)')) {
+          // 模拟探针回读：指纹与长度已完全一致落入 DOM
+          return {
+            result: {
+              value: {
+                found: true,
+                empty: false,
+                length: expectedFp.length,
+                hash: expectedFp.hash,
+                isTextarea: false,
+              },
+            },
+          };
+        }
+        return { result: { value: null } };
+      },
+    };
+    const injectRes = await insertTextReliable(mockCdp, testText);
+    assert.equal(injectRes.status, 'inserted');
+    assert.equal(injectRes.timedOut, true);
+    assert.equal(injectRes.verifiedAfterTimeout, true);
+    assert.equal(injectRes.retryCount, 0); // 坚决不执行第二次注入！
+  });
+
+  await testAsync('insertTextReliable: evaluate 超时且指纹残缺时清空输入框并执行且仅执行 1 次受控重试', async () => {
+    const testText = 'Retry test payload';
+    const expectedFp = computeFingerprint(testText);
+    let injectAttempts = 0;
+    let clearCalled = false;
+    const mockCdp = {
+      send: async (method, params) => {
+        if (params.expression.includes('execCommand(\'insertText\', false, str)')) {
+          injectAttempts++;
+          if (injectAttempts === 1) {
+            throw new Error('CDP 调用超时 (60000ms): Runtime.evaluate');
+          }
+          return { result: { value: { ok: true } } };
+        }
+        if (params.expression.includes('el.innerHTML = \'\'') || params.expression.includes('el.value = \'\'')) {
+          clearCalled = true;
+          return { result: { value: true } };
+        }
+        if (params.expression.includes('computeFingerprint(content)')) {
+          if (clearCalled && injectAttempts === 1) {
+            // 清空后的空状态探针：验证已清空
+            return {
+              result: {
+                value: {
+                  found: true,
+                  empty: true,
+                  length: 0,
+                  hash: '811c9dc5',
+                  isTextarea: false,
+                },
+              },
+            };
+          }
+          if (injectAttempts === 1) {
+            // 首次探针：发现内容残缺或为空
+            return {
+              result: {
+                value: {
+                  found: true,
+                  empty: false,
+                  length: 3,
+                  hash: 'badhash0',
+                  isTextarea: false,
+                },
+              },
+            };
+          }
+          // 重试注入后的探针：成功匹配
+          return {
+            result: {
+              value: {
+                found: true,
+                empty: false,
+                length: expectedFp.length,
+                hash: expectedFp.hash,
+                isTextarea: false,
+              },
+            },
+          };
+        }
+        return { result: { value: null } };
+      },
+    };
+    const retryRes = await insertTextReliable(mockCdp, testText);
+    assert.equal(retryRes.status, 'inserted');
+    assert.equal(retryRes.retryCount, 1);
+    assert.equal(clearCalled, true);
+    assert.equal(injectAttempts, 2);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 16. 提交强收据状态机测试 (submitMessageReliable)
+  // ---------------------------------------------------------------------------
+  console.log('\n16. 提交强收据状态机测试:');
+
+  await testAsync('submitMessageReliable: User Turn 计数增加判定 SUBMITTED', async () => {
+    let probeIndex = 0;
+    const mockCdp = {
+      send: async (method, params) => {
+        if (method === 'Input.dispatchKeyEvent') return {};
+        if (params.expression && params.expression.includes('isStreaming')) {
+          return { result: { value: { userTurns: 2, isStreaming: false } } };
+        }
+        if (params.expression && params.expression.includes('data-message-author-role="user"')) {
+          return { result: { value: 1 } };
+        }
+        return { result: { value: true } };
+      },
+    };
+    const submitRes = await submitMessageReliable(mockCdp);
+    assert.equal(submitRes.status, SUBMIT_STATUS.SUBMITTED);
+    assert.equal(submitRes.beforeUserTurns, 1);
+    assert.equal(submitRes.afterUserTurns, 2);
+  });
+
+  await testAsync('submitMessageReliable: 超时未获得 User Turn 递增或 Stop 强收据判定 UNKNOWN (禁止重试)', async () => {
+    const mockCdpUnknown = {
+      send: async (method, params) => {
+        if (method === 'Input.dispatchKeyEvent') return {};
+        if (params.expression && params.expression.includes('isStreaming')) {
+          // 模拟无增量、无流式响应
+          return { result: { value: { userTurns: 1, isStreaming: false } } };
+        }
+        if (params.expression && params.expression.includes('data-message-author-role="user"')) {
+          return { result: { value: 1 } };
+        }
+        return { result: { value: true } };
+      },
+    };
+    // 快速等待超时
+    const submitRes = await submitMessageReliable(mockCdpUnknown, { checkTimeoutMs: 500 });
+    assert.equal(submitRes.status, SUBMIT_STATUS.UNKNOWN);
+    assert.equal(submitRes.beforeUserTurns, 1);
+  });
+
   console.log(`\n========================================`);
-  console.log(`对抗性测试全部完成: ${passed}/${total} 通过 (100%)`);
+  console.log(`对抗性与可靠性测试全部完成: ${passed}/${total} 通过 (100%)`);
   console.log(`========================================\n`);
   process.exit(0);
 }

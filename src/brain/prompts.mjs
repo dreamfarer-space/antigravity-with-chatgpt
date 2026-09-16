@@ -46,7 +46,15 @@ CRITICAL: Do not simply agree with or flatter the author. Independently verify t
 1. Correctness: Are the requirements actually satisfied?
 2. Side Effects & Regressions: Does this change break adjacent modules or error handling?
 3. Security & Boundaries: Are edge cases, null checks, and permissions handled?
-4. Verdict: Explicitly state [APPROVED] or [CHANGES REQUESTED] with specific line references and suggestions.`,
+4. Bounded Evidence Protocol: Diffs and files are provided in bounded slices to guarantee transport stability. If you need subsequent diff pages or full file contents to finalize your review, emit an evidence request tag:
+<EVIDENCE_REQUEST>
+{ "type": "git_diff", "offset": <nextOffset>, "maxBytes": 32768 }
+</EVIDENCE_REQUEST>
+or:
+<EVIDENCE_REQUEST>
+{ "type": "read_file", "path": "relative/path/to/file" }
+</EVIDENCE_REQUEST>
+5. Verdict: Explicitly state [APPROVED] or [CHANGES REQUESTED] with specific line references and suggestions.`,
 
   [MODES.DERIVE]: `
 Role: Algorithmic & Mathematical Thinker.
@@ -67,6 +75,7 @@ Analyze the provided error messages, execution logs, and recent code changes.
  * @param {string} params.mode
  * @param {string} params.prompt
  * @param {string} [params.workspace]
+ * @param {string} [params.manifestBlock]
  * @param {string} [params.attachmentsBlock]
  * @param {string} [params.gitDiffBlock]
  * @param {string} [params.executionBlock]
@@ -76,6 +85,7 @@ export function buildPromptEnvelope({
   mode = MODES.ASK,
   prompt,
   workspace,
+  manifestBlock = '',
   attachmentsBlock = '',
   gitDiffBlock = '',
   executionBlock = '',
@@ -93,6 +103,10 @@ export function buildPromptEnvelope({
 
   if (workspace) {
     contextSections.push(`### Workspace Context:\nPath: \`${workspace}\``);
+  }
+
+  if (manifestBlock) {
+    contextSections.push(manifestBlock);
   }
 
   if (executionBlock) {

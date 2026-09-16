@@ -56,6 +56,8 @@ const REQUIRED_MODULES = [
   'scripts/mcp_server.mjs',
   'scripts/make_shortcut.mjs',
   'src/transport/cdp_transport.mjs',
+  'src/transport/fingerprint.mjs',
+  'src/transport/target_selector.mjs',
   'src/security/path_guard.mjs',
   'src/security/sensitive.mjs',
   'src/security/ignore.mjs',

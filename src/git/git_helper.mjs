@@ -70,16 +70,19 @@ export function getGitStatus(workspaceRoot) {
 }
 
 /**
- * 提取 Git Diff（带预算控制与安全脱敏）
+ * 提取 Git Diff（带预算控制、分页支持与安全脱敏）
  * @param {string} workspaceRoot
  * @param {object} options
+ * @param {number} [options.offset=0]
  * @param {number} [options.maxBytes=65536]
+ * @param {boolean} [options.head=false]
  * @param {boolean} [options.staged=false]
  * @param {string} [options.file]
- * @returns {object} { hasDiff, diff, totalBytes, truncated }
+ * @returns {object} { hasDiff, diff, totalBytes, returnedBytes, offset, hasMore, nextOffset, truncated }
  */
 export function getGitDiff(workspaceRoot, options = {}) {
   const maxBytes = options.maxBytes || DEFAULT_DIFF_MAX_BYTES;
+  const offset = Math.max(0, Number(options.offset) || 0);
   const args = ['-C', workspaceRoot, 'diff'];
 
   if (options.head) {
@@ -104,48 +107,135 @@ export function getGitDiff(workspaceRoot, options = {}) {
         // HEAD 对比失败（可能尚无初始提交），降级回退普通 diff
         return getGitDiff(workspaceRoot, { ...options, head: false });
       }
-      return { hasDiff: false, error: res.stderr || 'git diff failed' };
+      return {
+        hasDiff: false,
+        diff: '',
+        totalBytes: 0,
+        returnedBytes: 0,
+        offset,
+        hasMore: false,
+        nextOffset: null,
+        truncated: false,
+        error: res.stderr || 'git diff failed',
+      };
     }
 
     const rawDiff = res.stdout || '';
     const totalBytes = Buffer.byteLength(rawDiff, 'utf8');
 
     if (!rawDiff.trim()) {
-      return { hasDiff: false, diff: '', totalBytes: 0, truncated: false };
+      return {
+        hasDiff: false,
+        diff: '',
+        totalBytes: 0,
+        returnedBytes: 0,
+        offset,
+        hasMore: false,
+        nextOffset: null,
+        truncated: false,
+      };
     }
 
-    let diffText = rawDiff;
+    if (offset >= totalBytes) {
+      return {
+        hasDiff: false,
+        diff: '',
+        totalBytes,
+        returnedBytes: 0,
+        offset,
+        hasMore: false,
+        nextOffset: null,
+        truncated: false,
+      };
+    }
+
+    const rawBuf = Buffer.from(rawDiff, 'utf8');
+    // 对齐 offset 到 UTF-8 起始字节
+    let sliceStart = offset;
+    while (sliceStart > 0 && (rawBuf[sliceStart] & 0b11000000) === 0b10000000) {
+      sliceStart--;
+    }
+
+    const remainingBytes = totalBytes - sliceStart;
+    let diffText = '';
+    let hasMore = false;
+    let nextOffset = null;
     let truncated = false;
 
-    if (totalBytes > maxBytes) {
-      // 优雅按行截断
-      const lines = rawDiff.split('\n');
-      let accumulated = 0;
-      const kept = [];
-      for (const line of lines) {
-        const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
-        if (accumulated + lineBytes > maxBytes) {
-          truncated = true;
-          break;
-        }
-        kept.push(line);
-        accumulated += lineBytes;
+    if (remainingBytes <= maxBytes) {
+      // 剩余内容完全在预算内
+      diffText = rawBuf.subarray(sliceStart).toString('utf8');
+      hasMore = false;
+      nextOffset = null;
+      truncated = sliceStart > 0;
+    } else {
+      // 超出 maxBytes 预算，执行分页截断，且分页提示自身全额计入预算
+      truncated = true;
+      hasMore = true;
+
+      // 预估标牌大小
+      const markerTemplate = `\n... [DIFF PAGINATED: total ${totalBytes}B, slice [${sliceStart}..${sliceStart + maxBytes}], remaining ${remainingBytes}B. Next offset: ${sliceStart + maxBytes}]`;
+      const reservedMarkerBytes = Buffer.byteLength(markerTemplate, 'utf8') + 30;
+      const contentBudget = Math.max(0, maxBytes - reservedMarkerBytes);
+
+      let sliceEnd = sliceStart + contentBudget;
+      while (sliceEnd > sliceStart && (rawBuf[sliceEnd] & 0b11000000) === 0b10000000) {
+        sliceEnd--;
       }
-      kept.push(`\n... [DIFF TRUNCATED: ${(totalBytes / 1024).toFixed(1)} KB total, showed ${(accumulated / 1024).toFixed(1)} KB]`);
-      diffText = kept.join('\n');
+
+      const chunkBuf = rawBuf.subarray(sliceStart, sliceEnd);
+      const chunkText = chunkBuf.toString('utf8');
+      const lastNewline = chunkText.lastIndexOf('\n');
+
+      let sliceText = chunkText;
+      if (lastNewline > 0 && lastNewline > chunkText.length * 0.7) {
+        sliceText = chunkText.slice(0, lastNewline);
+      }
+
+      const actualSliceBytes = Buffer.byteLength(sliceText, 'utf8');
+      nextOffset = sliceStart + actualSliceBytes;
+      if (nextOffset >= totalBytes) {
+        hasMore = false;
+        nextOffset = null;
+      }
+
+      const marker = hasMore
+        ? `\n... [DIFF PAGINATED: ${(totalBytes / 1024).toFixed(1)} KB total; showing bytes ${sliceStart}..${nextOffset}; remaining ${(totalBytes - nextOffset)}B. Next offset: ${nextOffset}]`
+        : '';
+
+      diffText = sliceText + marker;
     }
 
-    // 统一敏感信息脱敏
-    const sanitized = sanitizeContent(diffText);
+    // 统一敏感信息脱敏并确保绝对满足 <= maxBytes
+    let sanitized = sanitizeContent(diffText);
+    if (Buffer.byteLength(sanitized, 'utf8') > maxBytes) {
+      sanitized = truncateUtf8ByBytes(sanitized, maxBytes);
+    }
+
+    const returnedBytes = Buffer.byteLength(sanitized, 'utf8');
 
     return {
       hasDiff: true,
       diff: sanitized,
       totalBytes,
+      returnedBytes,
+      offset: sliceStart,
+      hasMore,
+      nextOffset,
       truncated,
     };
   } catch (err) {
-    return { hasDiff: false, error: err.message };
+    return {
+      hasDiff: false,
+      diff: '',
+      totalBytes: 0,
+      returnedBytes: 0,
+      offset,
+      hasMore: false,
+      nextOffset: null,
+      truncated: false,
+      error: err.message,
+    };
   }
 }
 
@@ -172,13 +262,14 @@ export function truncateUtf8ByBytes(text, maxBytes) {
 
 /**
  * 安全抽取未跟踪文本文件的代码内容（受预算限制与安全沙箱脱敏）
+ * 预算核算严格包含 Markdown 围栏、Header 与截断标注自身，确保输出 UTF-8 字节 <= maxBytes
  * @param {string} workspaceRoot
  * @param {Array<string>} untrackedFiles
  * @param {number} [maxBytes=32768]
  * @returns {object} { files: [], content: '', truncated: boolean }
  */
 export function getUntrackedEvidence(workspaceRoot, untrackedFiles = [], maxBytes = DEFAULT_UNTRACKED_MAX_BYTES) {
-  if (!untrackedFiles || untrackedFiles.length === 0) {
+  if (!untrackedFiles || untrackedFiles.length === 0 || maxBytes <= 0) {
     return { files: [], content: '', truncated: false };
   }
 
@@ -212,26 +303,70 @@ export function getUntrackedEvidence(workspaceRoot, untrackedFiles = [], maxByte
       // 简单二元探测（含 NUL 字符通常为二进制）
       if (raw.includes('\0')) continue;
 
+      const header = `#### [NEW UNTRACKED FILE] \`${rel}\`\n\`\`\`\n`;
+      const footer = `\n\`\`\``;
+      const sep = blocks.length > 0 ? '\n\n' : '';
+      const sepBytes = Buffer.byteLength(sep, 'utf8');
+      const headerBytes = Buffer.byteLength(header, 'utf8');
+      const footerBytes = Buffer.byteLength(footer, 'utf8');
+      const overheadBytes = sepBytes + headerBytes + footerBytes;
+
+      const remainingBytes = maxBytes - accumulated;
+      if (remainingBytes <= overheadBytes) {
+        // 预算连 header + footer 都放不下
+        truncated = true;
+        break;
+      }
+
+      const contentBudget = remainingBytes - overheadBytes;
       const fileBytes = Buffer.byteLength(raw, 'utf8');
       let text = raw;
-      const remainingBytes = Math.max(0, maxBytes - accumulated);
-      if (fileBytes > remainingBytes) {
-        text = truncateUtf8ByBytes(raw, remainingBytes) + '\n... [file truncated]';
-        accumulated = maxBytes;
+
+      if (fileBytes > contentBudget) {
         truncated = true;
-      } else {
-        accumulated += fileBytes;
+        const truncMarker = '\n... [file truncated]';
+        const markerBytes = Buffer.byteLength(truncMarker, 'utf8');
+        if (contentBudget <= markerBytes) {
+          text = truncateUtf8ByBytes(raw, contentBudget);
+        } else {
+          text = truncateUtf8ByBytes(raw, contentBudget - markerBytes) + truncMarker;
+        }
       }
 
       const safeText = sanitizeContent(text);
-      blocks.push(`#### [NEW UNTRACKED FILE] \`${rel}\`\n\`\`\`\n${safeText}\n\`\`\``);
+      const block = `${header}${safeText}${footer}`;
+      const blockTotalBytes = sepBytes + Buffer.byteLength(block, 'utf8');
+
+      if (accumulated + blockTotalBytes > maxBytes) {
+        const allowedBlockBytes = maxBytes - accumulated - sepBytes;
+        if (allowedBlockBytes > 0) {
+          const cutBlock = truncateUtf8ByBytes(block, allowedBlockBytes);
+          blocks.push(cutBlock);
+          included.push(rel);
+        }
+        truncated = true;
+        break;
+      }
+
+      blocks.push(block);
       included.push(rel);
+      accumulated += blockTotalBytes;
+
+      if (truncated) {
+        break;
+      }
     } catch {}
+  }
+
+  let finalContent = blocks.join('\n\n');
+  if (Buffer.byteLength(finalContent, 'utf8') > maxBytes) {
+    finalContent = truncateUtf8ByBytes(finalContent, maxBytes);
+    truncated = true;
   }
 
   return {
     files: included,
-    content: blocks.join('\n\n'),
+    content: finalContent,
     truncated,
   };
 }
@@ -253,10 +388,15 @@ export function getReviewEvidence(workspaceRoot, options = {}) {
       summary: 'Not a git repository',
       hasDiff: false,
       diff: '',
+      totalDiffBytes: 0,
+      returnedDiffBytes: 0,
+      hasMoreDiff: false,
+      nextDiffOffset: null,
       untracked: [],
       untrackedContent: '',
       staged: [],
       modified: [],
+      truncated: false,
     };
   }
 
@@ -269,6 +409,10 @@ export function getReviewEvidence(workspaceRoot, options = {}) {
       diffRes = {
         hasDiff: true,
         diff: [stagedRes.diff, unstagedRes.diff].filter(Boolean).join('\n'),
+        totalBytes: (stagedRes.totalBytes || 0) + (unstagedRes.totalBytes || 0),
+        returnedBytes: Buffer.byteLength([stagedRes.diff, unstagedRes.diff].filter(Boolean).join('\n'), 'utf8'),
+        hasMore: stagedRes.hasMore || unstagedRes.hasMore,
+        nextOffset: stagedRes.nextOffset || unstagedRes.nextOffset || null,
         truncated: stagedRes.truncated || unstagedRes.truncated,
       };
     }
@@ -286,6 +430,10 @@ export function getReviewEvidence(workspaceRoot, options = {}) {
     untrackedContent: untrackedEvidence.content,
     hasDiff: Boolean(diffRes.hasDiff) || Boolean(untrackedEvidence.content),
     diff: diffRes.diff || '',
+    totalDiffBytes: diffRes.totalBytes || 0,
+    returnedDiffBytes: diffRes.returnedBytes || Buffer.byteLength(diffRes.diff || '', 'utf8'),
+    hasMoreDiff: Boolean(diffRes.hasMore),
+    nextDiffOffset: diffRes.nextOffset ?? null,
     truncated: diffRes.truncated || untrackedEvidence.truncated,
     error: diffRes.error || null,
   };
