@@ -1,0 +1,29 @@
+﻿# Dependencies
+node_modules/
+
+# Chrome User Profiles & Local State (Sensitive!)
+chrome-profile/
+test-profile/
+*.profile/
+
+# Environment files & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_*
+credentials.json
+
+# Logs & Temporary files
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Test coverage & Build
+coverage/
+dist/
+build/
+scratch/

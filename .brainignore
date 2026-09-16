@@ -1,0 +1,12 @@
+﻿# .brainignore - Files and directories excluded from ChatGPT context collection
+node_modules/
+.git/
+chrome-profile/
+test-profile/
+dist/
+coverage/
+*.log
+*.tmp
+*.lock
+.env*
+!.env.example
