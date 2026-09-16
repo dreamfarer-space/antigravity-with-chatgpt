@@ -162,6 +162,25 @@ const PRELUDE = `
     } catch (e) {}
     return ((target.innerText || target.textContent || '') + '').trim();
   };
+  const extractComposerText = (el) => {
+    if (!el) return '';
+    const isTextarea = el.tagName === 'TEXTAREA' || el.tagName === 'INPUT';
+    if (isTextarea) return el.value || '';
+    const children = Array.prototype.slice.call(el.children);
+    if (!children.length) {
+      return (el.innerText || el.textContent || '').replace(new RegExp(String.fromCharCode(160), 'g'), ' ');
+    }
+    const lines = [];
+    for (let i = 0; i < children.length; i++) {
+      const node = children[i];
+      if (node.getAttribute && node.getAttribute('data-empty-paragraph') === 'true') {
+        lines.push('');
+      } else {
+        lines.push(node.textContent || '');
+      }
+    }
+    return lines.join(String.fromCharCode(10)).replace(new RegExp(String.fromCharCode(160), 'g'), ' ');
+  };
 `;
 
 const PROBE_JS = `(() => {
@@ -197,9 +216,7 @@ ${PRELUDE}
   let composerSel = null;
   if (composer) {
     composerSel = composer.sel;
-    const raw = (composer.el.value !== undefined && composer.el.value !== null)
-      ? composer.el.value
-      : (composer.el.innerText || composer.el.textContent || '');
+    const raw = extractComposerText(composer.el);
     composerEmpty = (raw || '').trim().length === 0;
   }
 
@@ -480,7 +497,7 @@ export const PROBE_COMPOSER_JS = `(() => {
 
   const el = c.el;
   const isTextarea = el.tagName === 'TEXTAREA' || el.tagName === 'INPUT';
-  const content = isTextarea ? (el.value || '') : (el.innerText || el.textContent || '');
+  const content = extractComposerText(el);
   const trimmed = content.trim();
   const fp = computeFingerprint(content);
 
@@ -574,13 +591,13 @@ export async function insertTextReliable(cdp, text) {
       sel.addRange(range);
 
       document.execCommand('insertText', false, str);
-      const content = el.innerText || el.textContent || '';
+      let content = extractComposerText(el);
       if (content.length === 0) {
         el.textContent = str;
         el.dispatchEvent(new Event('input', { bubbles: true }));
+        content = extractComposerText(el);
       }
-      const finalContent = el.innerText || el.textContent || '';
-      const fp = computeFingerprint(finalContent);
+      const fp = computeFingerprint(content);
       return { ok: true, length: fp.length, hash: fp.hash, isTextarea: false };
     })()`, attemptTimeoutMs);
   };
