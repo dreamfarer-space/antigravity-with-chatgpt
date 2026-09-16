@@ -13,11 +13,11 @@ import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { resolveSafePath, isPathContained, SecurityError } from '../src/security/path_guard.mjs';
+import { resolveSafePath, isPathContained, canonicalizeManifestPath, SecurityError } from '../src/security/path_guard.mjs';
 import { sanitizeContent, isSensitivePath, redactSensitive } from '../src/security/sensitive.mjs';
 import { runBrainTask, parseEvidenceRequests, buildEvidenceRoundSnippets, MAX_AGGREGATE_EVIDENCE_BYTES } from '../src/brain/orchestrator.mjs';
 import { recordExecution } from '../src/execution/recorder.mjs';
-import { getUntrackedEvidence, truncateUtf8ByBytes, getGitDiff, getReviewEvidence, parseGitStatusOutput } from '../src/git/git_helper.mjs';
+import { getUntrackedEvidence, truncateUtf8ByBytes, getGitDiff, getReviewEvidence, parseGitStatusOutput, unquoteGitPath, parseRenamePathPair } from '../src/git/git_helper.mjs';
 import { evaluate, getInjectionTimeout, SUBMIT_STATUS, insertTextReliable, submitMessageReliable, verifyUnknownReceiptOrThrow } from '../src/transport/cdp_transport.mjs';
 import { readFileSafe } from '../src/workspace/context_provider.mjs';
 import { computeFingerprint, BROWSER_FINGERPRINT_SNIPPET } from '../src/transport/fingerprint.mjs';
@@ -1044,6 +1044,59 @@ Also need to check another file:
     assert.ok(res.snippets.some((s) => s.includes('REDACTED') || s.includes('ceiling')));
   });
 
+  test('Evidence protocol: canonicalizeManifestPath 保持精确字符身份，彻底防范 Confused-Deputy 碰撞', () => {
+    const tmp = os.tmpdir();
+
+    // 1. 空白字符身份隔离测试：' secret.txt ' 绝不与 'secret.txt' 碰撞
+    const spaced = canonicalizeManifestPath(tmp, ' secret.txt ');
+    const normal = canonicalizeManifestPath(tmp, 'secret.txt');
+    assert.notEqual(spaced, normal, '首尾空格路径绝不能通过 trim() 碰撞到同名无空格文件');
+    assert.equal(spaced, ' secret.txt ');
+
+    // 2. 跨平台反斜杠字符身份测试
+    if (process.platform !== 'win32') {
+      const posixBackslash = canonicalizeManifestPath(tmp, 'foo\\bar.txt');
+      const posixSlash = canonicalizeManifestPath(tmp, 'foo/bar.txt');
+      assert.notEqual(posixBackslash, posixSlash, 'POSIX 系统下文件名中的真实反斜杠绝不能被无条件替换为正斜杠');
+    }
+
+    // 3. 证据协议清单 Confused-Deputy 防护验证
+    const safeSpacedName = ' sensitive_space.txt ';
+    const manifestFiles = new Set([safeSpacedName]);
+
+    // 请求不带空格的同名文件，必须严格被拒绝
+    const res = buildEvidenceRoundSnippets({
+      requests: [{ type: 'read_file', path: 'sensitive_space.txt' }],
+      workspace: tmp,
+      reviewManifestFiles: manifestFiles,
+      currentAggregateBytes: 0,
+    });
+    assert.ok(res.snippets.some((s) => s.includes('Security policy prevents automated reading')));
+  });
+
+  test('Evidence protocol: 审查清单完整端到端接纳 Unmerged 冲突文件读取', () => {
+    // 验证 unmerged 冲突文件能被合法纳入 reviewManifestFiles 并被正常请求
+    const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'unmerged-test-'));
+    try {
+      const conflictFile = 'conflict_file.txt';
+      const conflictPath = path.join(testDir, conflictFile);
+      fs.writeFileSync(conflictPath, '<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n', 'utf8');
+
+      const manifestFiles = new Set([canonicalizeManifestPath(testDir, conflictFile)]);
+      const res = buildEvidenceRoundSnippets({
+        requests: [{ type: 'read_file', path: conflictFile }],
+        workspace: testDir,
+        reviewManifestFiles: manifestFiles,
+        currentAggregateBytes: 0,
+      });
+
+      assert.ok(res.snippets.some((s) => s.includes('ours') && s.includes('theirs')), 'Unmerged 冲突文件内容应成功提取');
+      assert.equal(res.audit[0].type, 'read_file');
+    } finally {
+      fs.rmSync(testDir, { recursive: true, force: true });
+    }
+  });
+
   // ---------------------------------------------------------------------------
   // 21. Git Status porcelain -z 与重命名/特殊字符健壮性测试
   // ---------------------------------------------------------------------------
@@ -1135,14 +1188,43 @@ Also need to check another file:
     assert.deepEqual(parsed.untracked, []);
   });
 
-  test('parseGitStatusOutput: 正确解析合并冲突 (Unmerged Conflicts) 并与未跟踪文件隔离', () => {
-    // Git porcelain: UU (both modified), AA (both added), DD (both deleted)
-    const unmergedPayload = 'UU conflict.txt\0AA both_added.txt\0?? untracked.txt\0';
-    const parsed = parseGitStatusOutput(unmergedPayload);
+  test('parseGitStatusOutput: 换行回退模式下包含合法 " -> " 字符的真实重命名解析 (含 C-style 引号边界识别)', () => {
+    // 真实 Git 输出：R  "foo -> bar.txt" -> baz.txt
+    const renameWithArrow = 'R  "foo -> bar.txt" -> baz.txt\n';
+    const parsed = parseGitStatusOutput(renameWithArrow);
 
-    assert.deepEqual(parsed.unmerged.sort(), ['both_added.txt', 'conflict.txt'].sort(), '冲突文件必须归入 unmerged');
-    assert.deepEqual(parsed.untracked, ['untracked.txt'], '未跟踪文件与冲突文件严格隔离');
-    assert.equal(parsed.untracked.includes('conflict.txt'), false);
+    assert.deepEqual(parsed.staged.sort(), ['baz.txt', 'foo -> bar.txt'].sort(), '引号内的 " -> " 绝不能作为重命名分割符截断');
+    assert.deepEqual(parsed.modified, []);
+    assert.deepEqual(parsed.unmerged, []);
+    assert.deepEqual(parsed.untracked, []);
+
+    // 两侧均带引号且含 " -> "
+    const doubleArrow = 'RM "old -> file.txt" -> "new -> file.txt"\n';
+    const parsedDouble = parseGitStatusOutput(doubleArrow);
+    assert.deepEqual(parsedDouble.staged.sort(), ['new -> file.txt', 'old -> file.txt'].sort());
+    assert.deepEqual(parsedDouble.modified, ['new -> file.txt']);
+  });
+
+  test('unquoteGitPath: C-style 转义字符与八进制 UTF-8 解码测试', () => {
+    assert.equal(unquoteGitPath('"plain.txt"'), 'plain.txt');
+    assert.equal(unquoteGitPath('"tab\\ttest.txt"'), 'tab\ttest.txt');
+    assert.equal(unquoteGitPath('"newline\\ntest.txt"'), 'newline\ntest.txt');
+    assert.equal(unquoteGitPath('"quote\\"test.txt"'), 'quote"test.txt');
+    assert.equal(unquoteGitPath('"slash\\\\test.txt"'), 'slash\\test.txt');
+    // Git core.quotepath 对中文 "中文.txt" 的八进制输出："\344\270\255\346\226\207.txt"
+    assert.equal(unquoteGitPath('"\\344\\270\\255\\346\\226\\207.txt"'), '中文.txt');
+  });
+
+  test('parseGitStatusOutput: 表驱动测试 Git 全部 7 种合并冲突状态 (DD, AU, UD, UA, DU, AA, UU)', () => {
+    const conflictCodes = ['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'];
+    for (const code of conflictCodes) {
+      const payload = `${code} conflict_${code}.txt\0`;
+      const parsed = parseGitStatusOutput(payload);
+      assert.deepEqual(parsed.unmerged, [`conflict_${code}.txt`], `冲突状态 ${code} 必须正确归入 unmerged`);
+      assert.deepEqual(parsed.untracked, [], `冲突状态 ${code} 严禁误归入 untracked`);
+      assert.deepEqual(parsed.staged, [], `冲突状态 ${code} 严禁误归入 staged`);
+      assert.deepEqual(parsed.modified, [], `冲突状态 ${code} 严禁误归入 modified`);
+    }
   });
 
   console.log(`\n========================================`);

@@ -118,3 +118,28 @@ export function isPathContained(workspaceRoot, requestedPath) {
     return false;
   }
 }
+
+/**
+ * 规范化审查清单与请求路径，保持精确字符身份，彻底防范 Confused-Deputy 碰撞
+ * @param {string} workspaceRoot 工作区绝对路径
+ * @param {string} p 相对或绝对路径
+ * @returns {string|null} 规范化相对路径；当路径非法、逃逸或空时返回 null
+ */
+export function canonicalizeManifestPath(workspaceRoot, p) {
+  if (typeof p !== 'string' || !p) return null;
+  if (p.includes('\0')) return null;
+
+  try {
+    const safePath = resolveSafePath(workspaceRoot, p);
+    const absRoot = path.resolve(workspaceRoot);
+    const rel = path.relative(absRoot, safePath);
+
+    // 在 Windows 下路径分隔符为反斜杠，统一规范为正斜杠便于跨环境表现
+    // 在 POSIX 系统下保持真实字符身份，严禁将合法文件名中的反斜杠字符替换为斜杠 (防路径碰撞)
+    const norm = process.platform === 'win32' ? rel.replace(/\\/g, '/') : rel;
+    if (!norm || norm === '.' || norm.startsWith('..')) return null;
+    return norm;
+  } catch {
+    return null;
+  }
+}

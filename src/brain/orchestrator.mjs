@@ -13,6 +13,7 @@ import { buildAttachmentsBlock, getWorkspaceInfo, readFileSafe } from '../worksp
 import { getGitDiff, getReviewEvidence } from '../git/git_helper.mjs';
 import { getRecentExecutions, formatExecutionSummary } from '../execution/recorder.mjs';
 import { sanitizeContent } from '../security/sensitive.mjs';
+import { canonicalizeManifestPath } from '../security/path_guard.mjs';
 import { sendPromptViaCdp } from '../transport/cdp_transport.mjs';
 
 /**
@@ -155,16 +156,17 @@ export function buildEvidenceRoundSnippets({
         nextOffset: diffRes.nextOffset,
       });
     } else if (req.type === 'read_file' && req.path) {
-      const rawPathStr = String(req.path).trim();
+      const rawPathStr = String(req.path);
       if (rawPathStr.length > MAX_PATH_LENGTH) {
         const snippet = `### [EVIDENCE: REJECTED \`${rawPathStr.slice(0, 32)}...\`]\nError: Requested path exceeds maximum allowed length (${MAX_PATH_LENGTH} chars).`;
         tryAppendSnippet(snippet);
         continue;
       }
 
-      const normPath = path.normalize(rawPathStr).replace(/\\/g, '/').replace(/^\.\//, '');
-      if (reviewManifestFiles && !reviewManifestFiles.has(normPath)) {
-        const snippet = `### [EVIDENCE: REJECTED \`${normPath}\`]\nError: Security policy prevents automated reading of files outside the active change/attachment manifest.`;
+      const normPath = canonicalizeManifestPath(workspace, rawPathStr);
+      if (!normPath || (reviewManifestFiles && !reviewManifestFiles.has(normPath))) {
+        const safeDisplay = normPath || rawPathStr.replace(/[\0\r\n]/g, '');
+        const snippet = `### [EVIDENCE: REJECTED \`${safeDisplay}\`]\nError: Security policy prevents automated reading of files outside the active change/attachment manifest.`;
         tryAppendSnippet(snippet);
         continue;
       }
@@ -340,14 +342,18 @@ export async function runBrainTask(options = {}) {
     const MAX_AGGREGATE_BYTES = 128 * 1024; // 最多追加 128KB 证据，防止无限膨胀
 
     // Confused-deputy 防护：严格仅允许读取当前变更清单 (staged, modified, unmerged, untracked) 或显式附带的文件
+    // 使用精确 canonicalizeManifestPath，严禁模糊 trim() 与跨平台无条件反斜杠替换
+    const rawFileList = [
+      ...(reviewEvidence?.staged || []),
+      ...(reviewEvidence?.modified || []),
+      ...(reviewEvidence?.unmerged || []),
+      ...(reviewEvidence?.untracked || []),
+      ...(Array.isArray(options.files) ? options.files : []),
+    ];
     const reviewManifestFiles = new Set(
-      [
-        ...(reviewEvidence?.staged || []),
-        ...(reviewEvidence?.modified || []),
-        ...(reviewEvidence?.unmerged || []),
-        ...(reviewEvidence?.untracked || []),
-        ...(Array.isArray(options.files) ? options.files : []),
-      ].map((p) => path.normalize(String(p).trim()).replace(/\\/g, '/').replace(/^\.\//, ''))
+      rawFileList
+        .map((p) => canonicalizeManifestPath(workspace, String(p)))
+        .filter(Boolean)
     );
 
     // 为完整的序列化 followUpPrompt 预留封套开销 (Header, Separators, Instructions)

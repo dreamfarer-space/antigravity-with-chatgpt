@@ -19,9 +19,126 @@ const DEFAULT_DIFF_MAX_BYTES = 64 * 1024; // 64 KB
 const DEFAULT_UNTRACKED_MAX_BYTES = 32 * 1024; // 32 KB
 
 /**
+ * 解码 Git C-style 引号包围与转义的 pathname
+ * @param {string} raw
+ * @returns {string}
+ */
+export function unquoteGitPath(raw) {
+  if (typeof raw !== 'string') return '';
+  const s = raw.trim();
+  if (!s.startsWith('"') || !s.endsWith('"') || s.length < 2) {
+    return s;
+  }
+  const inner = s.slice(1, -1);
+  const bytes = [];
+  let i = 0;
+  while (i < inner.length) {
+    if (inner[i] === '\\' && i + 1 < inner.length) {
+      i++;
+      const ch = inner[i];
+      if (ch === 't') {
+        bytes.push(0x09);
+        i++;
+      } else if (ch === 'n') {
+        bytes.push(0x0a);
+        i++;
+      } else if (ch === 'r') {
+        bytes.push(0x0d);
+        i++;
+      } else if (ch === 'b') {
+        bytes.push(0x08);
+        i++;
+      } else if (ch === 'f') {
+        bytes.push(0x0c);
+        i++;
+      } else if (ch === 'v') {
+        bytes.push(0x0b);
+        i++;
+      } else if (ch === 'a') {
+        bytes.push(0x07);
+        i++;
+      } else if (ch === '"' || ch === '\\') {
+        bytes.push(ch.charCodeAt(0));
+        i++;
+      } else if (ch >= '0' && ch <= '7') {
+        let octalStr = ch;
+        i++;
+        while (i < inner.length && octalStr.length < 3 && inner[i] >= '0' && inner[i] <= '7') {
+          octalStr += inner[i];
+          i++;
+        }
+        bytes.push(parseInt(octalStr, 8));
+      } else {
+        bytes.push(ch.charCodeAt(0));
+        i++;
+      }
+    } else {
+      const codePoint = inner.codePointAt(i);
+      const charBuf = Buffer.from(String.fromCodePoint(codePoint), 'utf8');
+      for (const b of charBuf) {
+        bytes.push(b);
+      }
+      i += String.fromCodePoint(codePoint).length;
+    }
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+/**
+ * 解析非 -z porcelain 回退模式下的重命名路径对 <orig-path> -> <new-path>
+ * 严谨识别 C-style 引号边界，防范文件名自身包含 " -> " 导致的拆分错误
+ * @param {string} str
+ * @returns {[string, string]|null}
+ */
+export function parseRenamePathPair(str) {
+  if (typeof str !== 'string') return null;
+  const raw = str.trim();
+
+  let origRaw = '';
+  let rest = '';
+
+  if (raw.startsWith('"')) {
+    // 首个路径是 C-style 引号包围，寻找未转义的闭合双引号
+    let i = 1;
+    let escaped = false;
+    let quoteEnd = -1;
+    while (i < raw.length) {
+      if (escaped) {
+        escaped = false;
+      } else if (raw[i] === '\\') {
+        escaped = true;
+      } else if (raw[i] === '"') {
+        quoteEnd = i;
+        break;
+      }
+      i++;
+    }
+
+    if (quoteEnd !== -1) {
+      origRaw = raw.slice(0, quoteEnd + 1);
+      rest = raw.slice(quoteEnd + 1).trim();
+    }
+  } else {
+    // 首个路径无引号，寻找第一个 ' -> '
+    const arrowIdx = raw.indexOf(' -> ');
+    if (arrowIdx !== -1) {
+      origRaw = raw.slice(0, arrowIdx).trim();
+      rest = '-> ' + raw.slice(arrowIdx + 4).trim();
+    }
+  }
+
+  if (rest.startsWith('-> ')) {
+    const targetRaw = rest.slice(3).trim();
+    return [unquoteGitPath(origRaw), unquoteGitPath(targetRaw)];
+  }
+
+  return null;
+}
+
+/**
  * 解析 Git porcelain 输出（全面兼容 -z NUL 分隔、重命名 old -> new、引号与特殊字符）
  * @param {string} stdout
- * @returns {{ staged: string[], modified: string[], untracked: string[] }}
+ * @returns {{ staged: string[], modified: string[], unmerged: string[], untracked: string[] }}
  */
 export function parseGitStatusOutput(stdout) {
   const staged = [];
@@ -92,31 +209,40 @@ export function parseGitStatusOutput(stdout) {
       const hasRenameOrCopy = code[0] === 'R' || code[0] === 'C' || code[1] === 'R' || code[1] === 'C';
 
       if (isUntracked) {
-        file = file.replace(/^"(.*)"$/, '$1');
-        if (file) untracked.push(file);
+        const cleanFile = unquoteGitPath(file);
+        if (cleanFile) untracked.push(cleanFile);
       } else if (isUnmerged) {
-        file = file.replace(/^"(.*)"$/, '$1');
-        if (file) unmerged.push(file);
-      } else if (hasRenameOrCopy && file.includes(' -> ')) {
-        const parts = file.split(' -> ').map((p) => p.replace(/^"(.*)"$/, '$1').trim()).filter(Boolean);
-        // X 轴 (Index / Staged)
-        if (code[0] === 'R' || code[0] === 'C') {
-          staged.push(...parts);
-        } else if (code[0] !== ' ' && code[0] !== '?') {
-          if (parts[1]) staged.push(parts[1]);
-        }
+        const cleanFile = unquoteGitPath(file);
+        if (cleanFile) unmerged.push(cleanFile);
+      } else if (hasRenameOrCopy) {
+        const renamePair = parseRenamePathPair(file);
+        if (renamePair) {
+          const [origPath, targetPath] = renamePair;
+          // X 轴 (Index / Staged)
+          if (code[0] === 'R' || code[0] === 'C') {
+            staged.push(targetPath, origPath);
+          } else if (code[0] !== ' ' && code[0] !== '?') {
+            staged.push(targetPath);
+          }
 
-        // Y 轴 (Worktree / Unstaged)
-        if (code[1] === 'R' || code[1] === 'C') {
-          modified.push(...parts);
-        } else if (code[1] !== ' ' && code[1] !== '?') {
-          if (parts[1]) modified.push(parts[1]);
+          // Y 轴 (Worktree / Unstaged)
+          if (code[1] === 'R' || code[1] === 'C') {
+            modified.push(targetPath, origPath);
+          } else if (code[1] !== ' ' && code[1] !== '?') {
+            modified.push(targetPath);
+          }
+        } else {
+          const cleanFile = unquoteGitPath(file);
+          if (cleanFile) {
+            if (code[0] !== ' ' && code[0] !== '?') staged.push(cleanFile);
+            if (code[1] !== ' ' && code[1] !== '?') modified.push(cleanFile);
+          }
         }
       } else {
-        file = file.replace(/^"(.*)"$/, '$1');
-        if (file) {
-          if (code[0] !== ' ' && code[0] !== '?') staged.push(file);
-          if (code[1] !== ' ' && code[1] !== '?') modified.push(file);
+        const cleanFile = unquoteGitPath(file);
+        if (cleanFile) {
+          if (code[0] !== ' ' && code[0] !== '?') staged.push(cleanFile);
+          if (code[1] !== ' ' && code[1] !== '?') modified.push(cleanFile);
         }
       }
     }
