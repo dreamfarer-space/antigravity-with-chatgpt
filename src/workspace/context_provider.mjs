@@ -91,8 +91,13 @@ export function readFileSafe(workspaceRoot, filePath, options = {}) {
   }
 
   const stat = fs.statSync(safePath);
-  if (stat.isDirectory()) {
-    throw new SecurityError(`无法读取目录作为文件: "${relPath}"`, 'E_IS_DIRECTORY');
+  if (!stat.isFile()) {
+    throw new SecurityError(`无法读取非普通文件: "${relPath}"`, stat.isDirectory() ? 'E_IS_DIRECTORY' : 'E_NOT_A_FILE');
+  }
+
+  const MAX_SOURCE_FILE_BYTES = 4 * 1024 * 1024;
+  if (stat.size > MAX_SOURCE_FILE_BYTES) {
+    throw new SecurityError(`安全拦截: 源文件大小 (${stat.size} 字节) 超过单文件读取安全上限 (4MB): "${relPath}"`, 'E_FILE_TOO_LARGE');
   }
 
   const maxBytes = options.maxBytes || DEFAULT_FILE_MAX_BYTES;

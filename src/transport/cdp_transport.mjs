@@ -839,6 +839,25 @@ export async function submitMessageReliable(cdp, options = {}) {
 
 export const submitMessage = submitMessageReliable;
 
+/**
+ * 对 UNKNOWN 提交状态进行 fail-closed 强校验
+ * @param {object} cdp
+ * @param {object} submitReceipt
+ * @param {number} beforeTurns
+ * @returns {Promise<object>}
+ */
+export async function verifyUnknownReceiptOrThrow(cdp, submitReceipt, beforeTurns) {
+  if (submitReceipt.reason === 'baseline_probe_failed' || submitReceipt.reason === 'baseline_probe_invalid') {
+    throw new Error(`提交基准获取失败 (UNKNOWN/${submitReceipt.reason})：无法确立确定性状态基准，立即中止以防重复提交`);
+  }
+
+  const p = await evaluate(cdp, PROBE_JS, 3000).catch(() => null);
+  if (!p || (p.assistant?.count ?? 0) <= beforeTurns) {
+    throw new Error(`提交消息状态未知 (UNKNOWN/${submitReceipt.reason || 'timeout'})：未能在时限内获取新增回合证据，已中止以防重复提交`);
+  }
+  return p;
+}
+
 async function waitForComposer(cdp, deadlineMs = 30000) {
   const deadline = Date.now() + deadlineMs;
   let hits = 0;
@@ -929,11 +948,7 @@ async function _sendPromptViaCdpInternal({ prompt, mode = 'reuse', timeoutS = 60
     }
 
     if (submitReceipt.status === SUBMIT_STATUS.UNKNOWN) {
-      // 提交状态未知：二次检查是否已在回复流中
-      p = await evaluate(cdp, PROBE_JS, 3000).catch(() => null);
-      if (!p || (!p.stopButton?.found && (p.assistant?.count ?? 0) <= beforeTurns)) {
-        throw new Error('提交消息状态未知 (UNKNOWN)：未能在时限内获取 User Turn 递增或回复流启动收据，已中止以防重复提交');
-      }
+      p = await verifyUnknownReceiptOrThrow(cdp, submitReceipt, beforeTurns);
     }
 
     // 等待回复流启动

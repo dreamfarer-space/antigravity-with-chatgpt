@@ -96,6 +96,7 @@ export async function runBrainTask(options = {}) {
   let gitDiffBlock = '';
   let executionBlock = '';
   let manifestBlock = '';
+  let reviewEvidence = null;
 
   // 1. 根据模式与参数决定是否拉取工作区证据
   if (mode !== MODES.DERIVE) {
@@ -109,7 +110,8 @@ export async function runBrainTask(options = {}) {
     if (needDiff) {
       const diffMax = typeof options.diffMaxBytes === 'number' ? options.diffMaxBytes : 32768;
       const diffOff = typeof options.diffOffset === 'number' ? options.diffOffset : 0;
-      const evidence = getReviewEvidence(workspace, { offset: diffOff, maxBytes: diffMax, untrackedMaxBytes: 16384 });
+      reviewEvidence = getReviewEvidence(workspace, { offset: diffOff, maxBytes: diffMax, untrackedMaxBytes: 16384 });
+      const evidence = reviewEvidence;
       const diffParts = [];
 
       if (mode === MODES.REVIEW) {
@@ -189,6 +191,16 @@ export async function runBrainTask(options = {}) {
     let aggregateBytes = 0;
     const MAX_AGGREGATE_BYTES = 128 * 1024; // 最多追加 128KB 证据，防止无限膨胀
 
+    // Confused-deputy 防护：严格仅允许读取当前变更清单 (staged, modified, untracked) 或显式附带的文件
+    const reviewManifestFiles = new Set(
+      [
+        ...(reviewEvidence?.staged || []),
+        ...(reviewEvidence?.modified || []),
+        ...(reviewEvidence?.untracked || []),
+        ...(Array.isArray(options.files) ? options.files : []),
+      ].map((p) => path.normalize(String(p).trim()).replace(/\\/g, '/').replace(/^\.\//, ''))
+    );
+
     while (evidenceRounds < maxRounds) {
       const requests = parseEvidenceRequests(cdpRes.text);
       if (!requests || requests.length === 0) {
@@ -199,17 +211,24 @@ export async function runBrainTask(options = {}) {
       const evidenceSnippets = [];
 
       for (const req of requests) {
-        if (aggregateBytes >= MAX_AGGREGATE_BYTES) {
+        const remainingBudget = MAX_AGGREGATE_BYTES - aggregateBytes;
+        if (remainingBudget <= 0) {
           evidenceSnippets.push(`[NOTICE: Aggregate evidence budget (${MAX_AGGREGATE_BYTES}B) reached. Proceeding with review.]`);
           break;
         }
 
         if (req.type === 'git_diff') {
           const reqOffset = Math.max(0, Number(req.offset) || 0);
-          const reqMax = Math.min(Math.max(1024, Number(req.maxBytes) || 32768), 65536);
+          const requestedMax = Math.min(Math.max(1024, Number(req.maxBytes) || 32768), 65536);
+          const allowedMax = Math.min(requestedMax, remainingBudget);
+          if (allowedMax <= 0) {
+            evidenceSnippets.push(`[NOTICE: Aggregate evidence budget reached for git_diff.]`);
+            break;
+          }
+
           const diffRes = getGitDiff(workspace, {
             offset: reqOffset,
-            maxBytes: reqMax,
+            maxBytes: allowedMax,
             head: true,
             file: req.file,
           });
@@ -226,8 +245,21 @@ export async function runBrainTask(options = {}) {
 
           evidenceSnippets.push(`### [EVIDENCE: GIT DIFF PAGE (offset: ${reqOffset}, returned: ${diffRes.returnedBytes}B)]\n${diffRes.diff}`);
         } else if (req.type === 'read_file' && req.path) {
+          const normPath = path.normalize(String(req.path).trim()).replace(/\\/g, '/').replace(/^\.\//, '');
+          if (!reviewManifestFiles.has(normPath)) {
+            evidenceSnippets.push(`### [EVIDENCE: REJECTED \`${req.path}\`]\nError: Security policy prevents automated reading of files outside the active change/attachment manifest.`);
+            continue;
+          }
+
+          const requestedMax = Math.min(Math.max(512, Number(req.maxBytes) || 32768), 65536);
+          const allowedMax = Math.min(requestedMax, remainingBudget);
+          if (allowedMax <= 0) {
+            evidenceSnippets.push(`[NOTICE: Aggregate evidence budget reached for read_file.]`);
+            break;
+          }
+
           try {
-            const fileRes = readFileSafe(workspace, req.path, { maxBytes: req.maxBytes || 32768 });
+            const fileRes = readFileSafe(workspace, req.path, { maxBytes: allowedMax });
             const bytes = Buffer.byteLength(fileRes.content, 'utf8');
             aggregateBytes += bytes;
             evidenceAudit.push({
@@ -241,6 +273,11 @@ export async function runBrainTask(options = {}) {
             evidenceSnippets.push(`### [EVIDENCE: FAILED TO READ \`${req.path}\`]\nError: ${err.message}`);
           }
         }
+      }
+
+      // 硬性不变式断言 (Hard Invariant Assertion)
+      if (aggregateBytes > MAX_AGGREGATE_BYTES) {
+        throw new Error(`Aggregate evidence bytes (${aggregateBytes}) exceeded hard invariant ceiling (${MAX_AGGREGATE_BYTES})`);
       }
 
       if (evidenceSnippets.length === 0) break;

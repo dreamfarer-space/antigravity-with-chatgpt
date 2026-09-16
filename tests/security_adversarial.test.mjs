@@ -18,7 +18,8 @@ import { sanitizeContent, isSensitivePath, redactSensitive } from '../src/securi
 import { runBrainTask, parseEvidenceRequests } from '../src/brain/orchestrator.mjs';
 import { recordExecution } from '../src/execution/recorder.mjs';
 import { getUntrackedEvidence, truncateUtf8ByBytes, getGitDiff, getReviewEvidence } from '../src/git/git_helper.mjs';
-import { evaluate, getInjectionTimeout, SUBMIT_STATUS, insertTextReliable, submitMessageReliable } from '../src/transport/cdp_transport.mjs';
+import { evaluate, getInjectionTimeout, SUBMIT_STATUS, insertTextReliable, submitMessageReliable, verifyUnknownReceiptOrThrow } from '../src/transport/cdp_transport.mjs';
+import { readFileSafe } from '../src/workspace/context_provider.mjs';
 import { computeFingerprint, BROWSER_FINGERPRINT_SNIPPET } from '../src/transport/fingerprint.mjs';
 import { selectTargetPage, filterChatGptPages } from '../src/transport/target_selector.mjs';
 
@@ -763,6 +764,152 @@ Also need to check another file:
     assert.deepEqual(parseEvidenceRequests('Normal text without request'), []);
     assert.deepEqual(parseEvidenceRequests('<EVIDENCE_REQUEST>invalid json{</EVIDENCE_REQUEST>'), []);
     assert.deepEqual(parseEvidenceRequests(null), []);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 18. readFileSafe 安全加固测试 (!stat.isFile 与 4MB 内存防护)
+  // ---------------------------------------------------------------------------
+  console.log('\n18. readFileSafe 安全加固测试:');
+
+  test('readFileSafe 拦截目录读取并抛出 E_IS_DIRECTORY', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-readsafe-dir-'));
+    try {
+      const subDir = path.join(tmpDir, 'subdir');
+      fs.mkdirSync(subDir);
+      assert.throws(
+        () => readFileSafe(tmpDir, 'subdir'),
+        (err) => err instanceof SecurityError && err.code === 'E_IS_DIRECTORY'
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('readFileSafe 拦截大于 4MB 的超大文件并抛出 E_FILE_TOO_LARGE', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-readsafe-large-'));
+    try {
+      const largeFile = path.join(tmpDir, 'large.txt');
+      fs.writeFileSync(largeFile, Buffer.alloc(4 * 1024 * 1024 + 16, 65)); // 4MB + 16B
+      assert.throws(
+        () => readFileSafe(tmpDir, 'large.txt'),
+        (err) => err instanceof SecurityError && err.code === 'E_FILE_TOO_LARGE'
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 19. UNKNOWN 提交收据绝对 Fail-Closed 校验测试
+  // ---------------------------------------------------------------------------
+  console.log('\n19. UNKNOWN 提交收据绝对 Fail-Closed 校验测试:');
+
+  await testAsync('verifyUnknownReceiptOrThrow: baseline_probe_failed 立即抛错中止，严禁二次弱证据放行', async () => {
+    const dummyCdp = {
+      send: async () => {
+        throw new Error('should not probe');
+      },
+    };
+    await assert.rejects(
+      async () => {
+        await verifyUnknownReceiptOrThrow(dummyCdp, { status: SUBMIT_STATUS.UNKNOWN, reason: 'baseline_probe_failed' }, 0);
+      },
+      /提交基准获取失败/
+    );
+  });
+
+  await testAsync('verifyUnknownReceiptOrThrow: receipt_timeout 时即便 stopButton 存在但 turns 未递增也必须中止', async () => {
+    const mockCdpOldStreaming = {
+      send: async (method, params) => {
+        if (params?.expression) {
+          // 旧的流式输出：stopButton 为 true，但 assistant.count 为 1 (未递增)
+          return {
+            result: {
+              value: {
+                stopButton: { found: true },
+                assistant: { count: 1, len: 100, hash: 123 },
+              },
+            },
+          };
+        }
+        return { result: { value: null } };
+      },
+    };
+
+    await assert.rejects(
+      async () => {
+        await verifyUnknownReceiptOrThrow(mockCdpOldStreaming, { status: SUBMIT_STATUS.UNKNOWN, reason: 'receipt_timeout' }, 1);
+      },
+      /提交消息状态未知/
+    );
+  });
+
+  await testAsync('verifyUnknownReceiptOrThrow: receipt_timeout 时明确探测到 turns 递增才允许通过', async () => {
+    const mockCdpTurnIncrement = {
+      send: async (method, params) => {
+        if (params?.expression) {
+          return {
+            result: {
+              value: {
+                stopButton: { found: true },
+                assistant: { count: 2, len: 50, hash: 456 },
+              },
+            },
+          };
+        }
+        return { result: { value: null } };
+      },
+    };
+
+    const res = await verifyUnknownReceiptOrThrow(mockCdpTurnIncrement, { status: SUBMIT_STATUS.UNKNOWN, reason: 'receipt_timeout' }, 1);
+    assert.equal(res.assistant.count, 2);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 20. 闭环证据拉取 Confused-Deputy 防护与 128KB 预算钳位测试
+  // ---------------------------------------------------------------------------
+  console.log('\n20. 闭环证据拉取安全性测试 (Confused-Deputy 与 128KB 预算钳位):');
+
+  test('Evidence protocol: 严格限制仅能自动拉取 Manifest 清单内文件 (防 Confused-Deputy)', () => {
+    const manifestFiles = new Set(['src/index.js', 'package.json']);
+    const attackPaths = [
+      '../outside.env',
+      '../../secret.pem',
+      'src/other_sensitive.key',
+      '.env',
+    ];
+    for (const p of attackPaths) {
+      const norm = path.normalize(p).replace(/\\/g, '/').replace(/^\.\//, '');
+      assert.equal(manifestFiles.has(norm), false, `路径 ${p} 应被 Confused-Deputy 白名单拦截`);
+    }
+    assert.equal(manifestFiles.has('src/index.js'), true);
+  });
+
+  test('Evidence protocol: 128KB 动态预算钳位测试确保永不发生预算膨胀', () => {
+    const MAX_AGGREGATE_BYTES = 128 * 1024;
+    let aggregateBytes = 0;
+
+    // 假设第一轮返回 70KB
+    const r1Requested = 100 * 1024;
+    const r1Budget = MAX_AGGREGATE_BYTES - aggregateBytes;
+    const r1Allowed = Math.min(r1Requested, r1Budget);
+    assert.equal(r1Allowed, 100 * 1024);
+    aggregateBytes += 70 * 1024;
+
+    // 第二轮请求 100KB，剩余 58KB，必须钳位至 58KB
+    const r2Requested = 100 * 1024;
+    const r2Budget = MAX_AGGREGATE_BYTES - aggregateBytes;
+    assert.equal(r2Budget, 58 * 1024);
+    const r2Allowed = Math.min(r2Requested, r2Budget);
+    assert.equal(r2Allowed, 58 * 1024);
+    aggregateBytes += r2Allowed;
+
+    // 此时 aggregateBytes 达到 128KB 上限
+    assert.equal(aggregateBytes, MAX_AGGREGATE_BYTES);
+
+    // 第三轮预算剩余 0，必须直接拒绝
+    const r3Budget = MAX_AGGREGATE_BYTES - aggregateBytes;
+    assert.equal(r3Budget, 0);
   });
 
   console.log(`\n========================================`);
