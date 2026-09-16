@@ -901,6 +901,41 @@ Also need to check another file:
     assert.equal(res.userTurn.count, 2);
   });
 
+  await testAsync('verifyUnknownReceiptOrThrow: 缺少或非法 beforeUserTurns 基准计数时立即抛错 fail-closed (防预存回合假阳性)', async () => {
+    const mockCdpPreExisting = {
+      send: async (method, params) => {
+        if (params?.expression) {
+          return {
+            result: {
+              value: {
+                stopButton: { found: true },
+                assistant: { count: 5, len: 100, hash: 123 },
+                userTurn: { count: 5 },
+              },
+            },
+          };
+        }
+        return { result: { value: null } };
+      },
+    };
+
+    // beforeUserTurns 缺失
+    await assert.rejects(
+      async () => {
+        await verifyUnknownReceiptOrThrow(mockCdpPreExisting, { status: SUBMIT_STATUS.UNKNOWN, reason: 'receipt_timeout' }, 5);
+      },
+      /submitReceipt 缺少合法的 user-turn 基准计数/
+    );
+
+    // beforeUserTurns 为非法负数
+    await assert.rejects(
+      async () => {
+        await verifyUnknownReceiptOrThrow(mockCdpPreExisting, { status: SUBMIT_STATUS.UNKNOWN, reason: 'receipt_timeout', beforeUserTurns: -1 }, 5);
+      },
+      /submitReceipt 缺少合法的 user-turn 基准计数/
+    );
+  });
+
   // ---------------------------------------------------------------------------
   // 20. 闭环证据拉取生产实现测试 (128KB 序列化预算记账、截断与 Confused-Deputy)
   // ---------------------------------------------------------------------------
@@ -972,6 +1007,26 @@ Also need to check another file:
     assert.ok(res.snippets.some((s) => s.includes('exceeds maximum allowed length')));
   });
 
+  test('Evidence protocol: 脱敏展开 (Sanitizer-Expanding) 路径在预算天花板边缘严格受控', () => {
+    const manifestFiles = new Set(['src/index.js']);
+    // 构造带敏感关键字的请求路径，脱敏后将展开变长：password="abc" -> [REDACTED_SECRET]
+    const expandingRequests = [
+      { type: 'read_file', path: 'outside/password="123456"/test.txt' },
+      { type: 'read_file', path: 'outside/api_key="sk-123456789012345678901234567890"/test.txt' },
+    ];
+    const res = buildEvidenceRoundSnippets({
+      requests: expandingRequests,
+      workspace: os.tmpdir(),
+      reviewManifestFiles: manifestFiles,
+      currentAggregateBytes: MAX_AGGREGATE_EVIDENCE_BYTES - 300, // 距离天花板仅 300 字节
+      maxAggregateBytes: MAX_AGGREGATE_EVIDENCE_BYTES,
+    });
+
+    // 必须经过 post-sanitization 测算，总字节必须严格受限于 MAX_AGGREGATE_EVIDENCE_BYTES
+    assert.ok(res.newAggregateBytes <= MAX_AGGREGATE_EVIDENCE_BYTES);
+    assert.ok(res.snippets.some((s) => s.includes('REDACTED') || s.includes('ceiling')));
+  });
+
   // ---------------------------------------------------------------------------
   // 21. Git Status porcelain -z 与重命名/特殊字符健壮性测试
   // ---------------------------------------------------------------------------
@@ -986,6 +1041,31 @@ Also need to check another file:
     assert.deepEqual(parsed.staged.sort(), ['new name.js', 'old name.js'].sort(), '重命名文件新旧路径均应纳入 manifest');
     assert.deepEqual(parsed.modified, ['normal with space.js'], '带空格文件名正确提取');
     assert.deepEqual(parsed.untracked, ['untracked unicode 中文.txt'], '多字节 Unicode 文件名正确提取');
+  });
+
+  test('parseGitStatusOutput: 正确解析 Y 位工作区重命名 ( R new\\0old\\0) 并维持流同步不产生虚假记录', () => {
+    // 关键测试用例：worktree rename ' R new-name.js\0AB secret.txt\0 M next.js\0'
+    // 必须将 'AB secret.txt' 正确作为 rename 的 oldFile 消费，绝不能当作新记录解析出 'secret.txt'！
+    const yRenamePayload = ' R new-name.js\0AB secret.txt\0 M next.js\0';
+    const parsed = parseGitStatusOutput(yRenamePayload);
+
+    assert.deepEqual(parsed.modified.sort(), ['new-name.js', 'AB secret.txt', 'next.js'].sort());
+    assert.deepEqual(parsed.staged, []);
+    assert.deepEqual(parsed.untracked, []);
+    // 确保没有产生虚假记录 'secret.txt'
+    assert.equal(parsed.modified.includes('secret.txt'), false);
+  });
+
+  test('parseGitStatusOutput: 正确解析工作区拷贝 ( C) 与暂存+工作区复合重命名 (RC)', () => {
+    const copyPayload = ' C new-copy.js\0old-copy.js\0RC new-both.js\0old-both.js\0';
+    const parsed = parseGitStatusOutput(copyPayload);
+
+    assert.ok(parsed.modified.includes('new-copy.js'));
+    assert.ok(parsed.modified.includes('old-copy.js'));
+    assert.ok(parsed.staged.includes('new-both.js'));
+    assert.ok(parsed.staged.includes('old-both.js'));
+    assert.ok(parsed.modified.includes('new-both.js'));
+    assert.ok(parsed.modified.includes('old-both.js'));
   });
 
   test('parseGitStatusOutput: 正确兼容换行分隔 porcelain 回退输出 (含 "old -> new" 与引号)', () => {

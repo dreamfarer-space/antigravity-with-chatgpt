@@ -99,12 +99,13 @@ export function buildEvidenceRoundSnippets({
     }
   }
 
-  function tryAppendSnippet(snippet) {
-    const snippetBytes = Buffer.byteLength(snippet, 'utf8') + 2; // 含换行符开销
+  function tryAppendSnippet(rawSnippet) {
+    const safeSnippet = sanitizeContent(rawSnippet);
+    const snippetBytes = Buffer.byteLength(safeSnippet, 'utf8') + 2; // 含换行符开销
     if (aggregateBytes + snippetBytes > maxAggregateBytes) {
       if (!budgetReached) {
         budgetReached = true;
-        const ceilingNotice = `[NOTICE: Aggregate evidence budget ceiling (${maxAggregateBytes}B) reached. Truncating further evidence.]`;
+        const ceilingNotice = sanitizeContent(`[NOTICE: Aggregate evidence budget ceiling (${maxAggregateBytes}B) reached. Truncating further evidence.]`);
         const ceilingBytes = Buffer.byteLength(ceilingNotice, 'utf8') + 2;
         if (aggregateBytes + ceilingBytes <= maxAggregateBytes) {
           snippets.push(ceilingNotice);
@@ -113,7 +114,7 @@ export function buildEvidenceRoundSnippets({
       }
       return false;
     }
-    snippets.push(snippet);
+    snippets.push(safeSnippet);
     aggregateBytes += snippetBytes;
     return true;
   }
@@ -347,6 +348,10 @@ export async function runBrainTask(options = {}) {
       ].map((p) => path.normalize(String(p).trim()).replace(/\\/g, '/').replace(/^\.\//, ''))
     );
 
+    // 为完整的序列化 followUpPrompt 预留封套开销 (Header, Separators, Instructions)
+    const ENVELOPE_RESERVE_BYTES = 512;
+    const maxEvidencePayload = MAX_AGGREGATE_EVIDENCE_BYTES - ENVELOPE_RESERVE_BYTES;
+
     while (evidenceRounds < maxRounds) {
       const requests = parseEvidenceRequests(cdpRes.text);
       if (!requests || requests.length === 0) {
@@ -359,7 +364,7 @@ export async function runBrainTask(options = {}) {
         workspace,
         reviewManifestFiles,
         currentAggregateBytes: aggregateBytes,
-        maxAggregateBytes: MAX_AGGREGATE_EVIDENCE_BYTES,
+        maxAggregateBytes: maxEvidencePayload,
         round: evidenceRounds,
       });
 
@@ -381,9 +386,9 @@ export async function runBrainTask(options = {}) {
       const followUpBytes = Buffer.byteLength(safeFollowUp, 'utf8');
 
       // 严格硬性不变式断言 (Hard Post-Serialization Invariant)
-      const MAX_FOLLOWUP_PROMPT_BYTES = 256 * 1024;
-      if (followUpBytes > MAX_FOLLOWUP_PROMPT_BYTES) {
-        throw new Error(`Follow-up evidence prompt (${followUpBytes}B) exceeded maximum safe prompt limit (${MAX_FOLLOWUP_PROMPT_BYTES}B)`);
+      // 包含外层封套、Markdown 标记、拒绝片段与实体数据在内的完整提示词，绝不允许超出 128KB 预算天花板
+      if (followUpBytes > MAX_AGGREGATE_EVIDENCE_BYTES) {
+        throw new Error(`Follow-up evidence prompt (${followUpBytes}B) strictly exceeded aggregate evidence ceiling (${MAX_AGGREGATE_EVIDENCE_BYTES}B)`);
       }
 
       cdpRes = await sendPromptViaCdp({

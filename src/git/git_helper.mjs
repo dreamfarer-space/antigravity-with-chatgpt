@@ -45,12 +45,20 @@ export function parseGitStatusOutput(stdout) {
       const file = token.slice(3);
       i++;
 
-      if (code[0] === 'R' || code[0] === 'C') {
-        // porcelain -z 重命名/拷贝格式：XY <newPath>\0<oldPath>\0
-        const oldFile = rawTokens[i] || '';
-        i++;
-        if (file) staged.push(file);
-        if (oldFile) staged.push(oldFile);
+      const stagedRename = code[0] === 'R' || code[0] === 'C';
+      const worktreeRename = code[1] === 'R' || code[1] === 'C';
+
+      if (stagedRename || worktreeRename) {
+        // porcelain -z 在 X 位或 Y 位为 R/C 时，均携带第二个 NUL 路径
+        const otherFile = rawTokens[i++] || '';
+        if (stagedRename) {
+          if (file) staged.push(file);
+          if (otherFile) staged.push(otherFile);
+        }
+        if (worktreeRename) {
+          if (file) modified.push(file);
+          if (otherFile) modified.push(otherFile);
+        }
       } else if (code.startsWith('?') || code.startsWith('U')) {
         if (file) untracked.push(file);
       } else {
@@ -63,10 +71,13 @@ export function parseGitStatusOutput(stdout) {
     for (const line of stdout.split('\n').filter(Boolean)) {
       const code = line.slice(0, 2);
       let file = line.slice(3).trim();
+      const stagedRename = code[0] === 'R' || code[0] === 'C';
+      const worktreeRename = code[1] === 'R' || code[1] === 'C';
+
       if (file.includes(' -> ')) {
         const parts = file.split(' -> ').map((p) => p.replace(/^"(.*)"$/, '$1').trim());
-        if (code[0] !== ' ' && code[0] !== '?') staged.push(...parts);
-        if (code[1] !== ' ' && code[1] !== '?') modified.push(...parts);
+        if (stagedRename) staged.push(...parts);
+        if (worktreeRename) modified.push(...parts);
       } else {
         file = file.replace(/^"(.*)"$/, '$1');
         if (code.startsWith('?') || code.startsWith('U')) {

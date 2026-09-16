@@ -851,9 +851,14 @@ export async function verifyUnknownReceiptOrThrow(cdp, submitReceipt, beforeTurn
     throw new Error(`提交基准获取失败 (UNKNOWN/${submitReceipt.reason})：无法确立确定性状态基准，立即中止以防重复提交`);
   }
 
+  // 严格基准有效性校验：beforeUserTurns 必须为非负整数，缺少或非法时立即 fail-closed 抛错
+  if (!submitReceipt || !Number.isInteger(submitReceipt.beforeUserTurns) || submitReceipt.beforeUserTurns < 0) {
+    throw new Error(`提交消息状态未知 (UNKNOWN): submitReceipt 缺少合法的 user-turn 基准计数，立即中止以防重复提交`);
+  }
+
   const p = await evaluate(cdp, PROBE_JS, 3000).catch(() => null);
   const userTurns = p?.userTurn?.count ?? p?.userTurns ?? 0;
-  const beforeUserTurns = typeof submitReceipt.beforeUserTurns === 'number' ? submitReceipt.beforeUserTurns : 0;
+  const beforeUserTurns = submitReceipt.beforeUserTurns;
 
   // 因果性强收据：必须有当前会话的 User Turn 实际增加证据，绝不能单独由 Assistant Turn 替代
   if (!p || userTurns <= beforeUserTurns) {
