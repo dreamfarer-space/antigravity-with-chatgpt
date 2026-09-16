@@ -267,6 +267,7 @@ export async function runBrainTask(options = {}) {
           `- Branch: \`${evidence.branch || 'unknown'}\``,
           `- Staged Files (${evidence.staged?.length ?? 0}): ${evidence.staged?.slice(0, 10).join(', ') || 'none'}`,
           `- Modified Files (${evidence.modified?.length ?? 0}): ${evidence.modified?.slice(0, 10).join(', ') || 'none'}`,
+          ...(evidence.unmerged && evidence.unmerged.length > 0 ? [`- Unmerged Conflicts (${evidence.unmerged.length}): ${evidence.unmerged.slice(0, 10).join(', ')}`] : []),
           `- Untracked Files (${evidence.untracked?.length ?? 0}): ${evidence.untracked?.slice(0, 10).join(', ') || 'none'}`,
           `- Diff Total Bytes: ${evidence.totalDiffBytes ?? 0}`,
           `- Diff Returned Bytes: ${evidence.returnedDiffBytes ?? 0}`,
@@ -338,11 +339,12 @@ export async function runBrainTask(options = {}) {
     let aggregateBytes = 0;
     const MAX_AGGREGATE_BYTES = 128 * 1024; // 最多追加 128KB 证据，防止无限膨胀
 
-    // Confused-deputy 防护：严格仅允许读取当前变更清单 (staged, modified, untracked) 或显式附带的文件
+    // Confused-deputy 防护：严格仅允许读取当前变更清单 (staged, modified, unmerged, untracked) 或显式附带的文件
     const reviewManifestFiles = new Set(
       [
         ...(reviewEvidence?.staged || []),
         ...(reviewEvidence?.modified || []),
+        ...(reviewEvidence?.unmerged || []),
         ...(reviewEvidence?.untracked || []),
         ...(Array.isArray(options.files) ? options.files : []),
       ].map((p) => path.normalize(String(p).trim()).replace(/\\/g, '/').replace(/^\.\//, ''))

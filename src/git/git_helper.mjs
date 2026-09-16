@@ -26,10 +26,11 @@ const DEFAULT_UNTRACKED_MAX_BYTES = 32 * 1024; // 32 KB
 export function parseGitStatusOutput(stdout) {
   const staged = [];
   const modified = [];
+  const unmerged = [];
   const untracked = [];
 
   if (typeof stdout !== 'string' || !stdout) {
-    return { staged, modified, untracked };
+    return { staged, modified, unmerged, untracked };
   }
 
   if (stdout.includes('\0')) {
@@ -45,11 +46,19 @@ export function parseGitStatusOutput(stdout) {
       const file = token.slice(3);
       i++;
 
+      if (code.startsWith('!')) {
+        continue;
+      }
+
+      const isUntracked = code.startsWith('?');
+      const isUnmerged = code[0] === 'U' || code[1] === 'U' || code === 'AA' || code === 'DD';
       const hasExtraPath = code[0] === 'R' || code[0] === 'C' || code[1] === 'R' || code[1] === 'C';
       const otherFile = hasExtraPath ? (rawTokens[i++] || '') : '';
 
-      if (code.startsWith('?') || code.startsWith('U')) {
+      if (isUntracked) {
         if (file) untracked.push(file);
+      } else if (isUnmerged) {
+        if (file) unmerged.push(file);
       } else {
         // X 轴 (Index / Staged)
         if (code[0] === 'R' || code[0] === 'C') {
@@ -74,10 +83,21 @@ export function parseGitStatusOutput(stdout) {
       const code = line.slice(0, 2);
       let file = line.slice(3).trim();
 
-      if (code.startsWith('?') || code.startsWith('U')) {
+      if (code.startsWith('!')) {
+        continue;
+      }
+
+      const isUntracked = code.startsWith('?');
+      const isUnmerged = code[0] === 'U' || code[1] === 'U' || code === 'AA' || code === 'DD';
+      const hasRenameOrCopy = code[0] === 'R' || code[0] === 'C' || code[1] === 'R' || code[1] === 'C';
+
+      if (isUntracked) {
         file = file.replace(/^"(.*)"$/, '$1');
         if (file) untracked.push(file);
-      } else if (file.includes(' -> ')) {
+      } else if (isUnmerged) {
+        file = file.replace(/^"(.*)"$/, '$1');
+        if (file) unmerged.push(file);
+      } else if (hasRenameOrCopy && file.includes(' -> ')) {
         const parts = file.split(' -> ').map((p) => p.replace(/^"(.*)"$/, '$1').trim()).filter(Boolean);
         // X 轴 (Index / Staged)
         if (code[0] === 'R' || code[0] === 'C') {
@@ -105,6 +125,7 @@ export function parseGitStatusOutput(stdout) {
   return {
     staged: Array.from(new Set(staged)),
     modified: Array.from(new Set(modified)),
+    unmerged: Array.from(new Set(unmerged)),
     untracked: Array.from(new Set(untracked)),
   };
 }
@@ -112,7 +133,7 @@ export function parseGitStatusOutput(stdout) {
 /**
  * 获取 Git 状态摘要
  * @param {string} workspaceRoot
- * @returns {object} { isGitRepo, branch, staged: [], modified: [], untracked: [], summary }
+ * @returns {object} { isGitRepo, branch, staged: [], modified: [], unmerged: [], untracked: [], summary }
  */
 export function getGitStatus(workspaceRoot) {
   try {
@@ -138,8 +159,9 @@ export function getGitStatus(workspaceRoot) {
       branch,
       staged: parsed.staged,
       modified: parsed.modified,
+      unmerged: parsed.unmerged,
       untracked: parsed.untracked,
-      summary: `Branch: ${branch} | Staged: ${parsed.staged.length}, Modified: ${parsed.modified.length}, Untracked: ${parsed.untracked.length}`,
+      summary: `Branch: ${branch} | Staged: ${parsed.staged.length}, Modified: ${parsed.modified.length}, Unmerged: ${parsed.unmerged.length}, Untracked: ${parsed.untracked.length}`,
     };
   } catch (err) {
     return { isGitRepo: false, error: err.message };
@@ -481,6 +503,7 @@ export function getReviewEvidence(workspaceRoot, options = {}) {
       hasMoreDiff: false,
       nextDiffOffset: null,
       untracked: [],
+      unmerged: [],
       untrackedContent: '',
       staged: [],
       modified: [],
@@ -514,6 +537,7 @@ export function getReviewEvidence(workspaceRoot, options = {}) {
     summary: status.summary,
     staged: status.staged,
     modified: status.modified,
+    unmerged: status.unmerged,
     untracked: status.untracked,
     untrackedContent: untrackedEvidence.content,
     hasDiff: Boolean(diffRes.hasDiff) || Boolean(untrackedEvidence.content),

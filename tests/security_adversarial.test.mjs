@@ -1124,6 +1124,27 @@ Also need to check another file:
     assert.ok(parsed.untracked.includes('untracked.txt'));
   });
 
+  test('parseGitStatusOutput: 换行回退模式下包含合法 " -> " 字符的文件名不误判为重命名', () => {
+    // 真实 Git 输入：修改名为 "foo -> bar.txt" 的已跟踪文件，状态为 " M"
+    const literalArrowPayload = ' M "foo -> bar.txt"\n';
+    const parsed = parseGitStatusOutput(literalArrowPayload);
+
+    assert.deepEqual(parsed.modified, ['foo -> bar.txt'], '文件名中的 " -> " 绝不能被拆分为虚假重命名');
+    assert.deepEqual(parsed.staged, []);
+    assert.deepEqual(parsed.unmerged, []);
+    assert.deepEqual(parsed.untracked, []);
+  });
+
+  test('parseGitStatusOutput: 正确解析合并冲突 (Unmerged Conflicts) 并与未跟踪文件隔离', () => {
+    // Git porcelain: UU (both modified), AA (both added), DD (both deleted)
+    const unmergedPayload = 'UU conflict.txt\0AA both_added.txt\0?? untracked.txt\0';
+    const parsed = parseGitStatusOutput(unmergedPayload);
+
+    assert.deepEqual(parsed.unmerged.sort(), ['both_added.txt', 'conflict.txt'].sort(), '冲突文件必须归入 unmerged');
+    assert.deepEqual(parsed.untracked, ['untracked.txt'], '未跟踪文件与冲突文件严格隔离');
+    assert.equal(parsed.untracked.includes('conflict.txt'), false);
+  });
+
   console.log(`\n========================================`);
   console.log(`对抗性与可靠性测试全部完成: ${passed}/${total} 通过 (100%)`);
   console.log(`========================================\n`);
