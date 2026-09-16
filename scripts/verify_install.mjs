@@ -53,6 +53,7 @@ head('1. 四层架构模块完整性');
 
 const REQUIRED_MODULES = [
   'scripts/ask_chatgpt.mjs',
+  'scripts/setup.mjs',
   'scripts/mcp_server.mjs',
   'scripts/make_shortcut.mjs',
   'src/transport/cdp_transport.mjs',

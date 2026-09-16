@@ -9,6 +9,7 @@
     "antigravity-chatgpt-mcp": "scripts/mcp_server.mjs"
   },
   "scripts": {
+    "setup": "node scripts/setup.mjs",
     "test": "node tests/security_adversarial.test.mjs",
     "verify": "node scripts/verify_install.mjs",
     "doctor": "node scripts/ask_chatgpt.mjs --doctor",

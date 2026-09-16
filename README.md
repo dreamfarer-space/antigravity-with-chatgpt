@@ -21,6 +21,24 @@
 
 ---
 
+## ⚡ Quick Install (一段话极速安装)
+
+Ensure you have **Node.js (>= 22.0.0)** and **Google Chrome** installed (zero npm packages required). Run this single command in your terminal to clone and configure everything automatically:
+
+```bash
+git clone https://github.com/dreamfarer-space/antigravity-with-chatgpt.git && cd antigravity-with-chatgpt && node scripts/setup.mjs
+```
+
+> **What `setup.mjs` configures in seconds:**
+> 1. Registers the native MCP server into Antigravity's global config (`~/.gemini/config/mcp_config.json`);
+> 2. Mounts the Antigravity 2.0 Skill junction (`~/.gemini/config/skills/antigravity-with-chatgpt`);
+> 3. Creates the desktop shortcut for an isolated Chrome debugging session (`127.0.0.1:9222`);
+> 4. Runs full self-tests (36/36 checks passing).
+>
+> **To start pairing**: Double-click the newly created **"ChatGPT (Antigravity智脑)"** desktop shortcut (or launch Chrome with port 9222), log in once to your ChatGPT Web account, and start pairing directly inside Antigravity 2.0!
+
+---
+
 ## 📖 Background & Design Philosophy
 
 When developing with modern agentic coding assistants, local agents like **Google Antigravity 2.0 IDE**, Gemini CLI, and Claude Code have deep local authority (file I/O, terminal execution, running tests, Git version control). However, when tackling complex architectural refactoring, algorithmic derivation, subtle root-cause debugging, or rigorous code reviews, a single model within a shared context often suffers from confirmation bias and self-rationalizing hallucinations.

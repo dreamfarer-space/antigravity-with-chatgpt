@@ -21,6 +21,24 @@
 
 ---
 
+## ⚡ 一句话极速安装 (Quick Install)
+
+环境要求仅需 **Node.js (>= 22.0.0)** 与 **Google Chrome**（无需 `npm install`，零第三方依赖）。在终端直接执行一行命令完成克隆与全自动配置：
+
+```bash
+git clone https://github.com/dreamfarer-space/antigravity-with-chatgpt.git && cd antigravity-with-chatgpt && node scripts/setup.mjs
+```
+
+> **自动化配置过程：**
+> 1. 自动写入 Antigravity 2.0 全局 MCP 配置 (`~/.gemini/config/mcp_config.json`)；
+> 2. 自动挂载 Antigravity 全局 Skill 软链接 (`~/.gemini/config/skills/antigravity-with-chatgpt`)；
+> 3. 自动生成独立 Profile 的 Chrome 桌面快捷方式（绑定 `127.0.0.1:9222` 调试端口与专用数据目录）；
+> 4. 自动运行 36 项架构自检，确认 100% 就绪。
+>
+> **极速上手**：双击桌面的 **「ChatGPT (Antigravity智脑)」** 快捷方式，在弹出的窗口中登录一次您的个人 ChatGPT 账号，即可在 Antigravity 2.0 中直接输入例如 *“请让 ChatGPT 帮我 review 当前代码”* 开启双脑协同！
+
+---
+
 ## 📖 项目背景与设计哲学
 
 在现代 AI Agent 辅助编程中，本地 Agent（如 **Google Antigravity 2.0 IDE**、Gemini CLI、Claude Code）具备极强的本地操作权限（文件读写、构建编译、测试运行、Git 提交）。然而在面对极端复杂的系统重构规划、深奥的数学算法推导、Bug 根因排查以及客观的代码审查时，单模型的上下文容易产生幻觉或自圆其说。
