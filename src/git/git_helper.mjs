@@ -11,9 +11,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { sanitizeContent, isSensitivePath } from '../security/sensitive.mjs';
-import { loadBrainIgnore } from '../security/ignore.mjs';
-import { authorizeCanonicalFile } from '../security/file_authorizer.mjs';
+import { sanitizeContent } from '../security/sensitive.mjs';
+import { authorizeCanonicalFile, createPolicyChecker } from '../security/file_authorizer.mjs';
 import { assertAuthorizedWorkspace } from '../security/authorized_workspace.mjs';
 
 const DEFAULT_DIFF_MAX_BYTES = 64 * 1024; // 64 KB
@@ -51,26 +50,31 @@ export function parseNameStatusZ(stdout) {
 }
 
 /**
- * 逐文件应用安全策略：敏感文件（sensitive 黑名单）与 .brainignore 一律不进 diff
- * rename/copy 需要同时校验 old 与 new 两端（任一端命中即整体排除）
+ * 逐文件应用安全策略：敏感文件（sensitive 黑名单）与 .brainignore 一律不进 diff。
+ *
+ * 策略边界锚定在**宿主授权根（policy root）**而不是调用方选择的子 workspace，
+ * 规则从 policyRoot 逐层累加（父子取并集，只增不减）——
+ * 否则 Agent 只要把 workspace 指向 `project/secrets`，父级 `secrets/**` 就会失效。
+ *
+ * rename/copy 需要同时校验 old 与 new 两端（任一端命中即整体排除）。
  * @param {string} workspaceRoot
  * @param {Array<{ paths: string[] }>} entries
  * @returns {{ allowed: string[], excluded: string[] }}
  */
 export function filterDiffEntriesByPolicy(workspaceRoot, entries) {
-  const ignore = loadBrainIgnore(workspaceRoot);
+  const checker = createPolicyChecker(workspaceRoot);
   const allowed = [];
   const excluded = [];
 
   for (const entry of entries || []) {
-    const offending = (entry.paths || []).some((p) => {
-      const rel = String(p).replace(/\\/g, '/');
-      if (!rel) return true;
-      return isSensitivePath(rel) || ignore.ignores(rel, false);
+    const paths = entry.paths || [];
+    const offending = paths.length === 0 || paths.some((p) => {
+      const abs = path.resolve(checker.workspace, String(p));
+      return !checker.check(abs).ok;
     });
 
-    if (offending) excluded.push(...(entry.paths || []));
-    else allowed.push(...(entry.paths || []));
+    if (offending) excluded.push(...paths);
+    else allowed.push(...paths);
   }
 
   return { allowed, excluded };

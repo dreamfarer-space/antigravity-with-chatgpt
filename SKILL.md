@@ -556,7 +556,7 @@ Desktop 快捷方式 **`ChatGPT (AI智脑)`** 打开的专用 Chrome 如果尚�
 
 ## 安全红线（最高优先级）
 
-### 0. 单一授权工作区根（v2.4.0 起）
+### 0. 单一授权工作区根 + 策略根分离（v2.4.0 起，v2.4.1 加固）
 
 **本地 Agent 不得自行定义"安全沙箱"。**
 
@@ -566,6 +566,14 @@ Desktop 快捷方式 **`ChatGPT (AI智脑)`** 打开的专用 Chrome 如果尚�
   （MCP 返回 `工作区未获授权`，CLI 以 `exit 2` 退出）；
 - 文件系统根（`/`、`D:\`）、用户主目录、系统目录、临时目录根**一律禁止**作为工作区根，
   即使宿主未固化授权根（库/嵌入模式）也会被拒绝。
+
+**策略根（policy root）≠ 操作根（workspace root）** —— v2.4.1 的关键加固：
+
+- `workspace` 允许是授权根的子目录（支持 monorepo / subproject），
+  但 **`.brainignore` 与敏感文件规则的最终边界永远是授权根**；
+- 规则从授权根**逐层累加**（父规则 + 各层子规则取并集，**只允许增加限制、不能削弱父规则**）；
+- 因此把 workspace 指向 `project/secrets` 这类子目录**不会**让父级 `secrets/**` 规则失效；
+  `getGitDiff` / `searchWorkspace` / `getWorkspaceInfo` 也一律以策略根为准。
 
 > 为什么：`resolveSafePath(workspaceRoot, p)` 只能保证"不逃出调用者指定的根"。
 > 若允许调用者把 workspace 指成 `C:\` 或 Home，路径沙箱保护的就成了"攻击者指定的沙箱"。

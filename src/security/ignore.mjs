@@ -129,3 +129,46 @@ export function loadBrainIgnore(workspaceRoot) {
   }
   return new BrainIgnore(userPatterns);
 }
+
+/**
+ * 从安全策略根（policyRoot）一路向下累加收集 .brainignore 规则。
+ *
+ * 背景（P1）：如果只从"调用方选择的子 workspace"加载 .brainignore，那么
+ * Agent 只要把 workspace 指向 `project/secrets` 这种子目录，父级的
+ * `secrets/**` 规则就会整体失效 —— 固定了 filesystem trust root，
+ * 却没固定 policy root。
+ *
+ * 因此策略必须从宿主授权的根开始累加，且**只允许增加限制**（父子规则取并集）。
+ *
+ * @param {string} policyRoot 安全策略根（通常为宿主授权根）
+ * @param {string} targetDir 目标目录（含 targetDir 自身的 .brainignore）
+ * @returns {BrainIgnore} 合并后的规则集
+ */
+export function loadBrainIgnoreChain(policyRoot, targetDir) {
+  const root = path.resolve(policyRoot);
+  const target = path.resolve(targetDir);
+
+  const dirs = [root];
+  const rel = path.relative(root, target);
+  if (rel && rel !== '.' && !rel.startsWith('..')) {
+    let current = root;
+    for (const seg of rel.split(/[\\/]+/).filter((s) => s && s !== '.')) {
+      current = path.join(current, seg);
+      dirs.push(current);
+    }
+  }
+
+  const patterns = [];
+  for (const dir of dirs) {
+    const ignoreFile = path.join(dir, '.brainignore');
+    if (!fs.existsSync(ignoreFile)) continue;
+    try {
+      for (const line of fs.readFileSync(ignoreFile, 'utf8').split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed && !trimmed.startsWith('#')) patterns.push(trimmed);
+      }
+    } catch {}
+  }
+
+  return new BrainIgnore(patterns);
+}

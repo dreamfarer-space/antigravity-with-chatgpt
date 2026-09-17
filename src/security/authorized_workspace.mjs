@@ -121,6 +121,23 @@ export function getAuthorizedWorkspace() {
   return authorizedRoot;
 }
 
+/**
+ * 安全策略根（policy root）—— 与"当前操作根 workspace root"是两个概念：
+ *   - authorizedRoot：宿主授权根，**安全策略边界**（.brainignore / 敏感文件规则的最终上限）
+ *   - workspaceRoot ：调用方请求的操作根，可以是授权根的子目录（monorepo / subproject）
+ *
+ * 若只从 workspace root 加载策略，Agent 把 workspace 指向 `project/secrets`
+ * 就能让父级 `secrets/**` 规则整体失效。所以策略必须锚定在 policyRoot 上，
+ * 子目录只允许**追加**限制。
+ *
+ * @param {string|null} workspaceRoot 未固化授权根时（库/嵌入模式）退化为 workspace 自身
+ * @returns {string|null}
+ */
+export function getPolicyRoot(workspaceRoot = null) {
+  if (authorizedRoot) return authorizedRoot;
+  return workspaceRoot ? realpathOrSelf(workspaceRoot) : null;
+}
+
 /** 仅供测试使用：清除已固化的授权根 */
 export function resetAuthorizedWorkspace() {
   authorizedRoot = null;

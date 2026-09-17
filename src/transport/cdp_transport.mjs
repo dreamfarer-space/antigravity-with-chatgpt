@@ -538,7 +538,7 @@ async function ensureCdpReady(chromeExe, deadlineMs = null) {
 
   const deadline = Date.now() + waitCap;
   while (Date.now() < deadline) {
-    await sleep(600);
+    if ((await sleepWithin(600, deadline)) === 0) break;
     const s = await checkCdpStatus();
     if (s.running) {
       log('专用 Chrome 已成功启动并就绪');
@@ -930,7 +930,19 @@ export async function submitMessageReliable(cdp, options = {}) {
     try {
       const base = { windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, code: 'Enter', key: 'Enter' };
       await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base, text: '\r', unmodifiedText: '\r' }, keyBudget);
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base }, remainingBudgetMs(deadlineMs, 10000) || keyBudget);
+
+      // 重申预算：rawKeyDown 可能刚好把剩余时间用完，此时绝不能再发 keyUp
+      // （历史 bug：`remainingBudgetMs(...) || keyBudget` 会在剩余为 0 时复活旧预算）
+      const keyUpBudget = remainingBudgetMs(deadlineMs, 10000);
+      if (keyUpBudget <= 0) {
+        return {
+          status: SUBMIT_STATUS.UNKNOWN,
+          reason: 'budget_exhausted_after_keydown',
+          beforeUserTurns: baseline.userTurns,
+          enterDispatched: true,
+        };
+      }
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base }, keyUpBudget);
       enterDispatched = true;
     } catch (err) {
       return {
@@ -1142,7 +1154,7 @@ export async function waitForStreamingCompletion(cdp, options = {}) {
 
     const p = await evaluate(cdp, PROBE_JS, probeTimeout).catch(() => null);
     if (!p) {
-      await sleep(400);
+      if ((await sleepWithin(400, deadlineMs)) === 0) break;
       continue;
     }
 
@@ -1202,7 +1214,7 @@ export async function waitForStreamingCompletion(cdp, options = {}) {
       stableHits = 0;
     }
 
-    await sleep(400);
+    if ((await sleepWithin(400, deadlineMs)) === 0) break;
   }
 
   // -------------------------------------------------------------------------
@@ -1270,7 +1282,10 @@ async function _fetchLatestResponseInternal({ timeoutS = 150, deadlineMs: extern
     const enableBudget = remainingBudgetMs(deadlineMs, 10000);
     if (enableBudget > 0) {
       await cdp.send('Runtime.enable', {}, enableBudget).catch(() => {});
-      await cdp.send('Page.enable', {}, remainingBudgetMs(deadlineMs, 10000)).catch(() => {});
+    }
+    const pageEnableBudget = remainingBudgetMs(deadlineMs, 10000);
+    if (pageEnableBudget > 0) {
+      await cdp.send('Page.enable', {}, pageEnableBudget).catch(() => {});
     }
 
     // 连接后实时校验 live location.href (彻底消除 TOCTOU 竞态)
@@ -1370,10 +1385,13 @@ async function _sendPromptInternal({ prompt, mode = 'reuse', timeoutS = 150, dea
   await cdp.connect(connectBudget);
 
   try {
-    const enableBudget = stepBudget(10000);
+    const enableBudget = remainingBudgetMs(deadlineMs, 10000);
     if (enableBudget > 0) {
       await cdp.send('Runtime.enable', {}, enableBudget).catch(() => {});
-      await cdp.send('Page.enable', {}, stepBudget(10000)).catch(() => {});
+    }
+    const pageEnableBudget = remainingBudgetMs(deadlineMs, 10000);
+    if (pageEnableBudget > 0) {
+      await cdp.send('Page.enable', {}, pageEnableBudget).catch(() => {});
     }
 
     const composerWaitDeadline = Math.min(Date.now() + 25000, deadlineMs - SAFETY_MARGIN_MS);
@@ -1399,9 +1417,10 @@ async function _sendPromptInternal({ prompt, mode = 'reuse', timeoutS = 150, dea
           : false;
 
         if (!clickedNew) {
-          await cdp.send('Page.navigate', { url: DEFAULT_TARGET_URL }, stepBudget(20000)).catch(() => {});
+          const navBudget = requireBudgetMs(deadlineMs, 20000, '在导航到全新会话页面之前');
+          await cdp.send('Page.navigate', { url: DEFAULT_TARGET_URL }, navBudget).catch(() => {});
         }
-        await sleep(1200);
+        await sleepWithin(1200, deadlineMs);
 
         // 若 WebSocket 在页面跳转中重置，自动重连新页面 WebSocket
         if (cdp.closed || !cdp.ws || cdp.ws.readyState !== WebSocket.OPEN) {
@@ -1413,10 +1432,13 @@ async function _sendPromptInternal({ prompt, mode = 'reuse', timeoutS = 150, dea
             throw new Error('总截止时间预算已耗尽（在重连 CDP 之前），已中止以防突破宿主超时');
           }
           await cdp.connect(reconnectBudget);
-          const reEnableBudget = stepBudget(10000);
+          const reEnableBudget = remainingBudgetMs(deadlineMs, 10000);
           if (reEnableBudget > 0) {
             await cdp.send('Runtime.enable', {}, reEnableBudget).catch(() => {});
-            await cdp.send('Page.enable', {}, stepBudget(10000)).catch(() => {});
+          }
+          const rePageEnableBudget = remainingBudgetMs(deadlineMs, 10000);
+          if (rePageEnableBudget > 0) {
+            await cdp.send('Page.enable', {}, rePageEnableBudget).catch(() => {});
           }
         }
 

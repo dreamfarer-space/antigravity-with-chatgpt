@@ -13,9 +13,9 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { resolveSafePath, SecurityError } from '../security/path_guard.mjs';
 import { isSensitivePath, sanitizeContent } from '../security/sensitive.mjs';
-import { loadBrainIgnore } from '../security/ignore.mjs';
-import { authorizeCanonicalFile } from '../security/file_authorizer.mjs';
-import { assertAuthorizedWorkspace } from '../security/authorized_workspace.mjs';
+import { loadBrainIgnoreChain } from '../security/ignore.mjs';
+import { authorizeCanonicalFile, createPolicyChecker } from '../security/file_authorizer.mjs';
+import { assertAuthorizedWorkspace, getPolicyRoot } from '../security/authorized_workspace.mjs';
 import { getGitStatus, truncateUtf8ByBytes } from '../git/git_helper.mjs';
 
 const DEFAULT_FILE_MAX_BYTES = 128 * 1024; // 128 KB per file
@@ -47,7 +47,9 @@ function isBinary(buffer) {
  */
 export function getWorkspaceInfo(workspaceRoot) {
   const absRoot = assertAuthorizedWorkspace(workspaceRoot);
-  const ignore = loadBrainIgnore(absRoot);
+  // 规则链从策略根累加：子项目自己的 .brainignore 只能追加限制，不能削弱父级
+  const policyRoot = getPolicyRoot(absRoot) || absRoot;
+  const ignore = loadBrainIgnoreChain(policyRoot, absRoot);
   const gitInfo = getGitStatus(absRoot);
 
   const topLevel = [];
@@ -189,13 +191,12 @@ export function searchWorkspace(workspaceRoot, query, options = {}) {
   if (!query || typeof query !== 'string') return [];
 
   const absRoot = assertAuthorizedWorkspace(workspaceRoot);
-  const ignore = loadBrainIgnore(absRoot);
+  // 策略边界锚定在宿主授权根（policy root），而不是调用方选择的子 workspace
+  const policyChecker = createPolicyChecker(absRoot);
 
   const isSearchableRel = (rel) => {
     if (!rel) return false;
-    if (isSensitivePath(rel)) return false;
-    if (ignore.ignores(rel, false)) return false;
-    return true;
+    return policyChecker.check(path.resolve(absRoot, rel)).ok;
   };
 
   // 优先尝试 ripgrep（--json 结构化输出，彻底规避 Windows 路径盘符与 ':' 分隔歧义）
@@ -220,7 +221,7 @@ export function searchWorkspace(workspaceRoot, query, options = {}) {
       const abs = payload.data.path?.text;
       if (!abs) continue;
       const rel = path.relative(absRoot, abs).replace(/\\/g, '/');
-      if (!isSearchableRel(rel)) continue;
+      if (!policyChecker.check(abs).ok) continue;
       const content = String(payload.data.lines?.text || '').replace(/\r?\n$/, '').trim();
       matches.push({ file: rel, line: payload.data.line_number || 0, text: sanitizeContent(content) });
       if (matches.length >= maxMatches) break;

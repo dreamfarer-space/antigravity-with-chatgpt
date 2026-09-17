@@ -32,7 +32,7 @@ AI 助手收到后，会自动为你全流程完成：
 2. 🔌 **自动注册全局 MCP 服务**：自动写入 `~/.gemini/config/mcp_config.json`；
 3. 🔗 **自动挂载 Antigravity 全局 Skill**：软链接至 `~/.gemini/config/skills/antigravity-with-chatgpt`；
 4. 🖥️ **自动创建专用 Chrome 快捷方式**：在桌面生成独立 Profile 调试会话图标（端口 `9222`）；
-5. ✅ **自动执行 104 项对抗性测试 + 37 项环境自检**：确认通信与安全边界 100% 准备就绪。
+5. ✅ **自动执行 110 项对抗性测试 + 37 项环境自检**：确认通信与安全边界 100% 准备就绪。
 
 配置完成后，双击桌面的 **「ChatGPT (Antigravity智脑)」** 登录一次你的 ChatGPT 个人账号，即可在 Antigravity 2.0 中随时通过例如 *“请让 ChatGPT 帮我 review 当前代码”* 开启双脑协同！
 
@@ -77,7 +77,8 @@ AI 助手收到后，会自动为你全流程完成：
   - **同一条绝对截止时间贯穿全链路**：deadline 在 MCP 边界锚定，一路透传经 orchestrator 进入传输层的每一个等待点（Chrome 就绪、CDP 连接、DOM 探测、静默窗口、文本读取）。下游各层**不得**重新锚定相对超时、**不得**用 `Math.max()` 制造额外时间 —— 预算耗尽后一个 CDP 调用都不会再发出。
 - 🔐 **单一授权工作区根（Single Authorized Workspace Root）**：
   - MCP Server / CLI 在**启动时固化授权工作区根**（`CHATGPT_BRAIN_WORKSPACE` 或进程 cwd，realpath 归一化）；
-  - 任何工具调用的 `workspace` 必须等于该根或严格位于其下，否则一律 **fail-closed**，且**不会触达编排层**。文件系统根（`/`、`D://`）、用户主目录、系统目录与临时目录根即使未固化授权根也会被直接拒绝；
+  - 任何工具调用的 `workspace` 必须等于该根或严格位于其下，否则一律 **fail-closed**，且**不会触达编排层**；
+  - **策略根 ≠ 操作根**：`workspace` 允许指向子目录（monorepo/subproject），但 `.brainignore` 与敏感文件规则的最终边界永远是授权根，并按"父 → 子"逐层累加（只增不减），因此把 `workspace` 指向 `project/secrets` 不会再让父级 `secrets/**` 规则失效。文件系统根（`/`、`D://`）、用户主目录、系统目录与临时目录根即使未固化授权根也会被直接拒绝；
   - 原因：路径沙箱只保护"调用者自己传进来的根"。若允许（可能已被 prompt injection 影响的）Agent 把 workspace 指成 `C://` 或 Home，所有包含性校验都会形同虚设。
 - 🧱 **单一文件授权入口（One File-Authorization Choke Point）**：
   - 所有可能跨越浏览器边界的内容都必须经过 `authorizeCanonicalFile()`：工作区授权 + 词法包含校验 + symlink 逃逸校验 + **词法与 realpath 双重**敏感名与 `.brainignore` 策略；
@@ -305,7 +306,7 @@ ask_chatgpt(prompt, timeout: 150)
 本项目针对持续集成与本地安装分别提供自动化验证方案：
 
 ### 1. 自动化 CI 测试套件 (`npm test`)
-在 GitHub Actions 持续集成流水线中自动执行，覆盖 Ubuntu、Windows 与 macOS 三大主流平台（Node 22 与 Node 24 矩阵）。**104 项对抗性用例**覆盖路径逃逸与符号链接穿越、密钥脱敏、出口统一脱敏、Git porcelain 解析、证据预算天花板、绝对 deadline 耗尽后零借用（连接/注入/提交/收据复核全路径）、授权工作区强制校验、未跟踪软链接别名、Git diff 文件级策略、会话身份锁定（`/ → /c/A → /c/B`）、durable 恢复凭证、多标签精确选择，以及真实 handler 链路上的 MCP 参数穿透：
+在 GitHub Actions 持续集成流水线中自动执行，覆盖 Ubuntu、Windows 与 macOS 三大主流平台（Node 22 与 Node 24 矩阵）。**110 项对抗性用例**覆盖路径逃逸与符号链接穿越、密钥脱敏、出口统一脱敏、Git porcelain 解析、证据预算天花板、绝对 deadline 耗尽后零借用（连接/注入/提交/收据复核全路径）、授权工作区强制校验、未跟踪软链接别名、Git diff 文件级策略、会话身份锁定（`/ → /c/A → /c/B`）、durable 恢复凭证、多标签精确选择，以及真实 handler 链路上的 MCP 参数穿透：
 
 ```powershell
 npm test

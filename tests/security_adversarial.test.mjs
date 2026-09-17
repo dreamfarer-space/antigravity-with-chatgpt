@@ -2446,6 +2446,199 @@ Also need to check another file:
     }
   });
 
+
+  // ---------------------------------------------------------------------------
+  // 38. policy root 与 workspace root 分离测试 (P1: 子工作区不得绕过父级 .brainignore)
+  // ---------------------------------------------------------------------------
+  console.log('\n38. policy root / workspace root 分离测试:');
+
+  test('policy root: 子工作区不得使父级 .brainignore 失效（readFileSafe）', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'policyroot-read-'));
+    try {
+      fs.writeFileSync(path.join(root, '.brainignore'), 'private/**\n');
+      fs.mkdirSync(path.join(root, 'private'));
+      fs.writeFileSync(path.join(root, 'private', 'secret.txt'), 'TOP_SECRET_VIA_SUBWORKSPACE', 'utf8');
+      fs.writeFileSync(path.join(root, 'public.txt'), 'ok', 'utf8');
+
+      pinAuthorizedWorkspace(root);
+
+      // 攻击者思路：把 workspace 指向 private 子目录，让父级规则"看不见"
+      assert.throws(
+        () => readFileSafe(path.join(root, 'private'), 'secret.txt'),
+        (err) => err instanceof SecurityError && err.code === 'E_IGNORED_FILE',
+        '父级 .brainignore 必须仍然是最终策略边界'
+      );
+      assert.throws(
+        () => readFileSafe(path.join(root, 'private'), 'secret.txt'),
+        /匹配 \.brainignore 规则链/
+      );
+
+      // 子工作区自身的普通文件不受影响
+      const okFile = readFileSafe(root, 'public.txt');
+      assert.equal(okFile.content, 'ok');
+    } finally {
+      resetAuthorizedWorkspace();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('policy root: 子工作区 diff 也必须服从父级 .brainignore（getGitDiff）', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'policyroot-diff-'));
+    try {
+      const git = (...args) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+      git('init', '-q', '-b', 'main');
+      git('config', 'user.name', 'T');
+      git('config', 'user.email', 't@e.com');
+
+      fs.writeFileSync(path.join(root, '.brainignore'), 'private/**\n');
+      fs.mkdirSync(path.join(root, 'private'));
+      fs.writeFileSync(path.join(root, 'private', 'secret.txt'), 'initial\n');
+      fs.writeFileSync(path.join(root, 'private', 'ok.txt'), 'initial\n');
+      git('add', '.');
+      git('commit', '-qm', 'init');
+
+      fs.writeFileSync(path.join(root, 'private', 'secret.txt'), 'PARENT_IGNORED_CHANGED\n');
+      fs.writeFileSync(path.join(root, 'private', 'ok.txt'), 'visible-changed\n');
+
+      pinAuthorizedWorkspace(root);
+      const diff = getGitDiff(path.join(root, 'private'), { head: true });
+
+      assert.ok(!diff.diff.includes('PARENT_IGNORED_CHANGED'), '父级 .brainignore 命中的子工作区变更绝不能进入 diff');
+      assert.ok(diff.excludedPaths.some((p) => p.includes('secret.txt')));
+    } finally {
+      resetAuthorizedWorkspace();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('policy root: 子工作区搜索同样服从父级 .brainignore（searchWorkspace）', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'policyroot-search-'));
+    try {
+      const git = (...args) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+      git('init', '-q', '-b', 'main');
+      git('config', 'user.name', 'T');
+      git('config', 'user.email', 't@e.com');
+
+      fs.writeFileSync(path.join(root, '.brainignore'), 'private/**\n');
+      fs.mkdirSync(path.join(root, 'private'));
+      fs.writeFileSync(path.join(root, 'private', 'secret.txt'), 'NEEDLE_PARENT_IGNORED\n');
+      fs.writeFileSync(path.join(root, 'private', 'ok.txt'), 'NEEDLE_VISIBLE\n');
+      git('add', '.');
+      git('commit', '-qm', 'init');
+
+      pinAuthorizedWorkspace(root);
+      const matches = searchWorkspace(path.join(root, 'private'), 'NEEDLE');
+      const joined = JSON.stringify(matches);
+
+      assert.ok(!joined.includes('NEEDLE_PARENT_IGNORED'), '父级 .brainignore 命中的内容绝不能出现在搜索结果中');
+    } finally {
+      resetAuthorizedWorkspace();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('policy root: 父子规则累加（只增不减），子项目自有规则同样生效', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'policyroot-chain-'));
+    try {
+      fs.writeFileSync(path.join(root, '.brainignore'), 'parent_only/**\n');
+      const sub = path.join(root, 'sub');
+      fs.mkdirSync(sub);
+      fs.writeFileSync(path.join(sub, '.brainignore'), 'local_only.txt\n');
+      fs.writeFileSync(path.join(sub, 'local_only.txt'), 'local secret', 'utf8');
+      fs.writeFileSync(path.join(sub, 'fine.txt'), 'fine', 'utf8');
+
+      pinAuthorizedWorkspace(root);
+
+      // 子项目自有规则生效
+      assert.throws(
+        () => readFileSafe(sub, 'local_only.txt'),
+        (err) => err instanceof SecurityError && err.code === 'E_IGNORED_FILE'
+      );
+      // 未被任何规则命中的文件正常可读
+      assert.equal(readFileSafe(sub, 'fine.txt').content, 'fine');
+    } finally {
+      resetAuthorizedWorkspace();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 39. deadline 借时旁路清零测试 (P1: 全文件机械式不变量)
+  // ---------------------------------------------------------------------------
+  console.log('\n39. deadline 借时旁路清零测试:');
+
+  await testAsync('submitMessageReliable: rawKeyDown 耗尽预算后绝不再发 keyUp（防 0 || budget 复活）', async () => {
+    const realNow = Date.now;
+    let timeOffset = 0;
+    let sendCount = 0;
+
+    const cdp = {
+      send: async (method, params) => {
+        if (method !== 'Runtime.evaluate') {
+          sendCount++;
+          // 模拟 rawKeyDown 把剩余 deadline 全部用掉
+          if (params && params.type === 'rawKeyDown') timeOffset = 10 * 60 * 1000;
+          return {};
+        }
+        const expr = params?.expression || '';
+        if (expr.includes('data-message-author-role')) {
+          return { result: { value: { userTurns: 0, isStreaming: false } } };
+        }
+        // 发送按钮不存在 -> 走 Enter 回退路径；同时快速推进"点击重试窗口"（每个 1.2s）以免测试真的等 4 秒
+        timeOffset += 1200;
+        return { result: { value: { action: 'NOT_FOUND' } } };
+      },
+    };
+
+    Date.now = () => realNow() + timeOffset;
+    try {
+      const res = await submitMessageReliable(cdp, { deadlineMs: realNow() + 100000 });
+      // 只允许 rawKeyDown 一次按键发送；修复前 `0 || keyBudget` 会再发出一次 keyUp（=2）
+      assert.equal(sendCount, 1, `预算耗尽后只允许发出 rawKeyDown 单次按键，实际 ${sendCount} 次 CDP send`);
+      assert.equal(res.status, SUBMIT_STATUS.UNKNOWN);
+      assert.equal(res.reason, 'budget_exhausted_after_keydown');
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test('transport 源码不变量: 禁止借时写法（grep 可检测，防未来回潮）', () => {
+    const src = fs.readFileSync(new URL('../src/transport/cdp_transport.mjs', import.meta.url), 'utf8');
+    const lines = src.split('\n');
+
+    const forbidden = [
+      { re: /remainingBudgetMs\([^)]*\)\s*\|\|/, why: '用 `||` 兜底会在剩余为 0 时复活旧预算' },
+      { re: /(?:cdp\.send|evaluate)\([^;]*stepBudget\(/, why: 'CDP 调用不得直接内联 stepBudget（可能为 0 仍被发出）' },
+      { re: /(?:cdp\.send|evaluate)\([^;]*remainingBudgetMs\(/, why: 'CDP 调用不得直接内联 remainingBudgetMs（必须先判定再调用）' },
+    ];
+
+    // 注释行不参与判定（历史说明里会引用旧写法），lint 只针对可执行代码
+    const isCommentLine = (line) => {
+      const t = line.trim();
+      return t.startsWith('//') || t.startsWith('/*') || t.startsWith('*');
+    };
+
+    const violations = [];
+    lines.forEach((line, i) => {
+      if (isCommentLine(line)) return;
+      for (const f of forbidden) {
+        if (f.re.test(line)) violations.push(`L${i + 1}: ${f.why} -> ${line.trim().slice(0, 120)}`);
+      }
+    });
+    assert.deepEqual(violations, [], `检测到 deadline 借时写法:\n${violations.join('\n')}`);
+
+    // 裸 sleep 白名单：sleepWithin 自身实现 + CDP.close 的 20ms 连接拆除等待
+    const sleepViolations = [];
+    lines.forEach((line, i) => {
+      if (isCommentLine(line)) return;
+      if (!/[^h]sleep\(/.test(line)) return;
+      const trimmed = line.trim();
+      if (trimmed === 'await sleep(budget);' || trimmed === 'await sleep(20);') return;
+      sleepViolations.push(`L${i + 1}: ${trimmed.slice(0, 120)}`);
+    });
+    assert.deepEqual(sleepViolations, [], `检测到不受 deadline 约束的 sleep:/n${sleepViolations.join('\n')}`);
+  });
+
   console.log(`\n========================================`);
   console.log(`对抗性与可靠性测试全部完成: ${passed}/${total} 通过 (100%)`);
   console.log(`========================================\n`);

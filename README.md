@@ -32,7 +32,7 @@ Your AI Agent will handle the entire installation automatically:
 2. 🔌 **Register Native MCP Server**: Automatically updates `~/.gemini/config/mcp_config.json`;
 3. 🔗 **Mount Global Antigravity Skill**: Creates the skill junction in `~/.gemini/config/skills/antigravity-with-chatgpt`;
 4. 🖥️ **Generate Dedicated Chrome Shortcut**: Creates a desktop launcher with isolated profile and port `9222`;
-5. ✅ **Run Full Self-Checks**: Runs the 104-case adversarial test suite plus the 37-point environment self-check to ensure 100% readiness.
+5. ✅ **Run Full Self-Checks**: Runs the 110-case adversarial test suite plus the 37-point environment self-check to ensure 100% readiness.
 
 After setup, double-click the **"ChatGPT (Antigravity智脑)"** desktop shortcut to log in to your ChatGPT Web account once, and you can immediately delegate deep reasoning and adversarial code reviews to ChatGPT from within Antigravity 2.0!
 
@@ -77,7 +77,8 @@ Inspired by the notable community project `XiaoDuoYa/codex-with-chatgpt` (**"Cha
   - **One absolute deadline, threaded end-to-end**: the deadline is anchored at the MCP boundary and passed down through the orchestrator into every transport wait (Chrome readiness, CDP connect, probes, quiet window, text reads). Downstream layers never re-anchor a fresh relative timeout and never `Math.max()` extra time—once the budget is exhausted, **zero** further CDP calls are issued.
 - 🔐 **Single Authorized Workspace Root**:
   - The MCP server / CLI **pins the authorized workspace root at startup** (`CHATGPT_BRAIN_WORKSPACE` or the process cwd, realpath-normalized).
-  - Every tool call's `workspace` must equal that root or live strictly inside it; anything else **fails closed** without ever reaching the orchestration layer. Filesystem roots (`/`, `D://`), the user home, system and temp roots are rejected outright—even in library mode.
+  - Every tool call's `workspace` must equal that root or live strictly inside it; anything else **fails closed** without ever reaching the orchestration layer.
+  - **Policy root ≠ workspace root**: a subdirectory workspace (monorepo/subproject) is allowed, but `.brainignore` and sensitive-file rules are always anchored to the authorized root and accumulated parent → child (restrictions can only be added, never weakened)—so pointing `workspace` at `project/secrets` can no longer disable a parent `secrets/**` rule. Filesystem roots (`/`, `D://`), the user home, system and temp roots are rejected outright—even in library mode.
   - Rationale: a path sandbox only protects the root the caller hands in. Letting a (possibly prompt-injected) agent pick `C://` or `HOME` reduces every containment check to theatre.
 - 🧱 **One File-Authorization Choke Point**:
   - All content that may cross the browser boundary goes through `authorizeCanonicalFile()`: workspace authorization + lexical containment + symlink-escape check + **dual** (lexical **and** realpath) sensitive-name and `.brainignore` policy.
@@ -306,7 +307,7 @@ ask_chatgpt(prompt, timeout: 150)
 The project includes both an automated cross-platform test suite for continuous integration and an environment verification suite for local setup:
 
 ### 1. Automated CI Test Suite (`npm test`)
-Executed automatically in GitHub Actions on every push and pull request across Ubuntu, Windows, and macOS (Node 22 & 24). **104 adversarial cases** cover path traversal & symlink breakout, secret redaction, egress sanitization, git porcelain parsing, evidence budget ceilings, absolute-deadline exhaustion (zero-borrow across connect/inject/submit/verify), authorized-workspace enforcement, untracked symlink aliases, per-file Git diff policy, conversation identity pinning (`/ → /c/A → /c/B`), durable resume credentials, multi-tab precise selection, and MCP parameter pass-through on the real handler chain:
+Executed automatically in GitHub Actions on every push and pull request across Ubuntu, Windows, and macOS (Node 22 & 24). **110 adversarial cases** cover path traversal & symlink breakout, secret redaction, egress sanitization, git porcelain parsing, evidence budget ceilings, absolute-deadline exhaustion (zero-borrow across connect/inject/submit/verify), authorized-workspace enforcement, untracked symlink aliases, per-file Git diff policy, conversation identity pinning (`/ → /c/A → /c/B`), durable resume credentials, multi-tab precise selection, and MCP parameter pass-through on the real handler chain:
 
 ```powershell
 npm test
