@@ -37,6 +37,23 @@ function getDeepestExistingAncestor(p) {
 }
 
 /**
+ * 严格包含判定：target 是否等于 base 或位于 base 之下（跨平台原生语义）
+ * 抽为独立导出，供工作区授权（authorized_workspace）与文件授权（file_authorizer）复用，
+ * 避免多处各写一套 containment 逻辑而产生语义漂移。
+ * @param {string} base
+ * @param {string} target
+ * @returns {boolean}
+ */
+export function isContainedPath(base, target) {
+  if (process.platform === 'win32') {
+    const rel = path.win32.relative(base.toLowerCase(), target.toLowerCase());
+    return rel === '' || (rel !== '..' && !rel.startsWith('..\\') && !path.win32.isAbsolute(rel));
+  }
+  const rel = path.posix.relative(base, target);
+  return rel === '' || (rel !== '..' && !rel.startsWith('../') && !path.posix.isAbsolute(rel));
+}
+
+/**
  * 校验并返回安全的规范化路径
  * @param {string} workspaceRoot 工作区根目录
  * @param {string} requestedPath 请求的文件或目录路径
@@ -64,14 +81,7 @@ export function resolveSafePath(workspaceRoot, requestedPath) {
     : path.resolve(absRoot, requestedPath);
 
   // 3. 严格相对路径判定包含关系 (跨平台原生语义，杜绝 Linux/macOS 大小写绕过)
-  const isContained = (base, target) => {
-    if (process.platform === 'win32') {
-      const rel = path.win32.relative(base.toLowerCase(), target.toLowerCase());
-      return rel === '' || (rel !== '..' && !rel.startsWith('..\\') && !path.win32.isAbsolute(rel));
-    }
-    const rel = path.posix.relative(base, target);
-    return rel === '' || (rel !== '..' && !rel.startsWith('../') && !path.posix.isAbsolute(rel));
-  };
+  const isContained = isContainedPath;
 
   // 4. 词法边界校验：目标路径必须收敛在工作区绝对根路径内
   if (!isContained(absRoot, absTarget)) {

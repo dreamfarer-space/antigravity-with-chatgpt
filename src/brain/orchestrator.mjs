@@ -14,6 +14,7 @@ import { getGitDiff, getReviewEvidence } from '../git/git_helper.mjs';
 import { getRecentExecutions, formatExecutionSummary } from '../execution/recorder.mjs';
 import { sanitizeContent } from '../security/sensitive.mjs';
 import { canonicalizeManifestPath } from '../security/path_guard.mjs';
+import { assertAuthorizedWorkspace, getAuthorizedWorkspace } from '../security/authorized_workspace.mjs';
 import { sendPromptViaCdp, fetchLatestResponse } from '../transport/cdp_transport.mjs';
 
 /**
@@ -237,7 +238,11 @@ export async function runBrainTask(options = {}) {
   const mode = (options.mode && Object.values(MODES).includes(String(options.mode).toLowerCase()))
     ? String(options.mode).toLowerCase()
     : MODES.ASK;
-  const workspace = options.workspace ? path.resolve(options.workspace) : process.cwd();
+  const workspace = assertAuthorizedWorkspace(
+    options.workspace
+      ? path.resolve(options.workspace)
+      : (getAuthorizedWorkspace() || process.cwd())
+  );
   const session = options.session === 'new' ? 'new' : 'reuse';
   const timeoutS = (typeof options.timeout === 'number' && options.timeout > 0) ? options.timeout : 600;
   // 端到端唯一绝对截止时间：优先使用调用方（MCP / CLI）锚定的 deadlineMs，
@@ -349,7 +354,8 @@ export async function runBrainTask(options = {}) {
       url: cdpRes.url,
       turns: cdpRes.turns,
       expectedTurn: cdpRes.expectedTurn,
-      conversationUrl: cdpRes.conversationUrl || cdpRes.url,
+      conversationUrl: cdpRes.conversationUrl || null,
+      targetId: cdpRes.targetId || null,
       mode,
       elapsedMs,
       message: cdpRes.message || 'ChatGPT 正在深度推理与生成长回复中。',
@@ -439,7 +445,8 @@ export async function runBrainTask(options = {}) {
           url: cdpRes?.url,
           turns: cdpRes?.turns,
           expectedTurn: cdpRes?.expectedTurn,
-          conversationUrl: cdpRes?.conversationUrl || cdpRes?.url,
+          conversationUrl: cdpRes?.conversationUrl || null,
+          targetId: cdpRes?.targetId || null,
           mode,
           elapsedMs,
           evidenceRounds,
@@ -468,7 +475,8 @@ export async function runBrainTask(options = {}) {
           url: cdpRes.url,
           turns: cdpRes.turns,
           expectedTurn: cdpRes.expectedTurn,
-          conversationUrl: cdpRes.conversationUrl || cdpRes.url,
+          conversationUrl: cdpRes.conversationUrl || null,
+          targetId: cdpRes.targetId || null,
           mode,
           elapsedMs,
           evidenceRounds,
@@ -488,7 +496,8 @@ export async function runBrainTask(options = {}) {
     inProgress: false,
     text: cdpRes.text,
     url: cdpRes.url,
-    conversationUrl: cdpRes.conversationUrl || cdpRes.url,
+    conversationUrl: cdpRes.conversationUrl || null,
+    targetId: cdpRes.targetId || null,
     turns: cdpRes.turns,
     mode,
     elapsedMs,
@@ -519,6 +528,7 @@ export async function fetchLatestBrainResponse(options = {}) {
     deadlineMs,
     expectedTurn: options.expectedTurn,
     conversationUrl: options.conversationUrl,
+    targetId: options.targetId,
     safeTimeout,
   });
 
@@ -529,7 +539,9 @@ export async function fetchLatestBrainResponse(options = {}) {
     isStreaming: Boolean(cdpRes.isStreaming),
     text: cdpRes.text || '',
     url: cdpRes.url,
-    conversationUrl: cdpRes.conversationUrl || cdpRes.url,
+    // 仅在拿到 durable `/c/<id>` 时为字符串；否则为 null（由 targetId 兜底恢复）
+    conversationUrl: cdpRes.conversationUrl || null,
+    targetId: cdpRes.targetId || options.targetId || null,
     turns: cdpRes.turns,
     expectedTurn: cdpRes.expectedTurn,
     elapsedMs,

@@ -17,12 +17,13 @@ import { resolveSafePath, isPathContained, canonicalizeManifestPath, SecurityErr
 import { sanitizeContent, isSensitivePath, redactSensitive } from '../src/security/sensitive.mjs';
 import { runBrainTask, parseEvidenceRequests, buildEvidenceRoundSnippets, MAX_AGGREGATE_EVIDENCE_BYTES, fetchLatestBrainResponse } from '../src/brain/orchestrator.mjs';
 import { recordExecution } from '../src/execution/recorder.mjs';
-import { getUntrackedEvidence, truncateUtf8ByBytes, getGitDiff, getReviewEvidence, parseGitStatusOutput, unquoteGitPath, parseRenamePathPair } from '../src/git/git_helper.mjs';
-import { evaluate, getInjectionTimeout, SUBMIT_STATUS, insertTextReliable, submitMessageReliable, verifyUnknownReceiptOrThrow, waitForStreamingCompletion, canonicalizeConversationUrl, isSameConversation, isSameConversationStrict, isRootConversation, isEphemeralConversation, isPinnableConversation, remainingBudgetMs } from '../src/transport/cdp_transport.mjs';
-import { readFileSafe, buildAttachmentsBlock } from '../src/workspace/context_provider.mjs';
+import { getUntrackedEvidence, truncateUtf8ByBytes, getGitDiff, getReviewEvidence, parseGitStatusOutput, unquoteGitPath, parseRenamePathPair, parseNameStatusZ, filterDiffEntriesByPolicy } from '../src/git/git_helper.mjs';
+import { evaluate, getInjectionTimeout, SUBMIT_STATUS, insertTextReliable, submitMessageReliable, verifyUnknownReceiptOrThrow, clearComposer, waitForStreamingCompletion, canonicalizeConversationUrl, isSameConversation, isSameConversationStrict, isRootConversation, isEphemeralConversation, isPinnableConversation, remainingBudgetMs } from '../src/transport/cdp_transport.mjs';
+import { readFileSafe, buildAttachmentsBlock, searchWorkspace } from '../src/workspace/context_provider.mjs';
 import { computeFingerprint, BROWSER_FINGERPRINT_SNIPPET } from '../src/transport/fingerprint.mjs';
 import { selectTargetPage, filterChatGptPages } from '../src/transport/target_selector.mjs';
 import { handleAskChatGPT, handleFetchChatGPTResponse, __deps as mcpDeps } from '../scripts/mcp_server.mjs';
+import { pinAuthorizedWorkspace, resetAuthorizedWorkspace, assertAuthorizedWorkspace, isAuthorizedWorkspace } from '../src/security/authorized_workspace.mjs';
 
 let passed = 0;
 let total = 0;
@@ -397,7 +398,7 @@ async function runAsyncTests() {
       spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: tempDir, encoding: 'utf8' });
 
       // 2. 创建初始提交
-      const testFile = path.join(tempDir, 'credentials.js');
+      const testFile = path.join(tempDir, 'app.js');
       fs.writeFileSync(testFile, '// Initial empty line\n', 'utf8');
       spawnSync('git', ['add', '.'], { cwd: tempDir, encoding: 'utf8' });
       spawnSync('git', ['commit', '-m', 'Initial commit'], { cwd: tempDir, encoding: 'utf8' });
@@ -1968,6 +1969,481 @@ Also need to check another file:
     // 根路径身份不参与精确匹配（未锁定状态退化为普通选择语义）
     const rootSel = selectTargetPage(pages, null, { conversationUrl: 'https://chatgpt.com/' });
     assert.equal(rootSel.target.id, 'TAB_B');
+  });
+
+
+  // ---------------------------------------------------------------------------
+  // 32. 绝对 deadline 真正贯穿注入 / 提交路径 (P1: 结束"只测 remainingBudgetMs"的时代)
+  // ---------------------------------------------------------------------------
+  console.log('\n32. 绝对 deadline 贯穿注入/提交路径测试:');
+
+  await testAsync('insertTextReliable: deadline 已耗尽时零 CDP 调用并立即中止（不借用 20s 固定注入超时）', async () => {
+    let sendCount = 0;
+    const cdp = { send: async () => { sendCount++; return {}; } };
+
+    await assert.rejects(
+      () => insertTextReliable(cdp, 'hello', { deadlineMs: Date.now() - 1 }),
+      /总截止时间预算已耗尽/
+    );
+    assert.equal(sendCount, 0, '预算耗尽时必须一个 CDP 调用都不发出');
+  });
+
+  await testAsync('insertTextReliable: 注入等待被剩余预算夹逼，而非 10~25s 固定超时', async () => {
+    let sendCount = 0;
+    const slowCdp = {
+      send: async () => {
+        sendCount++;
+        await new Promise((r) => setTimeout(r, 60));
+        return { result: { value: null } };
+      },
+    };
+
+    const t0 = Date.now();
+    await assert.rejects(
+      () => insertTextReliable(slowCdp, 'short text', { deadlineMs: Date.now() + 220 }),
+      /总截止时间预算已耗尽|注入完整性校验失败/
+    );
+    const elapsed = Date.now() - t0;
+
+    assert.ok(elapsed < 2000, `注入必须在剩余预算内收敛，实际 ${elapsed}ms`);
+    assert.ok(sendCount <= 6, `预算耗尽后不得继续探测，实际调用 ${sendCount} 次`);
+  });
+
+  await testAsync('clearComposer / verifyUnknownReceiptOrThrow: 预算耗尽时零 CDP 调用', async () => {
+    let sendCount = 0;
+    const cdp = { send: async () => { sendCount++; return {}; } };
+
+    const cleared = await clearComposer(cdp, { deadlineMs: Date.now() - 1 });
+    assert.equal(cleared, false);
+    assert.equal(sendCount, 0);
+
+    await assert.rejects(
+      () => verifyUnknownReceiptOrThrow(
+        cdp,
+        { status: SUBMIT_STATUS.UNKNOWN, reason: 'receipt_timeout', beforeUserTurns: 0 },
+        0,
+        { deadlineMs: Date.now() - 1 }
+      ),
+      /总截止时间预算已耗尽/
+    );
+    assert.equal(sendCount, 0);
+  });
+
+  await testAsync('submitMessageReliable: 预算已耗尽时绝不发送（零 CDP 调用，fail-closed）', async () => {
+    let sendCount = 0;
+    const cdp = { send: async () => { sendCount++; return {}; } };
+
+    const res = await submitMessageReliable(cdp, { deadlineMs: Date.now() - 1 });
+    assert.equal(sendCount, 0, '预算耗尽时绝不允许发出任何提交动作');
+    assert.equal(res.status, SUBMIT_STATUS.UNKNOWN);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 33. 宿主授权工作区根测试 (P1: 调用者不得自定义"安全沙箱")
+  // ---------------------------------------------------------------------------
+  console.log('\n33. 宿主授权工作区根测试:');
+
+  test('assertAuthorizedWorkspace: 危险根（文件系统根 / 家目录）即使未固化授权根也必须拒绝', () => {
+    resetAuthorizedWorkspace();
+    const dangerous = [path.parse(process.cwd()).root, os.homedir()];
+    for (const d of dangerous) {
+      assert.throws(
+        () => assertAuthorizedWorkspace(d),
+        (err) => err.code === 'E_DANGEROUS_WORKSPACE',
+        `危险根 ${d} 必须被拒绝`
+      );
+      assert.equal(isAuthorizedWorkspace(d), false);
+    }
+  });
+
+  test('pinAuthorizedWorkspace: 只允许授权根及其子目录，越界与危险根一律 fail-closed', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'authws-'));
+    const inner = path.join(root, 'sub');
+    fs.mkdirSync(inner);
+    try {
+      const pinned = pinAuthorizedWorkspace(root);
+      const realRoot = fs.realpathSync(root);
+      assert.ok(pinned.toLowerCase() === realRoot.toLowerCase(), '授权根必须被 realpath 固化');
+      assert.ok(assertAuthorizedWorkspace(inner).toLowerCase() === fs.realpathSync(inner).toLowerCase());
+      assert.equal(isAuthorizedWorkspace(inner), true);
+
+      // 逃出授权根 -> fail-closed
+      assert.throws(
+        () => assertAuthorizedWorkspace(process.cwd()),
+        (err) => err.code === 'E_UNAUTHORIZED_WORKSPACE'
+      );
+      assert.equal(isAuthorizedWorkspace(process.cwd()), false);
+
+      // 危险根不得被固化为授权根
+      assert.throws(
+        () => pinAuthorizedWorkspace(path.parse(process.cwd()).root),
+        (err) => err.code === 'E_DANGEROUS_WORKSPACE'
+      );
+    } finally {
+      resetAuthorizedWorkspace();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('MCP handleAskChatGPT: 未授权 workspace 必须 fail-closed 且绝不触达编排层', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'authws-mcp-'));
+    const originalRun = mcpDeps.runBrainTask;
+    let called = false;
+    mcpDeps.runBrainTask = async () => { called = true; return { ok: true, text: 'stub' }; };
+
+    try {
+      pinAuthorizedWorkspace(root);
+
+      const denied = await handleAskChatGPT({ prompt: 'hi', workspace: process.cwd() });
+      assert.equal(denied.isError, true);
+      assert.match(denied.content[0].text, /未获授权/);
+      assert.equal(called, false, '未授权请求绝不能触达编排层');
+
+      const allowed = await handleAskChatGPT({ prompt: 'hi', workspace: root });
+      assert.equal(allowed.isError, false);
+      assert.equal(called, true);
+    } finally {
+      mcpDeps.runBrainTask = originalRun;
+      resetAuthorizedWorkspace();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('runBrainTask: workspace 逃出授权根必须抛 E_UNAUTHORIZED_WORKSPACE（编排层单一授权检查）', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'authws-orch-'));
+    try {
+      pinAuthorizedWorkspace(root);
+      await assert.rejects(
+        () => runBrainTask({ prompt: 'hello', workspace: process.cwd() }),
+        (err) => err.code === 'E_UNAUTHORIZED_WORKSPACE'
+      );
+    } finally {
+      resetAuthorizedWorkspace();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 34. 未跟踪文件 symlink 敏感旁路回归测试 (P1)
+  // ---------------------------------------------------------------------------
+  console.log('\n34. 未跟踪文件 symlink 别名旁路回归测试:');
+
+  test('getUntrackedEvidence: 未跟踪别名 innocent.txt -> .env 必须被整体跳过', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'untracked-alias-'));
+    try {
+      fs.writeFileSync(path.join(root, '.env'), 'OPENAI_API_KEY=leak_via_untracked_alias', 'utf8');
+      fs.writeFileSync(path.join(root, 'normal.txt'), 'plain content', 'utf8');
+
+      let linked = true;
+      try {
+        fs.symlinkSync(path.join(root, '.env'), path.join(root, 'innocent.txt'), 'file');
+      } catch {
+        linked = false;
+      }
+
+      if (!linked) {
+        console.log('  [SKIP] 当前环境不支持创建文件 symlink，跳过别名断言（逻辑由 readFileSafe 同类用例覆盖）');
+        return;
+      }
+
+      const ev = getUntrackedEvidence(root, ['innocent.txt'], 32 * 1024);
+      assert.equal(ev.files.includes('innocent.txt'), false, '指向 .env 的别名绝不能被纳入证据');
+      assert.ok(!ev.content.includes('leak_via_untracked_alias'), '敏感内容绝不能被送出浏览器边界');
+
+      // 对照：普通未跟踪文件仍应正常纳入
+      const ev2 = getUntrackedEvidence(root, ['normal.txt'], 32 * 1024);
+      assert.ok(ev2.content.includes('plain content'), '普通未跟踪文件必须保持可用');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 35. tracked Git Diff 文件级策略测试 (P1)
+  // ---------------------------------------------------------------------------
+  console.log('\n35. tracked Git Diff 文件级策略测试:');
+
+  test('parseNameStatusZ: NUL 分隔 name-status（含 rename 双路径）解析正确', () => {
+    const entries = parseNameStatusZ('M\0app.js\0R100\0old.js\0new.js\0A\0added.txt\0');
+    assert.deepEqual(entries.map((e) => e.paths), [['app.js'], ['old.js', 'new.js'], ['added.txt']]);
+  });
+
+  test('filterDiffEntriesByPolicy: rename 双端任一命中敏感/忽略规则即整体排除', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'diff-policy-unit-'));
+    try {
+      fs.writeFileSync(path.join(root, '.brainignore'), 'ignored_dir/\n');
+      const entries = [
+        { paths: ['app.js'] },
+        { paths: ['ignored_dir/hidden.txt'] },
+        { paths: ['app.js', 'id_rsa'] },
+      ];
+      const { allowed, excluded } = filterDiffEntriesByPolicy(root, entries);
+      assert.deepEqual(allowed, ['app.js']);
+      assert.deepEqual(excluded, ['ignored_dir/hidden.txt', 'app.js', 'id_rsa']);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('getGitDiff: 已跟踪的敏感文件变更必须整体排除，普通文件仍保留', () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'diff-policy-'));
+    try {
+      const git = (...args) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+      git('init', '-q', '-b', 'main');
+      git('config', 'user.name', 'T');
+      git('config', 'user.email', 't@e.com');
+
+      fs.writeFileSync(path.join(repo, 'app.js'), 'console.log("v1");\n');
+      fs.writeFileSync(path.join(repo, 'credentials.js'), 'module.exports = "v1";\n');
+      git('add', '.');
+      git('commit', '-qm', 'init');
+
+      fs.writeFileSync(path.join(repo, 'app.js'), 'console.log("v2-changed");\n');
+      fs.writeFileSync(path.join(repo, 'credentials.js'), 'module.exports = "SUPER_SECRET_TOKEN_XYZ";\n');
+
+      const diff = getGitDiff(repo, { head: true });
+      assert.equal(diff.hasDiff, true);
+      assert.ok(diff.diff.includes('app.js'), '普通文件必须仍进入 review diff');
+      assert.ok(diff.diff.includes('v2-changed'));
+      assert.ok(!diff.diff.includes('SUPER_SECRET_TOKEN_XYZ'), '敏感文件内容绝不能进入 diff');
+      // 路径只允许出现在可审计的过滤提示行中，绝不能出现在 diff 头/正文里
+      assert.ok(!diff.diff.includes('--- a/credentials.js'), '敏感文件不得生成 diff 头');
+      assert.ok(!diff.diff.includes('+++ b/credentials.js'), '敏感文件不得生成 diff 头');
+      assert.match(diff.diff, /\[DIFF FILTERED: 1 path\(s\) excluded/);
+      assert.equal(diff.filtered, true);
+      assert.ok(diff.excludedPaths.includes('credentials.js'));
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('getGitDiff: .brainignore 排除的已跟踪文件变更同样必须整体排除', () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'diff-brainignore-'));
+    try {
+      const git = (...args) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+      git('init', '-q', '-b', 'main');
+      git('config', 'user.name', 'T');
+      git('config', 'user.email', 't@e.com');
+
+      fs.writeFileSync(path.join(repo, '.brainignore'), 'ignored_dir/\n');
+      fs.mkdirSync(path.join(repo, 'ignored_dir'));
+      fs.writeFileSync(path.join(repo, 'ignored_dir', 'hidden.txt'), 'initial\n');
+      fs.writeFileSync(path.join(repo, 'app.js'), 'console.log("v1");\n');
+      git('add', '.');
+      git('commit', '-qm', 'init');
+
+      fs.writeFileSync(path.join(repo, 'ignored_dir', 'hidden.txt'), 'CONFIDENTIAL_CHANGED\n');
+      fs.writeFileSync(path.join(repo, 'app.js'), 'console.log("v2");\n');
+
+      const diff = getGitDiff(repo, { head: true });
+      assert.ok(diff.diff.includes('app.js'));
+      assert.ok(!diff.diff.includes('CONFIDENTIAL_CHANGED'), '.brainignore 命中的变更绝不能进入 diff');
+      assert.ok(!diff.diff.includes('--- a/ignored_dir'), '.brainignore 命中的文件不得生成 diff 头');
+      assert.ok(diff.excludedPaths.some((p) => p.includes('ignored_dir')));
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('getGitDiff: 重命名到敏感路径时 old/new 两端都校验，整体排除', () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'diff-rename-'));
+    try {
+      const git = (...args) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+      git('init', '-q', '-b', 'main');
+      git('config', 'user.name', 'T');
+      git('config', 'user.email', 't@e.com');
+
+      fs.writeFileSync(path.join(repo, 'app.js'), 'console.log("rename-me");\n');
+      git('add', '.');
+      git('commit', '-qm', 'init');
+
+      git('mv', 'app.js', 'id_rsa');
+      const diff = getGitDiff(repo, { staged: true });
+
+      assert.ok(!diff.diff.includes('rename-me'), '重命名到敏感路径时原内容绝不能被带出');
+      assert.ok(diff.excludedPaths.includes('app.js') && diff.excludedPaths.includes('id_rsa'));
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 36. 恢复凭证不得退化测试 (P1)
+  // ---------------------------------------------------------------------------
+  console.log('\n36. 恢复凭证 durable 化与 targetId 兜底测试:');
+
+  const makeIdentityMock = (url) => ({
+    send: async (method, params) => {
+      if (method !== 'Runtime.evaluate') return {};
+      const expr = params?.expression || '';
+      if (expr === 'location.href') return { result: { value: url } };
+      if (expr.includes('MutationObserver')) return { result: { value: true } };
+      if (expr.includes('sendButton')) {
+        return { result: { value: { url, stopButton: { found: false }, assistant: { count: 1, len: 100, hash: 777 } } } };
+      }
+      if (expr.includes('textOfTurn')) return { result: { value: 'answer' } };
+      return {};
+    },
+  });
+
+  await testAsync('waitForStreamingCompletion: 根路径/临时身份时 conversationUrl 必须为 null，由 targetId 兜底', async () => {
+    const atRoot = await waitForStreamingCompletion(makeIdentityMock('https://chatgpt.com/'), {
+      deadlineMs: Date.now() + 15000,
+      beforeTurns: 0,
+      expectedTurn: 1,
+      expectedConversationUrl: 'https://chatgpt.com/',
+      targetUrl: 'https://chatgpt.com/',
+      targetId: 'TAB-ROOT',
+      safeTimeout: true,
+    });
+    assert.equal(atRoot.inProgress, false);
+    assert.equal(atRoot.conversationUrl, null, '根路径绝不能作为恢复凭证返回');
+    assert.equal(atRoot.targetId, 'TAB-ROOT');
+    assert.equal(atRoot.url, 'https://chatgpt.com/');
+
+    const ephemeral = await waitForStreamingCompletion(makeIdentityMock('https://chatgpt.com/c/WEB:tmp-1'), {
+      deadlineMs: Date.now() + 15000,
+      beforeTurns: 0,
+      expectedTurn: 1,
+      expectedConversationUrl: 'https://chatgpt.com/c/WEB:tmp-1',
+      targetUrl: 'https://chatgpt.com/c/WEB:tmp-1',
+      targetId: 'TAB-WEB',
+      safeTimeout: true,
+    });
+    assert.equal(ephemeral.conversationUrl, null, '临时 WEB: 身份绝不能作为恢复凭证返回');
+
+    const durable = await waitForStreamingCompletion(makeIdentityMock('https://chatgpt.com/c/real-1'), {
+      deadlineMs: Date.now() + 15000,
+      beforeTurns: 0,
+      expectedTurn: 1,
+      expectedConversationUrl: 'https://chatgpt.com/',
+      targetUrl: 'https://chatgpt.com/',
+      targetId: 'TAB-REAL',
+      safeTimeout: true,
+    });
+    assert.equal(durable.conversationUrl, 'https://chatgpt.com/c/real-1', 'durable 身份必须作为凭证返回');
+  });
+
+  await testAsync('waitForStreamingCompletion: IN_PROGRESS 降级路径同样不得伪造 conversationUrl', async () => {
+    const streamingMock = {
+      send: async (method) => {
+        if (method !== 'Runtime.evaluate') return {};
+        return {
+          result: {
+            value: {
+              url: 'https://chatgpt.com/',
+              stopButton: { found: true },
+              assistant: { count: 1, len: 10, hash: 1 },
+            },
+          },
+        };
+      },
+    };
+
+    const res = await waitForStreamingCompletion(streamingMock, {
+      deadlineMs: Date.now() + 120,
+      beforeTurns: 0,
+      safeTimeout: true,
+      targetId: 'TAB-9',
+    });
+
+    assert.equal(res.inProgress, true);
+    assert.equal(res.conversationUrl, null);
+    assert.equal(res.targetId, 'TAB-9');
+  });
+
+  await testAsync('MCP IN_PROGRESS 回执: 必须给出 targetId 兜底凭证且不得伪造 conversationUrl', async () => {
+    const originalRun = mcpDeps.runBrainTask;
+    mcpDeps.runBrainTask = async () => ({
+      ok: true,
+      inProgress: true,
+      isStreaming: true,
+      text: 'partial',
+      url: 'https://chatgpt.com/',
+      conversationUrl: null,
+      targetId: 'TAB-77',
+      turns: 1,
+      expectedTurn: 1,
+      elapsedMs: 10,
+    });
+
+    try {
+      const res = await handleAskChatGPT({ prompt: 'hi' });
+      const text = res.content[0].text;
+      assert.match(text, /"targetId": "TAB-77"/);
+      assert.ok(!/"conversationUrl"/.test(text), '非 durable 身份绝不能出现在续拉凭证中');
+    } finally {
+      mcpDeps.runBrainTask = originalRun;
+    }
+  });
+
+  await testAsync('MCP handleFetchChatGPTResponse: targetId 必须透传至底层传输层', async () => {
+    const originalFetch = mcpDeps.fetchLatestBrainResponse;
+    let captured = null;
+    mcpDeps.fetchLatestBrainResponse = async (options) => {
+      captured = options;
+      return { ok: true, inProgress: false, text: 'ok', conversationUrl: null, targetId: options.targetId };
+    };
+
+    try {
+      await handleFetchChatGPTResponse({ timeout: 60, targetId: 'TAB-XYZ', expectedTurn: 3 });
+      assert.equal(captured.targetId, 'TAB-XYZ');
+      assert.equal(captured.expectedTurn, 3);
+    } finally {
+      mcpDeps.fetchLatestBrainResponse = originalFetch;
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 37. searchWorkspace 统一策略测试 (P2)
+  // ---------------------------------------------------------------------------
+  console.log('\n37. searchWorkspace 统一策略测试:');
+
+  test('searchWorkspace: .brainignore 命中的已跟踪文件绝不出现在搜索结果中', () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'search-ignore-'));
+    try {
+      const git = (...args) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+      git('init', '-q', '-b', 'main');
+      git('config', 'user.name', 'T');
+      git('config', 'user.email', 't@e.com');
+
+      fs.writeFileSync(path.join(repo, '.brainignore'), 'ignored_dir/\n');
+      fs.mkdirSync(path.join(repo, 'ignored_dir'));
+      fs.writeFileSync(path.join(repo, 'ignored_dir', 'secret.txt'), 'NEEDLE_IGNORED\n');
+      fs.writeFileSync(path.join(repo, 'visible.txt'), 'NEEDLE_VISIBLE\n');
+      git('add', '.');
+      git('commit', '-qm', 'init');
+
+      const matches = searchWorkspace(repo, 'NEEDLE');
+      const files = matches.map((m) => m.file);
+
+      assert.ok(files.includes('visible.txt'), '普通文件命中必须保留');
+      assert.ok(!files.some((f) => f.includes('ignored_dir')), '.brainignore 命中的文件必须被过滤');
+      assert.ok(!JSON.stringify(matches).includes('NEEDLE_IGNORED'), '被忽略文件的内容绝不能出现在结果中');
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('searchWorkspace: 敏感文件名同样不得出现在搜索结果中', () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'search-sensitive-'));
+    try {
+      const git = (...args) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+      git('init', '-q', '-b', 'main');
+      git('config', 'user.name', 'T');
+      git('config', 'user.email', 't@e.com');
+
+      fs.writeFileSync(path.join(repo, 'credentials.js'), 'const SENSITIVE_NEEDLE = 1;\n');
+      fs.writeFileSync(path.join(repo, 'app.js'), 'const SENSITIVE_NEEDLE = 2;\n');
+      git('add', '.');
+      git('commit', '-qm', 'init');
+
+      const files = searchWorkspace(repo, 'SENSITIVE_NEEDLE').map((m) => m.file);
+      assert.ok(files.includes('app.js'));
+      assert.ok(!files.includes('credentials.js'), '敏感文件绝不能出现在搜索结果中');
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   console.log(`\n========================================`);

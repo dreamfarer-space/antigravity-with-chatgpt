@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { runBrainTask, fetchLatestBrainResponse } from '../src/brain/orchestrator.mjs';
 import { MODES } from '../src/brain/prompts.mjs';
 import { checkCdpStatus } from '../src/transport/cdp_transport.mjs';
+import { assertAuthorizedWorkspace, getAuthorizedWorkspace, pinAuthorizedWorkspace } from '../src/security/authorized_workspace.mjs';
 import { recordExecution } from '../src/execution/recorder.mjs';
 import { getWorkspaceInfo, readFileSafe } from '../src/workspace/context_provider.mjs';
 import { getGitDiff } from '../src/git/git_helper.mjs';
@@ -50,6 +51,23 @@ export const __deps = {
   runBrainTask,
   fetchLatestBrainResponse,
 };
+
+/**
+ * 工具调用者（本地 Agent）不得自定义安全沙箱：所有 workspace 参数都必须通过
+ * 宿主授权根校验（启动时由 CHATGPT_BRAIN_WORKSPACE 或进程 cwd 固化）。
+ * @param {string|undefined} requested
+ * @returns {{ ok: true, workspace: string } | { ok: false, error: string }}
+ */
+export function resolveToolWorkspace(requested) {
+  try {
+    const candidate = requested
+      ? path.resolve(requested)
+      : (getAuthorizedWorkspace() || process.cwd());
+    return { ok: true, workspace: assertAuthorizedWorkspace(candidate) };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Tool Specifications
@@ -128,6 +146,12 @@ const TOOLS = [
         expectedTurn: {
           type: 'number',
           description: '预期的最小回复回合数（可选，防止多会话或前后轮次串线）',
+        },
+        targetId: {
+          type: 'string',
+          description:
+            'Chrome 标签身份（可选，opaque）。当上一轮 IN_PROGRESS 未返回 durable conversationUrl 时，' +
+            '用它精确定位同一标签继续拉取（优先于 conversationUrl）。',
         },
         conversationUrl: {
           type: 'string',
@@ -286,12 +310,21 @@ export async function handleAskChatGPT(args) {
   // 端到端唯一绝对截止时间：在 MCP 边界锚定，一路透传到 CDP 传输层的每一个等待点
   const deadlineMs = Date.now() + safeTimeout * 1000;
 
+  // 工作区必须通过宿主授权根校验（调用者不得自定义沙箱）
+  const wsResolution = resolveToolWorkspace(args.workspace);
+  if (!wsResolution.ok) {
+    return {
+      content: [{ type: 'text', text: `错误: 工作区未获授权 — ${wsResolution.error}` }],
+      isError: true,
+    };
+  }
+
   try {
     const res = await __deps.runBrainTask({
       prompt,
       mode: args.mode || MODES.ASK,
       session: args.session || (args.mode === 'new' ? 'new' : 'reuse'),
-      workspace: args.workspace,
+      workspace: wsResolution.workspace,
       files: args.files,
       gitDiff: args.gitDiff,
       diffOffset: args.diffOffset,
@@ -303,21 +336,33 @@ export async function handleAskChatGPT(args) {
 
     if (res.inProgress) {
       const targetTurn = res.expectedTurn || (res.turns || 1);
-      const convUrl = res.conversationUrl || res.url || '';
+      // P1-5：只有 durable `/c/<id>` 才能当 conversationUrl 凭证；
+      // 停留在 `/` 或临时 `/c/WEB:<uuid>` 时凭证为 null，此时以 targetId 兜底恢复身份。
+      const durableConvUrl = res.conversationUrl || null;
+      const resumeTargetId = res.targetId || null;
+      const resumeCredential = {
+        ...(resumeTargetId ? { targetId: resumeTargetId } : {}),
+        expectedTurn: targetTurn,
+        ...(durableConvUrl ? { conversationUrl: durableConvUrl } : {}),
+      };
+
       const waitNotice = [
         `[STATUS: IN_PROGRESS] ChatGPT 正在深度思考与生成长回复中。`,
         `为防止触发 Antigravity / MCP 客户端的 3 分钟硬性超时限制 (timed out after 3m0s)，已在安全窗口 (${Math.round((res.elapsedMs || 0) / 1000)}s) 内安全返回。`,
         ``,
         `【当前生成状态与恢复身份凭证】:`,
         `- 目标期望回复回合 (expectedTurn): ${targetTurn}`,
-        convUrl ? `- 绑定的会话 (conversationUrl): ${convUrl}` : '',
+        durableConvUrl
+          ? `- 已锁定会话 (conversationUrl): ${durableConvUrl}`
+          : `- 会话身份尚未持久化（仍在根路径或临时 /c/WEB:<uuid>），conversationUrl 故意返回 null，恢复时请仅凭 targetId`,
+        resumeTargetId ? `- Chrome 标签身份 (targetId): ${resumeTargetId}` : '',
         `- 是否仍在流式传输: ${res.isStreaming ? '是 (Streaming)' : '等待 DOM 稳定'}`,
         res.text ? `- 已截获部分文本切片 (${res.text.length} 字符):\n\`\`\`\n${res.text.slice(-400)}\n\`\`\`` : `- 尚未产生可见文本切片`,
         ``,
         `【后续操作指引】:`,
-        `请勿重新提交完整提问（以防覆盖正在生成的长回复）！请直接调用工具 \`fetch_chatgpt_response\` 携带会话与回合凭据拉取完整回复:`,
+        `请勿重新提交完整提问（以防覆盖正在生成的长回复）！请直接调用工具 \`fetch_chatgpt_response\` 携带下列凭据拉取完整回复:`,
         `\`\`\`json`,
-        JSON.stringify({ expectedTurn: targetTurn, ...(convUrl ? { conversationUrl: convUrl } : {}) }, null, 2),
+        JSON.stringify(resumeCredential, null, 2),
         `\`\`\``,
       ].filter(Boolean).join('\n');
 
@@ -343,26 +388,37 @@ export async function handleFetchChatGPTResponse(args = {}) {
   const safeTimeout = Math.min(Math.max(5, Number(args.timeout) || 150), 165);
   const deadlineMs = Date.now() + safeTimeout * 1000;
 
+  const wsResolution = resolveToolWorkspace(args.workspace);
+  if (!wsResolution.ok) {
+    return {
+      content: [{ type: 'text', text: `错误: 工作区未获授权 — ${wsResolution.error}` }],
+      isError: true,
+    };
+  }
+
   try {
     const res = await __deps.fetchLatestBrainResponse({
       timeout: safeTimeout,
       deadlineMs,
       expectedTurn: args.expectedTurn,
       conversationUrl: args.conversationUrl,
-      workspace: args.workspace,
+      targetId: args.targetId,
+      workspace: wsResolution.workspace,
       safeTimeout: true,
     });
 
     if (res.inProgress) {
       const targetTurn = args.expectedTurn || res.expectedTurn || res.turns || 1;
-      const convUrl = args.conversationUrl || res.conversationUrl || res.url || '';
+      const durableConvUrl = res.conversationUrl || null;
+      const resumeTargetId = args.targetId || res.targetId || null;
       const waitNotice = [
         `[STATUS: IN_PROGRESS] ChatGPT 仍在生成长回复中（已等待 ${Math.round((res.elapsedMs || 0) / 1000)}s）。`,
         `- 目标期望回复回合: ${targetTurn}`,
-        convUrl ? `- 绑定的会话: ${convUrl}` : '',
+        durableConvUrl ? `- 已锁定会话: ${durableConvUrl}` : '',
+        resumeTargetId ? `- Chrome 标签身份 (targetId): ${resumeTargetId}` : '',
         `- 是否仍在流式传输: ${res.isStreaming ? '是' : '否'}`,
         res.text ? `- 已截获最新切片 (${res.text.length} 字符):\n\`\`\`\n${res.text.slice(-400)}\n\`\`\`` : '',
-        `可再次调用 \`fetch_chatgpt_response\` (携带 expectedTurn: ${targetTurn}) 继续拉取，直到生成完全结束。`,
+        `可再次调用 \`fetch_chatgpt_response\` (携带 targetId${durableConvUrl ? ' / conversationUrl' : ''} 与 expectedTurn: ${targetTurn}) 继续拉取，直到生成完全结束。`,
       ].filter(Boolean).join('\n');
 
       return {
@@ -391,7 +447,14 @@ export async function handleFetchChatGPTResponse(args = {}) {
 }
 
 async function handleGetGitDiffPage(args = {}) {
-  const ws = args.workspace ? path.resolve(args.workspace) : process.cwd();
+  const wsResolution = resolveToolWorkspace(args.workspace);
+  if (!wsResolution.ok) {
+    return {
+      content: [{ type: 'text', text: `错误: 工作区未获授权 — ${wsResolution.error}` }],
+      isError: true,
+    };
+  }
+  const ws = wsResolution.workspace;
   const offset = Math.max(0, Number(args.offset) || 0);
   const maxBytes = Math.min(Math.max(1024, Number(args.maxBytes) || 32768), 65536);
   const head = args.head !== false;
@@ -420,7 +483,14 @@ async function handleReadReviewFile(args = {}) {
     };
   }
 
-  const ws = args.workspace ? path.resolve(args.workspace) : process.cwd();
+  const wsResolution = resolveToolWorkspace(args.workspace);
+  if (!wsResolution.ok) {
+    return {
+      content: [{ type: 'text', text: `错误: 工作区未获授权 — ${wsResolution.error}` }],
+      isError: true,
+    };
+  }
+  const ws = wsResolution.workspace;
   const maxBytes = Math.min(Math.max(1024, Number(args.maxBytes) || 32768), 128 * 1024);
 
   try {
@@ -440,7 +510,14 @@ async function handleReadReviewFile(args = {}) {
 async function handleCheckStatus(args) {
   try {
     const cdp = await checkCdpStatus();
-    const wsInfo = args.workspace ? getWorkspaceInfo(args.workspace) : null;
+    const wsResolution = resolveToolWorkspace(args.workspace);
+    if (!wsResolution.ok) {
+      return {
+        content: [{ type: 'text', text: `错误: 工作区未获授权 — ${wsResolution.error}` }],
+        isError: true,
+      };
+    }
+    const wsInfo = getWorkspaceInfo(wsResolution.workspace);
 
     const data = {
       ready: cdp.running,
@@ -640,5 +717,14 @@ const isMainModule = (() => {
 })();
 
 if (isMainModule) {
+  // 宿主授权根必须在启动时固化：此后任何工具调用的 workspace 都只能等于它或位于其下，
+  // 调用者（可能已被 prompt injection 影响的本地 Agent）不得自行定义"安全沙箱"。
+  try {
+    const root = pinAuthorizedWorkspace(process.env.CHATGPT_BRAIN_WORKSPACE || process.cwd());
+    log(`Authorized workspace root: ${root}`);
+  } catch (err) {
+    log(`FATAL: 无法固化授权工作区根 — ${err.message}`);
+    process.exit(2);
+  }
   startServer();
 }

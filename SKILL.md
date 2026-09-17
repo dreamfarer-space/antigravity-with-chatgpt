@@ -132,6 +132,9 @@ node "D:\ChatGPT-Brain-Bridge\gemini-skill\antigravity-with-chatgpt\scripts\make
   - `notes`: 补充说明
 - **`chatgpt_status`**: 探测专用 Chrome 与 ChatGPT 连接就绪状态及当前工作区
 
+> 所有工具的 `workspace` 参数都必须落在宿主授权工作区根之内（见"安全红线"第 0 条），
+> 否则返回 `工作区未获授权` 并且**不会**触达编排层。缺省时使用授权根本身。
+
 ### 方式 2：CLI 脚本直接调用
 
 脚本路径（固定）：
@@ -283,22 +286,27 @@ ask_chatgpt(prompt, timeout=150)
 **本地 Agent 必须遵守的两条规则：**
 
 1. **看到 `IN_PROGRESS` 绝不重发 Prompt** —— 此时 Prompt 已注入且正在生成，重发会覆盖或打乱进行中的回复；
-2. **续拉时带上凭证** —— `expectedTurn`（最小助手回合数，防轮次串线）与 `conversationUrl`（会话身份，防标签串线）。
+2. **续拉时带上凭证** —— 优先 `targetId`（Chrome 标签身份，opaque 且始终可用），
+   配合 `expectedTurn`（最小助手回合数，防轮次串线）与 `conversationUrl`（会话身份，防标签串线）。
 
 | 通道 | 写法 |
 | --- | --- |
-| MCP | `fetch_chatgpt_response({ expectedTurn, conversationUrl, timeout: 150 })` |
-| CLI | `ask_chatgpt.mjs --fetch`（等价 `--poll`），可配 `--json` / `--out` |
+| MCP | `fetch_chatgpt_response({ targetId, expectedTurn, conversationUrl, timeout: 150 })` |
+| CLI | `ask_chatgpt.mjs --fetch --target-id <id> --turn <n> [--conversation-url <url>]`，可配 `--json` / `--out` |
 
 其他约束：
 
 - `timeout` 在 MCP 路径被**硬性夹逼**到 `[5, 165]` 秒，默认 150 秒；CLI 路径默认 600 秒（不受宿主熔断约束）；
-- **同一条绝对 deadline 贯穿全链路**：deadline 在 MCP 边界锚定 → `runBrainTask` → `sendPromptViaCdp` / `fetchLatestResponse` → Chrome 就绪 / CDP 连接 / 探针 / 静默窗口 / 文本读取。任何一层都**不得**重新锚定相对超时，也**不得**用 `Math.max()` 制造额外时间；预算耗尽后一个 CDP 调用都不会再发出（这是代码级不变量，有回归用例守着）；
+- **同一条绝对 deadline 贯穿全链路**：deadline 在 MCP 边界锚定 → `runBrainTask` → `sendPromptViaCdp` / `fetchLatestResponse`
+  → Chrome 就绪 / CDP 连接 / 输入框等待 / **注入** / **提交** / 探针 / 静默窗口 / 文本读取。
+  任何一层都**不得**重新锚定相对超时，也**不得**用 `Math.max()` 制造额外时间
+  （注入、提交、收据复核、清空输入框使用的都是剩余预算；预算耗尽时一个 CDP 调用都不会发出）；
 - `safeTimeout: false`（仅 API/CLI 层面可用）会恢复"超时即硬失败"的旧行为；
 - **会话身份状态机**：`UNBOUND_ROOT → PINNED(/c/<id>)`。首次观测到具体会话即**永久锁定**，此后严格比较 —— 根路径 `/` 不能当永久通行证，`/ → /c/A → /c/B` 会在读取文本前 fail-closed；
 - **临时身份不算身份**：新会话提交后 SPA 会短暂停留在客户端临时地址 `/c/WEB:<uuid>`，之后才换成服务端 `/c/<uuid>`。该形态**不参与锁定、也不能当恢复凭证**，因此"临时 → 真实"的跃迁是正常流程，不会被误判为劫持（这一条是实机踩出来的，mock 测不出）；
-- **恢复凭证会升级**：从 `/` 或临时身份发起的提问，返回的 `conversationUrl` 是具体 `/c/<服务端 uuid>`；
-- **多标签精确匹配**：带 `conversationUrl` 续拉时按规范化会话身份精确选标签；匹配不到直接 fail-closed（报 `未找到与目标会话匹配的 ChatGPT 标签页`），绝不退回"第一个 ChatGPT 标签"；根路径/临时身份凭证不具备可比性，自动退化为绑定标签语义。
+- **恢复凭证规则**：`conversationUrl` **只在拿到 durable `/c/<服务端 uuid>` 时才返回**；
+  若到点仍停留在 `/` 或 `/c/WEB:<uuid>`，该字段为 **`null`**（绝不伪造），此时用 `targetId` 兜底恢复身份；
+- **多标签精确匹配**：带 `conversationUrl` 或 `targetId` 续拉时精确选标签；匹配不到直接 fail-closed（报 `未找到与目标会话匹配的 ChatGPT 标签页`），绝不退回"第一个 ChatGPT 标签"。
 
 ### 项目锁定
 
@@ -548,6 +556,20 @@ Desktop 快捷方式 **`ChatGPT (AI智脑)`** 打开的专用 Chrome 如果尚�
 
 ## 安全红线（最高优先级）
 
+### 0. 单一授权工作区根（v2.4.0 起）
+
+**本地 Agent 不得自行定义"安全沙箱"。**
+
+- MCP Server / CLI 启动时用 `CHATGPT_BRAIN_WORKSPACE`（缺省为进程 cwd）**固化唯一授权根**，
+  并做 realpath 归一化；
+- 任何工具调用携带的 `workspace` 只能**等于该根或严格位于其下**，否则 fail-closed
+  （MCP 返回 `工作区未获授权`，CLI 以 `exit 2` 退出）；
+- 文件系统根（`/`、`D:\`）、用户主目录、系统目录、临时目录根**一律禁止**作为工作区根，
+  即使宿主未固化授权根（库/嵌入模式）也会被拒绝。
+
+> 为什么：`resolveSafePath(workspaceRoot, p)` 只能保证"不逃出调用者指定的根"。
+> 若允许调用者把 workspace 指成 `C:\` 或 Home，路径沙箱保护的就成了"攻击者指定的沙箱"。
+
 ### 1. 绝对零删除
 
 严禁操作任何 `Delete / 删除 / Archive / 归档 / Clear / 清空 / Remove` 等历史数据相关按钮。
@@ -597,6 +619,26 @@ D:\ChatGPT-Brain-Bridge\chrome-profile
 需要 **Node.js 22+**（全局 WebSocket）。版本不足时脚本会明确提示升级 Node.js，
 **而不是偷偷安装依赖**。
 
+### 5. 文件级安全策略（单一授权入口）
+
+凡是要把工作区文件内容送出浏览器边界的路径，**必须**经过 `authorizeCanonicalFile()`
+（`src/security/file_authorizer.mjs`）：
+
+1. 工作区授权（见上面第 0 条）；
+2. 词法路径包含校验 + 符号链接逃逸校验；
+3. **lexical rel 与 canonical realpath 双重** `isSensitivePath` 黑名单校验；
+4. **双重** `.brainignore` 校验；
+5. 普通文件校验与大小上限。
+
+由此收敛了三处曾经的旁路：
+
+- **未跟踪文件 symlink 别名**：`innocent.txt -> .env` 以前只在别名上判敏感名，读取时却跟随链接；
+- **tracked Git Diff**：以前只对整份 diff 做正则脱敏，不按文件名执行策略。现在先取
+  `git diff --name-status -z` 清单，逐文件授权后再生成 patch（rename/copy 校验 old/new 两端），
+  被排除的路径只出现在可审计的 `[DIFF FILTERED: ...]` 提示行里，内容与 diff 头一律不生成；
+- **searchWorkspace**：ripgrep 与 `git grep` 两条分支现在都同时应用敏感规则与 `.brainignore`
+  （ripgrep 分支改用 `--json` 结构化输出，规避 Windows 盘符与 `:` 分隔歧义）。
+
 ---
 
 ## 常见故障排查
@@ -608,7 +650,9 @@ D:\ChatGPT-Brain-Bridge\chrome-profile
 | `exit 3` 输入框未命中 | `--doctor`，看输入框/发送按钮选择器命中情况（ChatGPT 改版） |
 | `exit 3` 插入后仍为空 | 同上；确认 `#prompt-textarea` 是否存在，必要时更新选择器表 |
 | stdout 出现 `[IN_PROGRESS]` | 正常现象（长回复到点未生成完），**不要重发 Prompt**，改跑 `--fetch` 或 `fetch_chatgpt_response` 续拉 |
-| 续拉报会话身份校验失败 | 标签页被切走了；用返回的 `conversationUrl` 重新绑定，或 `--new` 重开一轮 |
+| 续拉报会话身份校验失败 | 标签页被切走了；用返回的 `targetId` / `conversationUrl` 重新绑定，或 `--new` 重开一轮 |
+| `工作区未获授权` / CLI `exit 2` | `workspace` 逃出了宿主授权根；改用授权根或其子目录，或用 `CHATGPT_BRAIN_WORKSPACE` 固化根 |
+| diff 里出现 `[DIFF FILTERED: …]` | 正常：命中敏感文件名或 `.brainignore` 的变更被整体排除，路径仅用于审计，内容绝不外发 |
 | `exit 6` 附带文件被拒 | 该文件是二进制/媒体/压缩/数据库，或超过 256 KB 上限 |
 
 脚本使用 `Input.insertText` 一次性输入全文（**不逐字符模拟键盘**），
@@ -636,6 +680,9 @@ CLI 总超时默认 600 秒（10 分钟），可用 `--timeout` 调整。
 --attach <files..>   附带本地源码文件（多文件梯度切片预算、自动识别语言、拒绝二进制）
 --file <path>        从文件读取完整提示词（绕过命令行长度限制）
 --fetch              抓取当前页面正在生成或最新的回复（无需重发 Prompt，别名 --poll）
+--target-id <id>     续拉时指定 Chrome 标签身份（opaque，优先于 --conversation-url）
+--turn <n>           续拉时的最小助手回合数（防轮次串线）
+--conversation-url <url>  续拉时指定会话身份（仅在 durable /c/<id> 时可用）
 --url <url>          本次锁定到指定 ChatGPT 项目/页面 URL
 --timeout <seconds>  总超时，CLI 默认 600；MCP 路径默认 150 且硬性夹逼上限 165
 --out <path>         额外把结果写入文件
@@ -644,4 +691,5 @@ CLI 总超时默认 600 秒（10 分钟），可用 `--timeout` 调整。
 --doctor             自检 / 诊断
 ```
 
-环境变量：`CHATGPT_BRAIN_URL`、`CHATGPT_BRAIN_PORT`、`CHATGPT_BRAIN_DEBUG`、`CHROME_PATH`。
+环境变量：`CHATGPT_BRAIN_URL`、`CHATGPT_BRAIN_PORT`、`CHATGPT_BRAIN_DEBUG`、`CHROME_PATH`、
+`CHATGPT_BRAIN_WORKSPACE`（宿主授权工作区根；缺省为进程 cwd）。

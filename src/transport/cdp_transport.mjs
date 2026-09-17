@@ -46,8 +46,58 @@ export function remainingBudgetMs(deadlineMs, capMs, marginMs = 0) {
   return Math.max(0, Math.min(capMs, deadlineMs - Date.now() - marginMs));
 }
 
-/** 构造统一的 inProgress（优雅降级）结果，恢复凭证必须带上已锁定的具体会话身份 */
-function buildInProgressResult({ text = '', turns = 0, expectedTurn, url = null, conversationUrl = null, isStreaming = false, message = '' } = {}) {
+/**
+ * 申请本步预算；当统一 deadline 已耗尽时立即抛错中止。
+ * 用于所有"必须成功才能继续"的关键步骤（注入、提交、连接等），
+ * 确保任何一层都不会为了"再试一次"而突破宿主超时。
+ * @param {number|undefined} deadlineMs
+ * @param {number} capMs
+ * @param {string} label
+ * @returns {number}
+ */
+function requireBudgetMs(deadlineMs, capMs, label) {
+  const budget = remainingBudgetMs(deadlineMs, capMs);
+  if (typeof deadlineMs === 'number' && Number.isFinite(deadlineMs) && budget <= 0) {
+    throw new Error(`总截止时间预算已耗尽（${label}），已中止以防突破宿主超时`);
+  }
+  return budget;
+}
+
+/**
+ * 把"相对 N 毫秒的循环截止时间"收敛到统一 deadline，取二者更早者。
+ * @param {number|undefined} deadlineMs
+ * @param {number} capMs
+ * @returns {number} 绝对时间戳
+ */
+function stepDeadline(deadlineMs, capMs) {
+  const local = Date.now() + capMs;
+  return (typeof deadlineMs === 'number' && Number.isFinite(deadlineMs))
+    ? Math.min(local, deadlineMs)
+    : local;
+}
+
+/**
+ * 受统一 deadline 约束的 sleep：预算不足时只睡剩余部分，已耗尽则完全不睡。
+ * @param {number} ms
+ * @param {number|undefined} deadlineMs
+ * @returns {Promise<number>} 实际睡眠毫秒数
+ */
+async function sleepWithin(ms, deadlineMs) {
+  const budget = remainingBudgetMs(deadlineMs, ms);
+  if (budget > 0) {
+    await sleep(budget);
+    return budget;
+  }
+  return 0;
+}
+
+/**
+ * 构造统一的 inProgress（优雅降级）结果。
+ * 恢复凭证规则：`conversationUrl` 仅在拿到 durable `/c/<id>` 身份时给出；
+ * 否则必须为 null（绝不把 `/` 或临时 `/c/WEB:<uuid>` 当凭证），
+ * 此时用 `targetId`（Chrome target，opaque）作为兜底恢复凭证。
+ */
+function buildInProgressResult({ text = '', turns = 0, expectedTurn, url = null, conversationUrl = null, targetId = null, isStreaming = false, message = '' } = {}) {
   return {
     ok: true,
     inProgress: true,
@@ -56,7 +106,8 @@ function buildInProgressResult({ text = '', turns = 0, expectedTurn, url = null,
     turns: typeof turns === 'number' ? turns : 0,
     expectedTurn,
     url,
-    conversationUrl: conversationUrl || url || null,
+    conversationUrl: conversationUrl || null,
+    targetId: targetId || null,
     message,
   };
 }
@@ -579,8 +630,14 @@ export const PROBE_COMPOSER_JS = `(() => {
   };
 })()`;
 
-export async function clearComposer(cdp) {
-  await evaluate(cdp, `(() => {
+export async function clearComposer(cdp, options = {}) {
+  const budget = remainingBudgetMs(options.deadlineMs, 10000);
+  if (budget <= 0) {
+    warn('清空 Composer 被跳过：统一 deadline 预算已耗尽');
+    return false;
+  }
+  try {
+    await evaluate(cdp, `(() => {
     ${PRELUDE}
     const COMPOSER = ${JSON.stringify(COMPOSER_SELECTORS)};
     const c = pickVisible(COMPOSER);
@@ -603,14 +660,21 @@ export async function clearComposer(cdp) {
     el.innerHTML = '<p><br></p>';
     el.dispatchEvent(new Event('input', { bubbles: true }));
     return true;
-  })()`, 10000).catch(() => {});
+  })()`, budget).catch(() => {});
+  } catch (err) {
+    warn('清空 Composer 失败:', err.message);
+    return false;
+  }
 }
 
-export async function insertTextReliable(cdp, text) {
+export async function insertTextReliable(cdp, text, options = {}) {
+  const deadlineMs = options.deadlineMs;
   const normalizedText = typeof text === 'string' ? text.replace(/\r\n/g, '\n') : '';
   const bytes = Buffer.byteLength(normalizedText, 'utf8');
   const expected = computeFingerprint(normalizedText);
-  const timeoutMs = getInjectionTimeout(normalizedText);
+  const baseInjectionTimeout = getInjectionTimeout(normalizedText);
+  // 注入超时本身也受统一 deadline 夹逼：剩余预算不足时按剩余时间注入，已耗尽则直接中止
+  const timeoutMs = requireBudgetMs(deadlineMs, baseInjectionTimeout, '在注入 Prompt 之前');
   const b64 = Buffer.from(normalizedText, 'utf8').toString('base64');
 
   let timedOut = false;
@@ -692,14 +756,15 @@ export async function insertTextReliable(cdp, text) {
     probe = singleShotRes;
   } else {
     // 若初次注入发生 CDP evaluate 超时或返回值异常，启动探针轮询比对指纹
-    const probeTimeout = Math.max(10000, Math.min(timeoutMs, 25000));
     for (let i = 0; i < 3; i++) {
+      const probeTimeout = remainingBudgetMs(deadlineMs, Math.min(timeoutMs, 25000));
+      if (probeTimeout <= 0) break;
       probe = await evaluate(cdp, PROBE_COMPOSER_JS, probeTimeout).catch(() => null);
       if (probe && probe.found && probe.length === expected.length && probe.hash === expected.hash) {
         fingerprintMatched = true;
         break;
       }
-      if (i < 2) await sleep(500);
+      if (i < 2) await sleepWithin(500, deadlineMs);
     }
   }
 
@@ -711,17 +776,22 @@ export async function insertTextReliable(cdp, text) {
   if (!fingerprintMatched) {
     retryCount = 1;
     warn(`注入指纹不匹配 (期望: len=${expected.length}, hash=${expected.hash}; 实际: len=${probe?.length}, hash=${probe?.hash})，清空并受控重试...`);
-    await clearComposer(cdp);
-    await sleep(400);
+    await clearComposer(cdp, { deadlineMs });
+    await sleepWithin(400, deadlineMs);
 
-    const emptyProbe = await evaluate(cdp, PROBE_COMPOSER_JS, 10000).catch(() => null);
+    const emptyProbeBudget = requireBudgetMs(deadlineMs, 10000, '在重试前校验 Composer 是否已清空');
+    const emptyProbe = await evaluate(cdp, PROBE_COMPOSER_JS, emptyProbeBudget).catch(() => null);
     if (emptyProbe && !emptyProbe.empty) {
       throw new Error('清空 Composer 失败，中止注入重试以防 Prompt 污染');
     }
 
     let retryRes = null;
+    const retryTimeoutMs = remainingBudgetMs(deadlineMs, baseInjectionTimeout);
+    if (retryTimeoutMs <= 0) {
+      throw new Error('总截止时间预算已耗尽（在注入重试之前），已中止以防突破宿主超时');
+    }
     try {
-      retryRes = await runSingleShot(timeoutMs);
+      retryRes = await runSingleShot(retryTimeoutMs);
     } catch (err) {
       if (err.message && err.message.includes('CDP 调用超时')) {
         timedOut = true;
@@ -732,14 +802,15 @@ export async function insertTextReliable(cdp, text) {
       fingerprintMatched = true;
       probe = retryRes;
     } else {
-      const probeTimeout = Math.max(10000, Math.min(timeoutMs, 25000));
       for (let i = 0; i < 3; i++) {
+        const probeTimeout = remainingBudgetMs(deadlineMs, Math.min(retryTimeoutMs, 25000));
+        if (probeTimeout <= 0) break;
         probe = await evaluate(cdp, PROBE_COMPOSER_JS, probeTimeout).catch(() => null);
         if (probe && probe.found && probe.length === expected.length && probe.hash === expected.hash) {
           fingerprintMatched = true;
           break;
         }
-        if (i < 2) await sleep(500);
+        if (i < 2) await sleepWithin(500, deadlineMs);
       }
     }
 
@@ -777,7 +848,9 @@ export const SUBMIT_STATUS = Object.freeze({
 });
 
 export async function submitMessageReliable(cdp, options = {}) {
-  const checkTimeoutMs = typeof options === 'number' ? options : (options.checkTimeoutMs || 10000);
+  const opts = typeof options === 'number' ? { checkTimeoutMs: options } : (options || {});
+  const checkTimeoutMs = opts.checkTimeoutMs || 10000;
+  const deadlineMs = opts.deadlineMs;
 
   // 1. 强制获取发送前 User Turns 与流式状态作为强基准证据 (Mandatory Baseline)
   const baselineProbeScript = `(() => {
@@ -793,7 +866,7 @@ export async function submitMessageReliable(cdp, options = {}) {
 
   let baseline = null;
   try {
-    baseline = await evaluate(cdp, baselineProbeScript, 5000);
+    baseline = await evaluate(cdp, baselineProbeScript, requireBudgetMs(deadlineMs, 5000, '在提交基准探测之前'));
   } catch (err) {
     // 基准探测失败：严禁盲目假定为 0（在已有对话页面中会产生严重假阳性），直接进入 UNKNOWN
     return {
@@ -827,10 +900,12 @@ export async function submitMessageReliable(cdp, options = {}) {
   })()`;
 
   let clickRes = null;
-  const deadline = Date.now() + 4000;
+  const deadline = stepDeadline(deadlineMs, 4000);
   while (Date.now() < deadline) {
+    const clickBudget = remainingBudgetMs(deadlineMs, 3000);
+    if (clickBudget <= 0) break;
     try {
-      clickRes = await evaluate(cdp, clickProbeScript, 3000);
+      clickRes = await evaluate(cdp, clickProbeScript, clickBudget);
       if (clickRes && clickRes.action === 'CLICKED') {
         break;
       }
@@ -838,16 +913,24 @@ export async function submitMessageReliable(cdp, options = {}) {
       clickRes = { action: 'CLICK_UNKNOWN', error: err.message };
       break;
     }
-    await sleep(250);
+    await sleepWithin(250, deadlineMs);
   }
 
   let enterDispatched = false;
   if (!clickRes || clickRes.action === 'NOT_FOUND') {
     // 发送按钮确不存在，回退 Enter 键
+    const keyBudget = remainingBudgetMs(deadlineMs, 10000);
+    if (keyBudget <= 0) {
+      return {
+        status: SUBMIT_STATUS.NOT_SUBMITTED,
+        reason: 'budget_exhausted_before_enter',
+        beforeUserTurns: baseline.userTurns,
+      };
+    }
     try {
       const base = { windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, code: 'Enter', key: 'Enter' };
-      await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base, text: '\r', unmodifiedText: '\r' }, 10000);
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base }, 10000);
+      await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base, text: '\r', unmodifiedText: '\r' }, keyBudget);
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base }, remainingBudgetMs(deadlineMs, 10000) || keyBudget);
       enterDispatched = true;
     } catch (err) {
       return {
@@ -868,10 +951,12 @@ export async function submitMessageReliable(cdp, options = {}) {
   // 若 clickRes.action 为 'CLICK_UNKNOWN' 或 'CLICK_ERROR'，严禁盲目发送 Enter（防双重提交），直接通过后续收据验证
 
   // 3. 强收据轮询验证 (User turn 计数递增 或 流式边沿触发)
-  const checkDeadline = Date.now() + checkTimeoutMs;
+  const checkDeadline = stepDeadline(deadlineMs, checkTimeoutMs);
   while (Date.now() < checkDeadline) {
-    await sleep(300);
-    const receipt = await evaluate(cdp, baselineProbeScript, 4000).catch(() => null);
+    await sleepWithin(300, deadlineMs);
+    const receiptBudget = remainingBudgetMs(deadlineMs, 4000);
+    if (receiptBudget <= 0) break;
+    const receipt = await evaluate(cdp, baselineProbeScript, receiptBudget).catch(() => null);
 
     if (receipt && typeof receipt.userTurns === 'number') {
       // 强收据 1：User Turns 计数绝对递增
@@ -915,7 +1000,9 @@ export const submitMessage = submitMessageReliable;
  * @param {number} beforeTurns
  * @returns {Promise<object>}
  */
-export async function verifyUnknownReceiptOrThrow(cdp, submitReceipt, beforeTurns) {
+export async function verifyUnknownReceiptOrThrow(cdp, submitReceipt, beforeTurns, options = {}) {
+  const deadlineMs = options.deadlineMs;
+
   if (!submitReceipt || typeof submitReceipt !== 'object') {
     throw new Error('提交消息状态未知 (UNKNOWN): submitReceipt 必须为非空对象，立即中止以防重复提交');
   }
@@ -929,7 +1016,8 @@ export async function verifyUnknownReceiptOrThrow(cdp, submitReceipt, beforeTurn
     throw new Error(`提交消息状态未知 (UNKNOWN): submitReceipt 缺少合法的 user-turn 基准计数，立即中止以防重复提交`);
   }
 
-  const p = await evaluate(cdp, PROBE_JS, 3000).catch(() => null);
+  const probeBudget = requireBudgetMs(deadlineMs, 3000, '在 UNKNOWN 收据复核之前');
+  const p = await evaluate(cdp, PROBE_JS, probeBudget).catch(() => null);
   const userTurns = p?.userTurn?.count ?? p?.userTurns ?? 0;
   const beforeUserTurns = submitReceipt.beforeUserTurns;
 
@@ -940,12 +1028,22 @@ export async function verifyUnknownReceiptOrThrow(cdp, submitReceipt, beforeTurn
   return p;
 }
 
-async function waitForComposer(cdp, deadlineMs = 30000) {
-  const deadline = Date.now() + deadlineMs;
+/**
+ * 等待 Composer 加载稳定（连续 2 次探针命中）
+ * @param {object} cdp
+ * @param {number} [absoluteDeadlineMs] 统一绝对截止时间戳；缺省时退化为 30s 相对预算
+ * @returns {Promise<object>}
+ */
+async function waitForComposer(cdp, absoluteDeadlineMs) {
+  const deadline = (typeof absoluteDeadlineMs === 'number' && Number.isFinite(absoluteDeadlineMs))
+    ? absoluteDeadlineMs
+    : (Date.now() + 30000);
   let hits = 0;
   while (Date.now() < deadline) {
+    const probeBudget = remainingBudgetMs(deadline, 12000);
+    if (probeBudget <= 0) break;
     try {
-      const p = await evaluate(cdp, PROBE_JS, 12000);
+      const p = await evaluate(cdp, PROBE_JS, probeBudget);
       if (p && p.composer && p.composer.found) {
         hits++;
         if (hits >= 2) return p;
@@ -955,9 +1053,9 @@ async function waitForComposer(cdp, deadlineMs = 30000) {
     } catch (err) {
       warn('waitForComposer probe error:', err.message);
     }
-    await sleep(600);
+    if ((await sleepWithin(600, deadline)) === 0) break;
   }
-  throw new Error('等待 ChatGPT 输入框加载稳定超时');
+  throw new Error('等待 ChatGPT 输入框加载稳定超时（或总截止时间预算已耗尽）');
 }
 
 // ---------------------------------------------------------------------------
@@ -992,6 +1090,7 @@ export async function waitForStreamingCompletion(cdp, options = {}) {
   const expectedTurn = options.expectedTurn;
   const targetUrl = options.targetUrl || DEFAULT_TARGET_URL;
   const expectedConversationUrl = options.expectedConversationUrl || null;
+  const targetId = options.targetId || null;
   const safeTimeout = options.safeTimeout !== false;
 
   const SAFETY_MARGIN_MS = DEFAULT_SAFETY_MARGIN_MS;
@@ -1027,8 +1126,14 @@ export async function waitForStreamingCompletion(cdp, options = {}) {
     }
   };
 
-  // 恢复凭证：优先返回已锁定的具体身份；未锁定（仍处于 root/临时身份）时退回真实 URL
-  const identityUrl = () => pinnedConversationUrl || canonicalizeConversationUrl(targetUrl) || targetUrl;
+  // 恢复凭证（P1）：只有 durable `/c/<id>` 才能作为 conversationUrl 返回；
+  // 停留在 `/` 或临时 `/c/WEB:<uuid>` 时必须返回 null，由 targetId 兜底恢复身份。
+  const durableConversationUrl = () => {
+    if (pinnedConversationUrl) return pinnedConversationUrl;
+    const candidate = canonicalizeConversationUrl(targetUrl);
+    return isPinnableConversation(candidate) ? candidate : null;
+  };
+  const displayUrl = () => pinnedConversationUrl || canonicalizeConversationUrl(targetUrl) || targetUrl;
   const stepBudget = (capMs, marginMs = 0) => remainingBudgetMs(deadlineMs, capMs, marginMs);
 
   while (stepBudget(1, SAFETY_MARGIN_MS) > 0) {
@@ -1081,13 +1186,13 @@ export async function waitForStreamingCompletion(cdp, options = {}) {
           if (fetchBudget <= 0) break;
           const text = await evaluate(cdp, GET_LAST_TEXT_JS, fetchBudget).catch(() => '');
           if (text && text.trim()) {
-            const finalUrl = identityUrl();
             return {
               ok: true,
               inProgress: false,
               text: text.trim(),
-              url: finalUrl,
-              conversationUrl: finalUrl,
+              url: displayUrl(),
+              conversationUrl: durableConversationUrl(),
+              targetId,
               turns: p.assistant.count,
             };
           }
@@ -1120,20 +1225,18 @@ export async function waitForStreamingCompletion(cdp, options = {}) {
   }
 
   if (safeTimeout) {
-    const finalUrl = identityUrl();
-    return {
-      ...buildInProgressResult({
-        text: partialText || '',
-        turns: finalProbe?.assistant?.count || beforeTurns,
-        expectedTurn: minRequiredTurns,
-        url: finalUrl,
-        conversationUrl: finalUrl,
-        isStreaming: stillStreaming,
-        message: stillStreaming
-          ? 'ChatGPT 正在深度推理与生成长回复中。已安全返回以避免触发 MCP 客户端 3 分钟超时限制。'
-          : 'ChatGPT 生成仍在处理中。',
-      }),
-    };
+    return buildInProgressResult({
+      text: partialText || '',
+      turns: finalProbe?.assistant?.count || beforeTurns,
+      expectedTurn: minRequiredTurns,
+      url: displayUrl(),
+      conversationUrl: durableConversationUrl(),
+      targetId,
+      isStreaming: stillStreaming,
+      message: stillStreaming
+        ? 'ChatGPT 正在深度推理与生成长回复中。已安全返回以避免触发 MCP 客户端 3 分钟超时限制。'
+        : 'ChatGPT 生成仍在处理中。',
+    });
   }
 
   throw new Error(`等待 ChatGPT 生成超时`);
@@ -1187,6 +1290,8 @@ async function _fetchLatestResponseInternal({ timeoutS = 150, deadlineMs: extern
     }
 
     const identityUrl = canonicalizeConversationUrl(liveUrl) || liveUrl;
+    // P1：只有 durable `/c/<id>` 才能作为 conversationUrl 凭证；`/` 或临时 WEB: 身份返回 null
+    const durableUrl = isPinnableConversation(liveUrl) ? identityUrl : null;
 
     const probeBudget = remainingBudgetMs(deadlineMs, 5000);
     const p = probeBudget > 0 ? await evaluate(cdp, PROBE_JS, probeBudget).catch(() => null) : null;
@@ -1198,6 +1303,7 @@ async function _fetchLatestResponseInternal({ timeoutS = 150, deadlineMs: extern
         expectedTurn: expectedTurn || 1,
         targetUrl: liveUrl,
         expectedConversationUrl: conversationUrl || liveUrl,
+        targetId: target.id,
         safeTimeout,
       });
     }
@@ -1213,8 +1319,9 @@ async function _fetchLatestResponseInternal({ timeoutS = 150, deadlineMs: extern
           inProgress: false,
           text: text.trim(),
           url: identityUrl,
-          // 恢复凭证必须升级为具体会话身份，绝不能继续把根路径 `/` 当凭证
-          conversationUrl: identityUrl,
+          // 恢复凭证必须升级为具体会话身份；不可持久化时为 null（由 targetId 兜底）
+          conversationUrl: durableUrl,
+          targetId: target.id,
           turns: p.assistant.count,
         };
       }
@@ -1227,6 +1334,7 @@ async function _fetchLatestResponseInternal({ timeoutS = 150, deadlineMs: extern
       expectedTurn: minRequiredTurns,
       targetUrl: liveUrl,
       expectedConversationUrl: conversationUrl || liveUrl,
+      targetId: target.id,
       safeTimeout,
     });
   } finally {
@@ -1268,11 +1376,11 @@ async function _sendPromptInternal({ prompt, mode = 'reuse', timeoutS = 150, dea
       await cdp.send('Page.enable', {}, stepBudget(10000)).catch(() => {});
     }
 
-    const composerBudget = stepBudget(25000, SAFETY_MARGIN_MS);
-    if (composerBudget <= 0) {
+    const composerWaitDeadline = Math.min(Date.now() + 25000, deadlineMs - SAFETY_MARGIN_MS);
+    if (composerWaitDeadline <= Date.now()) {
       throw new Error('总截止时间预算已耗尽（在定位输入框之前），已中止以防突破宿主超时');
     }
-    let p = await waitForComposer(cdp, composerBudget);
+    let p = await waitForComposer(cdp, composerWaitDeadline);
 
     // 新会话导航策略
     if (mode === 'new') {
@@ -1312,32 +1420,32 @@ async function _sendPromptInternal({ prompt, mode = 'reuse', timeoutS = 150, dea
           }
         }
 
-        const navBudget = stepBudget(30000, SAFETY_MARGIN_MS);
-        if (navBudget <= 0) {
+        const navWaitDeadline = Math.min(Date.now() + 30000, deadlineMs - SAFETY_MARGIN_MS);
+        if (navWaitDeadline <= Date.now()) {
           throw new Error('总截止时间预算已耗尽（在等待新会话输入框之前），已中止以防突破宿主超时');
         }
-        p = await waitForComposer(cdp, navBudget);
+        p = await waitForComposer(cdp, navWaitDeadline);
       }
     }
 
     // 清理输入框残留
     if (!p.composer.empty) {
-      await clearComposer(cdp);
-      await sleep(150);
+      await clearComposer(cdp, { deadlineMs });
+      await sleepWithin(150, deadlineMs);
     }
 
     const beforeTurns = p.assistant.found ? p.assistant.count : 0;
 
-    // 可靠注入与强收据提交
-    await insertTextReliable(cdp, prompt);
-    const submitReceipt = await submitMessageReliable(cdp);
+    // 可靠注入与强收据提交（同一条 deadlineMs 预算贯穿到底）
+    await insertTextReliable(cdp, prompt, { deadlineMs });
+    const submitReceipt = await submitMessageReliable(cdp, { deadlineMs });
 
     if (submitReceipt.status === SUBMIT_STATUS.NOT_SUBMITTED) {
       throw new Error(`提交消息未执行 (NOT_SUBMITTED): ${submitReceipt.reason || '发送动作未触发'}`);
     }
 
     if (submitReceipt.status === SUBMIT_STATUS.UNKNOWN) {
-      p = await verifyUnknownReceiptOrThrow(cdp, submitReceipt, beforeTurns);
+      p = await verifyUnknownReceiptOrThrow(cdp, submitReceipt, beforeTurns, { deadlineMs });
     }
 
     const hrefBudget = stepBudget(3000);
@@ -1351,6 +1459,7 @@ async function _sendPromptInternal({ prompt, mode = 'reuse', timeoutS = 150, dea
       beforeTurns,
       targetUrl: liveUrl || target.url,
       expectedConversationUrl: liveUrl || target.url,
+      targetId: target.id,
       safeTimeout,
     });
   } finally {

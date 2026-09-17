@@ -32,7 +32,7 @@ Your AI Agent will handle the entire installation automatically:
 2. 🔌 **Register Native MCP Server**: Automatically updates `~/.gemini/config/mcp_config.json`;
 3. 🔗 **Mount Global Antigravity Skill**: Creates the skill junction in `~/.gemini/config/skills/antigravity-with-chatgpt`;
 4. 🖥️ **Generate Dedicated Chrome Shortcut**: Creates a desktop launcher with isolated profile and port `9222`;
-5. ✅ **Run Full Self-Checks**: Runs the 84-case adversarial test suite plus the 37-point environment self-check to ensure 100% readiness.
+5. ✅ **Run Full Self-Checks**: Runs the 104-case adversarial test suite plus the 37-point environment self-check to ensure 100% readiness.
 
 After setup, double-click the **"ChatGPT (Antigravity智脑)"** desktop shortcut to log in to your ChatGPT Web account once, and you can immediately delegate deep reasoning and adversarial code reviews to ChatGPT from within Antigravity 2.0!
 
@@ -75,6 +75,14 @@ Inspired by the notable community project `XiaoDuoYa/codex-with-chatgpt` (**"Cha
   - MCP calls clamp the wait window to **150s by default, hard-capped at 165s**—safely inside Antigravity's 180s host watchdog, so a long reasoning turn is never hard-killed mid-flight.
   - When ChatGPT is still streaming, the bridge returns `[STATUS: IN_PROGRESS]` along with resumption credentials (`expectedTurn` + `conversationUrl`) instead of failing. Resume with `fetch_chatgpt_response`—**no prompt re-injection, no overwriting the in-flight answer**.
   - **One absolute deadline, threaded end-to-end**: the deadline is anchored at the MCP boundary and passed down through the orchestrator into every transport wait (Chrome readiness, CDP connect, probes, quiet window, text reads). Downstream layers never re-anchor a fresh relative timeout and never `Math.max()` extra time—once the budget is exhausted, **zero** further CDP calls are issued.
+- 🔐 **Single Authorized Workspace Root**:
+  - The MCP server / CLI **pins the authorized workspace root at startup** (`CHATGPT_BRAIN_WORKSPACE` or the process cwd, realpath-normalized).
+  - Every tool call's `workspace` must equal that root or live strictly inside it; anything else **fails closed** without ever reaching the orchestration layer. Filesystem roots (`/`, `D://`), the user home, system and temp roots are rejected outright—even in library mode.
+  - Rationale: a path sandbox only protects the root the caller hands in. Letting a (possibly prompt-injected) agent pick `C://` or `HOME` reduces every containment check to theatre.
+- 🧱 **One File-Authorization Choke Point**:
+  - All content that may cross the browser boundary goes through `authorizeCanonicalFile()`: workspace authorization + lexical containment + symlink-escape check + **dual** (lexical **and** realpath) sensitive-name and `.brainignore` policy.
+  - Closes three bypasses: untracked `alias.txt -> .env` symlinks, tracked Git diffs (now filtered per file via `git diff --name-status -z`, renames validated on both ends), and `searchWorkspace` (both ripgrep and `git grep` branches, ripgrep switched to `--json` to remove Windows drive-letter parsing ambiguity).
+  - Excluded files never produce diff headers or content—only an auditable `[DIFF FILTERED: …]` notice.
 - 🧭 **Conversation Identity Guard (State Machine)**:
   - Conversation URLs are canonicalized (scheme + host + path, query/hash stripped) and tracked as `UNBOUND_ROOT → PINNED(/c/<id>)`. The first concrete `/c/<id>` observed is **pinned permanently**; from then on comparison is strict.
   - This closes the dangerous `/ → /c/A → /c/B` hole: a root URL can never act as a permanent wildcard, and any mid-generation cross-conversation navigation **fails closed** instead of returning another chat's content.
@@ -274,7 +282,7 @@ ask_chatgpt(prompt, timeout: 150)
 
 - **Wait window clamping**: `timeout` defaults to **150s** and is hard-clamped to **165s** for both `ask_chatgpt` and `fetch_chatgpt_response`, staying inside the host watchdog.
 - **Never resubmit**: on `IN_PROGRESS` the prompt is already injected and generating. Call `fetch_chatgpt_response` with the returned credentials—resubmitting the full prompt can overwrite or interleave the in-flight answer.
-- **Resumption credentials**: `expectedTurn` (minimum assistant turn index, prevents turn crossover) and `conversationUrl` (canonicalized conversation identity, prevents tab crossover). Both are optional but strongly recommended when more than one ChatGPT tab is open.
+- **Resumption credentials**: `targetId` (opaque Chrome target identity, always available and preferred), `expectedTurn` (minimum assistant turn index, prevents turn crossover) and `conversationUrl` (canonicalized conversation identity, only returned once a durable `/c/<id>` exists—it is `null` on root/ephemeral identities rather than a fake value). All optional, but strongly recommended when more than one ChatGPT tab is open.
 - **Partial text**: `IN_PROGRESS` responses include the last ~400 characters already captured, so agents can stream progress to the user while waiting.
 - **`safeTimeout` semantics**: the default `safeTimeout: true` returns `IN_PROGRESS` (exit code `0`) rather than throwing on timeout. Set `safeTimeout: false` to get a hard failure instead.
 
@@ -285,7 +293,7 @@ ask_chatgpt(prompt, timeout: 150)
 | Tool | Description | Key Parameters |
 | :--- | :--- | :--- |
 | **`ask_chatgpt`** | Delegates complex reasoning, planning, or review to ChatGPT Web | `prompt` (required): Prompt text<br>`mode`: `ask` / `plan` / `review` / `derive` / `diagnose`<br>`files`: Array of relative file paths to attach<br>`gitDiff`: Boolean to attach real Git diff<br>`diffOffset`: Number (byte offset for diff pagination)<br>`diffMaxBytes`: Number (max bytes per diff page, default 32768)<br>`session`: `reuse` or `new`<br>`timeout`: Max seconds to wait (default 150, hard cap 165)<br>Returns `[STATUS: IN_PROGRESS]` + `expectedTurn` / `conversationUrl` when still generating |
-| **`fetch_chatgpt_response`** | Resumes / polls the latest reply in the bound conversation—no prompt re-injection | `timeout`: Max seconds to wait (default 150, hard cap 165)<br>`expectedTurn`: Minimum assistant turn index (anti-crossover)<br>`conversationUrl`: Expected conversation URL (anti tab-crossover)<br>`workspace`: Optional root path |
+| **`fetch_chatgpt_response`** | Resumes / polls the latest reply in the bound conversation—no prompt re-injection | `timeout`: Max seconds to wait (default 150, hard cap 165)<br>`targetId`: Chrome target identity (opaque, preferred resume credential)<br>`expectedTurn`: Minimum assistant turn index (anti-crossover)<br>`conversationUrl`: Expected conversation URL—durable `/c/<id>` only (anti tab-crossover)<br>`workspace`: Optional root path (must be inside the authorized root) |
 | **`get_git_diff_page`** | Fetches paginated real Git diff slices with strict byte budgets | `workspace`: Optional root path<br>`offset`: Starting byte offset (default 0)<br>`maxBytes`: Max bytes (default 32768, max 65536)<br>`head`: Boolean (default true)<br>`staged`: Boolean (default false)<br>`file`: Optional file path |
 | **`read_review_file`** | Safely reads local code files under path sandbox and budget limits | `path` (required): Relative file path<br>`workspace`: Optional root path<br>`maxBytes`: Max bytes (default 32768) |
 | **`chatgpt_status`** | Probes Chrome CDP 9222 connectivity and workspace readiness | `workspace`: Optional root path |
@@ -298,7 +306,7 @@ ask_chatgpt(prompt, timeout: 150)
 The project includes both an automated cross-platform test suite for continuous integration and an environment verification suite for local setup:
 
 ### 1. Automated CI Test Suite (`npm test`)
-Executed automatically in GitHub Actions on every push and pull request across Ubuntu, Windows, and macOS (Node 22 & 24). **84 adversarial cases** cover path traversal & symlink breakout, secret redaction, egress sanitization, git porcelain parsing, evidence budget ceilings, absolute-deadline exhaustion (zero-borrow), conversation identity pinning (`/ → /c/A → /c/B`), multi-tab precise selection, and MCP parameter pass-through on the real handler chain:
+Executed automatically in GitHub Actions on every push and pull request across Ubuntu, Windows, and macOS (Node 22 & 24). **104 adversarial cases** cover path traversal & symlink breakout, secret redaction, egress sanitization, git porcelain parsing, evidence budget ceilings, absolute-deadline exhaustion (zero-borrow across connect/inject/submit/verify), authorized-workspace enforcement, untracked symlink aliases, per-file Git diff policy, conversation identity pinning (`/ → /c/A → /c/B`), durable resume credentials, multi-tab precise selection, and MCP parameter pass-through on the real handler chain:
 
 ```powershell
 npm test

@@ -14,10 +14,13 @@ import { spawnSync } from 'node:child_process';
 import { resolveSafePath, SecurityError } from '../security/path_guard.mjs';
 import { isSensitivePath, sanitizeContent } from '../security/sensitive.mjs';
 import { loadBrainIgnore } from '../security/ignore.mjs';
+import { authorizeCanonicalFile } from '../security/file_authorizer.mjs';
+import { assertAuthorizedWorkspace } from '../security/authorized_workspace.mjs';
 import { getGitStatus, truncateUtf8ByBytes } from '../git/git_helper.mjs';
 
 const DEFAULT_FILE_MAX_BYTES = 128 * 1024; // 128 KB per file
 const BINARY_CHECK_BYTES = 4096;
+const MAX_SOURCE_FILE_BYTES = 4 * 1024 * 1024;
 
 const LANG_MAP = {
   '.ts': 'typescript', '.tsx': 'tsx', '.js': 'javascript', '.jsx': 'jsx',
@@ -43,7 +46,7 @@ function isBinary(buffer) {
  * @returns {object}
  */
 export function getWorkspaceInfo(workspaceRoot) {
-  const absRoot = path.resolve(workspaceRoot);
+  const absRoot = assertAuthorizedWorkspace(workspaceRoot);
   const ignore = loadBrainIgnore(absRoot);
   const gitInfo = getGitStatus(absRoot);
 
@@ -76,43 +79,12 @@ export function getWorkspaceInfo(workspaceRoot) {
  * @returns {object} { path, content, linesRead, totalLines, truncated }
  */
 export function readFileSafe(workspaceRoot, filePath, options = {}) {
-  const safePath = resolveSafePath(workspaceRoot, filePath);
-  const relPath = path.relative(workspaceRoot, safePath).replace(/\\/g, '/');
-
-  // 符号链接与真实物理路径解析 (防 in-workspace symlink alias 绕过敏感文件与 .brainignore 规则)
-  let canonicalPath = safePath;
-  let canonicalRelPath = relPath;
-  try {
-    canonicalPath = fs.realpathSync(safePath);
-    const realRoot = fs.existsSync(workspaceRoot) ? fs.realpathSync(workspaceRoot) : path.resolve(workspaceRoot);
-    canonicalRelPath = path.relative(realRoot, canonicalPath).replace(/\\/g, '/');
-  } catch (err) {
-    throw new SecurityError(`无法解析文件物理路径: "${relPath}" (${err.message})`, 'E_INVALID_PATH');
-  }
-
-  // 1. 词法路径与真实物理路径双重检查：敏感文件拦截
-  if (isSensitivePath(relPath) || isSensitivePath(canonicalRelPath)) {
-    throw new SecurityError(`安全拦截: 禁止读取敏感文件 "${relPath}"${canonicalRelPath !== relPath ? ` (指向敏感目标 "${canonicalRelPath}")` : ''}`, 'E_SENSITIVE_FILE');
-  }
-
-  // 2. 词法路径与真实物理路径双重检查：.brainignore 规则拦截
-  const ignore = loadBrainIgnore(workspaceRoot);
-  if (ignore.ignores(relPath, false) || ignore.ignores(canonicalRelPath, false)) {
-    throw new SecurityError(`规则拦截: 文件 "${relPath}"${canonicalRelPath !== relPath ? ` (指向忽略目标 "${canonicalRelPath}")` : ''} 匹配 .brainignore`, 'E_IGNORED_FILE');
-  }
-
-  const stat = fs.statSync(canonicalPath);
-  if (!stat.isFile()) {
-    throw new SecurityError(`无法读取非普通文件: "${relPath}"`, stat.isDirectory() ? 'E_IS_DIRECTORY' : 'E_NOT_A_FILE');
-  }
-
-  const MAX_SOURCE_FILE_BYTES = 4 * 1024 * 1024;
-  if (stat.size > MAX_SOURCE_FILE_BYTES) {
-    throw new SecurityError(`安全拦截: 源文件大小 (${stat.size} 字节) 超过单文件读取安全上限 (4MB): "${relPath}"`, 'E_FILE_TOO_LARGE');
-  }
-
   const maxBytes = options.maxBytes || DEFAULT_FILE_MAX_BYTES;
-  const buf = fs.readFileSync(canonicalPath);
+  // 单一文件授权入口：工作区授权 + 词法/realpath 双重 sensitive 与 .brainignore 校验 + 大小上限
+  const authorized = authorizeCanonicalFile(workspaceRoot, filePath, { maxBytes: MAX_SOURCE_FILE_BYTES });
+  const relPath = authorized.relPath;
+
+  const buf = fs.readFileSync(authorized.realPath);
 
   if (isBinary(buf)) {
     throw new SecurityError(`安全拦截: 拒绝读取二进制文件 "${relPath}"`, 'E_BINARY_FILE');
@@ -204,6 +176,8 @@ export function buildAttachmentsBlock(workspaceRoot, files, optionsOrMaxTotalByt
 
 /**
  * 在工作区内执行受控搜索
+ * 两条分支（ripgrep / git grep）都必须同时应用 sensitive 黑名单与 .brainignore，
+ * 并且只能搜索宿主授权的工作区根。
  * @param {string} workspaceRoot
  * @param {string} query
  * @param {object} [options]
@@ -214,13 +188,19 @@ export function searchWorkspace(workspaceRoot, query, options = {}) {
   const maxMatches = options.maxMatches || 50;
   if (!query || typeof query !== 'string') return [];
 
-  const absRoot = path.resolve(workspaceRoot);
+  const absRoot = assertAuthorizedWorkspace(workspaceRoot);
+  const ignore = loadBrainIgnore(absRoot);
 
-  // 优先尝试 ripgrep
+  const isSearchableRel = (rel) => {
+    if (!rel) return false;
+    if (isSensitivePath(rel)) return false;
+    if (ignore.ignores(rel, false)) return false;
+    return true;
+  };
+
+  // 优先尝试 ripgrep（--json 结构化输出，彻底规避 Windows 路径盘符与 ':' 分隔歧义）
   const rgRes = spawnSync('rg', [
-    '--no-heading',
-    '--line-number',
-    '--color=never',
+    '--json',
     '--max-count', String(maxMatches),
     query,
     absRoot,
@@ -228,24 +208,28 @@ export function searchWorkspace(workspaceRoot, query, options = {}) {
 
   if (rgRes.status === 0 && rgRes.stdout) {
     const matches = [];
-    const lines = rgRes.stdout.split('\n').filter(Boolean);
-    for (const line of lines) {
-      const parts = line.split(':');
-      if (parts.length >= 3) {
-        const fullPath = parts[0];
-        const lineNum = Number(parts[1]);
-        const content = parts.slice(2).join(':').trim();
-        const rel = path.relative(absRoot, fullPath).replace(/\\/g, '/');
-        if (isSensitivePath(rel)) continue;
-        matches.push({ file: rel, line: lineNum, text: sanitizeContent(content) });
-        if (matches.length >= maxMatches) break;
+    for (const line of rgRes.stdout.split('\n')) {
+      if (!line.trim()) continue;
+      let payload = null;
+      try {
+        payload = JSON.parse(line);
+      } catch {
+        continue;
       }
+      if (!payload || payload.type !== 'match' || !payload.data) continue;
+      const abs = payload.data.path?.text;
+      if (!abs) continue;
+      const rel = path.relative(absRoot, abs).replace(/\\/g, '/');
+      if (!isSearchableRel(rel)) continue;
+      const content = String(payload.data.lines?.text || '').replace(/\r?\n$/, '').trim();
+      matches.push({ file: rel, line: payload.data.line_number || 0, text: sanitizeContent(content) });
+      if (matches.length >= maxMatches) break;
     }
     return matches;
   }
 
-  // 降级尝试 git grep
-  const gitRes = spawnSync('git', ['-C', absRoot, 'grep', '-n', '-I', query], {
+  // 降级尝试 git grep（输出为仓库相对路径，同样强制应用 brainignore 与敏感规则）
+  const gitRes = spawnSync('git', ['-C', absRoot, 'grep', '-n', '-I', '--no-color', query], {
     encoding: 'utf8',
     shell: false,
   });
@@ -256,10 +240,10 @@ export function searchWorkspace(workspaceRoot, query, options = {}) {
     for (const line of lines) {
       const parts = line.split(':');
       if (parts.length >= 3) {
-        const rel = parts[0];
+        const rel = parts[0].replace(/\\/g, '/');
         const lineNum = Number(parts[1]);
         const content = parts.slice(2).join(':').trim();
-        if (isSensitivePath(rel)) continue;
+        if (!isSearchableRel(rel)) continue;
         matches.push({ file: rel, line: lineNum, text: sanitizeContent(content) });
         if (matches.length >= maxMatches) break;
       }

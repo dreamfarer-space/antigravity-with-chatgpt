@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { runBrainTask, fetchLatestBrainResponse } from '../src/brain/orchestrator.mjs';
 import { MODES } from '../src/brain/prompts.mjs';
 import { checkCdpStatus, findChrome } from '../src/transport/cdp_transport.mjs';
+import { pinAuthorizedWorkspace, assertAuthorizedWorkspace } from '../src/security/authorized_workspace.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -62,6 +63,9 @@ function parseArgs(argv) {
       case '--derive': opts.mode = MODES.DERIVE; break;
       case '--diagnose': opts.mode = MODES.DIAGNOSE; break;
       case '--workspace': opts.workspace = rest[++i]; break;
+      case '--target-id': opts.targetId = rest[++i]; break;
+      case '--conversation-url': opts.conversationUrl = rest[++i]; break;
+      case '--turn': opts.expectedTurn = Number(rest[++i]); break;
       case '--file': opts.file = rest[++i]; break;
       case '--out': opts.out = rest[++i]; break;
       case '--timeout': opts.timeoutS = Number(rest[++i]); break;
@@ -133,6 +137,17 @@ async function main() {
     process.exit(EXIT.OK);
   }
 
+  // 宿主授权根：CLI 操作者（人类 shell）的 cwd 或 CHATGPT_BRAIN_WORKSPACE 即授权根。
+  // --workspace 只允许指向该根或其子目录，避免"调用者自定义沙箱"绕过文件级安全策略。
+  try {
+    pinAuthorizedWorkspace(process.env.CHATGPT_BRAIN_WORKSPACE || process.cwd());
+    opts.workspace = assertAuthorizedWorkspace(path.resolve(opts.workspace || process.cwd()));
+  } catch (err) {
+    process.stderr.write(`[brain-bridge][ERROR] 工作区未获授权: ${err.message}\n`);
+    process.stderr.write('[brain-bridge][HINT] 授权根为当前工作目录；如确需其他目录，请设置 CHATGPT_BRAIN_WORKSPACE。\n');
+    process.exit(EXIT.USAGE);
+  }
+
   if (opts.doctor) {
     return runDoctor();
   }
@@ -142,6 +157,9 @@ async function main() {
       const result = await fetchLatestBrainResponse({
         timeout: opts.timeoutS,
         workspace: opts.workspace,
+        expectedTurn: opts.expectedTurn,
+        conversationUrl: opts.conversationUrl,
+        targetId: opts.targetId,
       });
 
       if (opts.out && result.text) {

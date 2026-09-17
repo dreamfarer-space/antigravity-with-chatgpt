@@ -12,11 +12,69 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { sanitizeContent, isSensitivePath } from '../security/sensitive.mjs';
-import { resolveSafePath } from '../security/path_guard.mjs';
 import { loadBrainIgnore } from '../security/ignore.mjs';
+import { authorizeCanonicalFile } from '../security/file_authorizer.mjs';
+import { assertAuthorizedWorkspace } from '../security/authorized_workspace.mjs';
 
 const DEFAULT_DIFF_MAX_BYTES = 64 * 1024; // 64 KB
 const DEFAULT_UNTRACKED_MAX_BYTES = 32 * 1024; // 32 KB
+const PATHSPEC_CHUNK_SIZE = 200;
+
+/**
+ * 解析 `git diff --name-status -z` 的 NUL 分隔输出
+ * 输出形如：`M\0path\0`、`R100\0old\0new\0`、`C75\0old\0new\0`
+ * @param {string} stdout
+ * @returns {Array<{ status: string, code: string, paths: string[] }>}
+ */
+export function parseNameStatusZ(stdout) {
+  const entries = [];
+  if (typeof stdout !== 'string' || !stdout) return entries;
+
+  const tokens = stdout.split('\0');
+  let i = 0;
+  while (i < tokens.length) {
+    const status = tokens[i++];
+    if (!status) continue;
+    const code = status[0];
+
+    if (code === 'R' || code === 'C') {
+      const from = tokens[i++] || '';
+      const to = tokens[i++] || '';
+      const paths = [from, to].filter(Boolean);
+      if (paths.length) entries.push({ status, code, paths });
+    } else {
+      const p = tokens[i++] || '';
+      if (p) entries.push({ status, code, paths: [p] });
+    }
+  }
+  return entries;
+}
+
+/**
+ * 逐文件应用安全策略：敏感文件（sensitive 黑名单）与 .brainignore 一律不进 diff
+ * rename/copy 需要同时校验 old 与 new 两端（任一端命中即整体排除）
+ * @param {string} workspaceRoot
+ * @param {Array<{ paths: string[] }>} entries
+ * @returns {{ allowed: string[], excluded: string[] }}
+ */
+export function filterDiffEntriesByPolicy(workspaceRoot, entries) {
+  const ignore = loadBrainIgnore(workspaceRoot);
+  const allowed = [];
+  const excluded = [];
+
+  for (const entry of entries || []) {
+    const offending = (entry.paths || []).some((p) => {
+      const rel = String(p).replace(/\\/g, '/');
+      if (!rel) return true;
+      return isSensitivePath(rel) || ignore.ignores(rel, false);
+    });
+
+    if (offending) excluded.push(...(entry.paths || []));
+    else allowed.push(...(entry.paths || []));
+  }
+
+  return { allowed, excluded };
+}
 
 /**
  * 解码 Git C-style 引号包围与转义的 pathname
@@ -262,8 +320,9 @@ export function parseGitStatusOutput(stdout) {
  * @returns {object} { isGitRepo, branch, staged: [], modified: [], unmerged: [], untracked: [], summary }
  */
 export function getGitStatus(workspaceRoot) {
+  const root = assertAuthorizedWorkspace(workspaceRoot);
   try {
-    const branchRes = spawnSync('git', ['-C', workspaceRoot, 'branch', '--show-current'], {
+    const branchRes = spawnSync('git', ['-C', root, 'branch', '--show-current'], {
       encoding: 'utf8',
       shell: false,
     });
@@ -273,7 +332,7 @@ export function getGitStatus(workspaceRoot) {
 
     const branch = (branchRes.stdout || '').trim();
 
-    const statusRes = spawnSync('git', ['-C', workspaceRoot, 'status', '--porcelain=v1', '-z'], {
+    const statusRes = spawnSync('git', ['-C', root, 'status', '--porcelain=v1', '-z'], {
       encoding: 'utf8',
       shell: false,
     });
@@ -306,46 +365,107 @@ export function getGitStatus(workspaceRoot) {
  * @returns {object} { hasDiff, diff, totalBytes, returnedBytes, offset, hasMore, nextOffset, truncated }
  */
 export function getGitDiff(workspaceRoot, options = {}) {
+  const root = assertAuthorizedWorkspace(workspaceRoot);
   const maxBytes = options.maxBytes || DEFAULT_DIFF_MAX_BYTES;
   const offset = Math.max(0, Number(options.offset) || 0);
-  const args = ['-C', workspaceRoot, 'diff'];
 
-  if (options.head) {
-    args.push('HEAD');
-  } else if (options.staged) {
-    args.push('--staged');
+  // 统一使用 --relative：让 name-status 的路径与随后 pathspec 的解析基准一致
+  // （否则子目录工作区下 repo-root 相对路径会被当作 cwd 相对路径而匹配不到任何文件）
+  const listArgs = ['-C', root, 'diff', '--relative', '--name-status', '-z'];
+  if (options.head) listArgs.push('HEAD');
+  else if (options.staged) listArgs.push('--staged');
+  if (options.file) listArgs.push('--', options.file);
+
+  // P1-4：先取文件清单 -> 逐文件安全授权 -> 只对通过授权的文件生成 patch。
+  // 绝不能只依赖 sanitizeContent() 的正则（它无法替代文件级 deny policy）。
+  const listRes = spawnSync('git', listArgs, { encoding: 'utf8', shell: false, maxBuffer: 8 * 1024 * 1024 });
+  if (listRes.status !== 0) {
+    if (options.head) {
+      return getGitDiff(root, { ...options, head: false });
+    }
+    return {
+      hasDiff: false,
+      diff: '',
+      totalBytes: 0,
+      rawTotalBytes: 0,
+      returnedBytes: 0,
+      offset,
+      hasMore: false,
+      nextOffset: null,
+      truncated: false,
+      error: listRes.stderr || 'git diff --name-status failed',
+    };
   }
 
-  if (options.file) {
-    args.push('--', options.file);
+  const entries = parseNameStatusZ(listRes.stdout || '');
+  if (entries.length === 0) {
+    return {
+      hasDiff: false,
+      diff: '',
+      totalBytes: 0,
+      rawTotalBytes: 0,
+      returnedBytes: 0,
+      offset,
+      hasMore: false,
+      nextOffset: null,
+      truncated: false,
+    };
   }
+
+  const { allowed, excluded } = filterDiffEntriesByPolicy(root, entries);
+  const filteredNotice = excluded.length
+    ? `[DIFF FILTERED: ${excluded.length} path(s) excluded by security policy (.brainignore / sensitive-file rules): ${excluded.slice(0, 10).join(', ')}${excluded.length > 10 ? ' …' : ''}]\n`
+    : '';
+
+  if (allowed.length === 0) {
+    // 变更全部被安全策略排除：只回传过滤说明，绝不回传任何被排除文件的内容
+    const noticeBytes = Buffer.byteLength(filteredNotice, 'utf8');
+    const diffText = offset >= noticeBytes ? '' : filteredNotice.slice(offset);
+    return {
+      hasDiff: Boolean(diffText),
+      diff: diffText,
+      totalBytes: noticeBytes,
+      rawTotalBytes: noticeBytes,
+      returnedBytes: Buffer.byteLength(diffText, 'utf8'),
+      offset,
+      hasMore: false,
+      nextOffset: null,
+      truncated: false,
+      filtered: true,
+      excludedPaths: excluded,
+    };
+  }
+
+  const args = ['-C', root, 'diff', '--relative'];
+  if (options.head) args.push('HEAD');
+  else if (options.staged) args.push('--staged');
 
   try {
-    const res = spawnSync('git', args, {
-      encoding: 'utf8',
-      shell: false,
-      maxBuffer: 4 * 1024 * 1024,
-    });
-
-    if (res.status !== 0) {
-      if (options.head) {
-        // HEAD 对比失败（可能尚无初始提交），降级回退普通 diff
-        return getGitDiff(workspaceRoot, { ...options, head: false });
+    let rawDiff = filteredNotice;
+    for (let i = 0; i < allowed.length; i += PATHSPEC_CHUNK_SIZE) {
+      const chunk = allowed.slice(i, i + PATHSPEC_CHUNK_SIZE);
+      const res = spawnSync('git', [...args, '--', ...chunk], {
+        encoding: 'utf8',
+        shell: false,
+        maxBuffer: 4 * 1024 * 1024,
+      });
+      if (res.status !== 0) {
+        return {
+          hasDiff: false,
+          diff: '',
+          totalBytes: 0,
+          rawTotalBytes: 0,
+          returnedBytes: 0,
+          offset,
+          hasMore: false,
+          nextOffset: null,
+          truncated: false,
+          error: res.stderr || 'git diff failed',
+        };
       }
-      return {
-        hasDiff: false,
-        diff: '',
-        totalBytes: 0,
-        returnedBytes: 0,
-        offset,
-        hasMore: false,
-        nextOffset: null,
-        truncated: false,
-        error: res.stderr || 'git diff failed',
-      };
+      rawDiff += res.stdout || '';
     }
 
-    const rawDiff = res.stdout || '';
     if (!rawDiff.trim()) {
       return {
         hasDiff: false,
@@ -455,6 +575,8 @@ export function getGitDiff(workspaceRoot, options = {}) {
       hasMore,
       nextOffset,
       truncated,
+      filtered: excluded.length > 0,
+      excludedPaths: excluded,
     };
   } catch (err) {
     return {
@@ -506,11 +628,6 @@ export function getUntrackedEvidence(workspaceRoot, untrackedFiles = [], maxByte
     return { files: [], content: '', truncated: false };
   }
 
-  let ignoreChecker = null;
-  try {
-    ignoreChecker = loadBrainIgnore(workspaceRoot);
-  } catch {}
-
   let accumulated = 0;
   let truncated = false;
   const blocks = [];
@@ -522,17 +639,14 @@ export function getUntrackedEvidence(workspaceRoot, untrackedFiles = [], maxByte
       break;
     }
 
-    if (isSensitivePath(rel)) continue;
-    if (ignoreChecker && ignoreChecker.ignores(rel)) continue;
-
     try {
-      const full = resolveSafePath(workspaceRoot, rel);
-      const stat = fs.statSync(full);
-      if (!stat.isFile() || stat.size === 0) continue;
-      // 忽略过大的单个文件 (> 256 KB)
-      if (stat.size > 256 * 1024) continue;
+      // 单一文件授权入口：工作区授权 + 词法/realpath 双重 sensitive 与 .brainignore 校验。
+      // 曾经这里只在 lexical 名称上做 isSensitivePath/ignore 判断，随后 statSync/readFileSync
+      // 会跟随 symlink，导致 `debug.txt -> .env` 这类别名旁路（见 P1-3）。
+      const authorized = authorizeCanonicalFile(workspaceRoot, rel, { maxBytes: 256 * 1024 });
+      if (authorized.size === 0) continue;
 
-      const raw = fs.readFileSync(full, 'utf8');
+      const raw = fs.readFileSync(authorized.realPath, 'utf8');
       // 简单二元探测（含 NUL 字符通常为二进制）
       if (raw.includes('\0')) continue;
 
