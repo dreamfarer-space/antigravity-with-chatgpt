@@ -112,15 +112,19 @@ node "D:\ChatGPT-Brain-Bridge\gemini-skill\antigravity-with-chatgpt\scripts\make
 
 ### 方式 1：Antigravity 2.0 原生 MCP 工具（推荐）
 
-在 `~/.gemini/config/mcp_config.json` 中配置完成后，Antigravity Agent 原生拥有以下 3 个 MCP 工具：
+在 `~/.gemini/config/mcp_config.json` 中配置完成后，Antigravity Agent 原生拥有以下 MCP 工具：
 
 - **`ask_chatgpt`**: 直接向 ChatGPT 发起智能体推理任务
   - `prompt`: 提示词或任务目标（必填）
   - `mode`: `"ask"`（通用问答，默认）| `"plan"`（架构与任务规划）| `"review"`（闭环独立审查，自动抓取真实 Git Diff 与测试记录）| `"derive"`（纯算法/数学推导）| `"diagnose"`（故障根因排查）
   - `session`: `"reuse"`（继续当前会话，默认）或 `"new"`（开启全新会话）
-  - `files`: 需要作为证据一起发送的代码文件路径列表（可选，自动进行防逃逸与脱敏）
+  - `files`: 需要作为证据一起发送的代码文件路径列表（多文件采用阶梯切片预算保护，防超长膨胀）
   - `gitDiff`: 布尔值，是否注入工作区真实的 Git Diff（review / diagnose 模式默认自动开启）
-  - `timeout`: 最长等待时间（秒，默认 600）
+  - `timeout`: 单次等待最长超时时间（秒，默认 150，上限 165，受 MCP 客户端 3 分钟熔断主动防护）
+- **`fetch_chatgpt_response`**: 抓取当前 ChatGPT 正在生成或最新生成的长回复
+  - `timeout`: 等待超时（秒，默认 150，上限 165）
+  - `workspace`: 可选的工作区根目录
+  - 用于在上一轮提问由于生成耗时较长（返回 `IN_PROGRESS`）后拉取最终回复，无需重新注入 Prompt
 - **`record_execution`**: 记录本地命令或测试执行事实
   - `command`: 运行的命令（如 `npm test`）
   - `exitCode`: 退出码
@@ -199,14 +203,27 @@ node "D:\ChatGPT-Brain-Bridge\gemini-skill\antigravity-with-chatgpt\scripts\ask_
 node "D:\ChatGPT-Brain-Bridge\gemini-skill\antigravity-with-chatgpt\scripts\ask_chatgpt.mjs" --new --file prompt.md
 ```
 
+#### 模式 E：抓取长回复（--fetch / --poll）
+
+上一轮返回 `[IN_PROGRESS]`，或想在**不重发 Prompt** 的前提下取回正在生成/最新的回复：
+
+```cmd
+node "D:\ChatGPT-Brain-Bridge\gemini-skill\antigravity-with-chatgpt\scripts\ask_chatgpt.mjs" --fetch
+node "D:\ChatGPT-Brain-Bridge\gemini-skill\antigravity-with-chatgpt\scripts\ask_chatgpt.mjs" --fetch --timeout 150 --out answer.md
+node "D:\ChatGPT-Brain-Bridge\gemini-skill\antigravity-with-chatgpt\scripts\ask_chatgpt.mjs" --fetch --json
+```
+
+仍未见定稿时会再次打印 `[IN_PROGRESS]`，循环调用即可；`--json` 下可用 `inProgress` 字段判断。
+
 ### 诊断
 
 ```cmd
 node "D:\ChatGPT-Brain-Bridge\gemini-skill\antigravity-with-chatgpt\scripts\ask_chatgpt.mjs" --doctor
 ```
 
-`--doctor` 会逐项检查 Node 版本、全局 WebSocket/fetch、目录、chrome.exe、CDP 9222、
-ChatGPT 页面、输入框 / 发送按钮 / 停止按钮 / Assistant 节点的选择器命中情况，以及登录状态。
+`--doctor` 会检查 Node 版本、全局 WebSocket/fetch、chrome.exe、CDP 9222 与当前 ChatGPT 标签页 URL。
+> 注：选择器命中情况（输入框 / 发送按钮 / 停止按钮 / Assistant 节点）与未登录标志
+> 目前只在**运行期的 stderr 日志**中出现，`--doctor` 尚未汇总展示这些细节。
 
 ### 安装自检（部署/排障时用）
 
@@ -224,14 +241,17 @@ CDP 9222；加 `--run-test` 会额外跑一次真实联通测试。
 
 | 通道 | 内容 |
 | --- | --- |
-| **stdout** | 正常成功时**只有** ChatGPT 的最终回复文本 |
+| **stdout** | 正常成功时**只有** ChatGPT 的最终回复文本（含超时降级时的 `[IN_PROGRESS] ...` 提示块） |
 | **stderr** | 所有日志、警告、诊断、错误 |
-| **exit 0** | 成功 |
+| **exit 0** | 成功（含「仍在生成中」的 `[IN_PROGRESS]` 优雅返回） |
 | **exit 2** | 用法 / 配置错误（含 Node 版本过低） |
-| **exit 3** | CDP / 页面 / 选择器问题 |
-| **exit 4** | 需要用户手动登录 |
-| **exit 5** | 等待回复超时 |
+| **exit 3** | CDP / 页面 / 选择器 / 提交收据 / 登录态等运行期错误 |
 | **exit 6** | 文件问题（不存在 / 二进制 / 过大） |
+
+> **注意（与旧版文档的差异）**：当前实现**只产生 0 / 2 / 3 / 6 四种退出码** —— 代码中不存在 exit 4 / exit 5。
+> 等待超时**不再**以非零码退出，而是由 `safeTimeout` 优雅降级为 `exit 0` + `[IN_PROGRESS]`；
+> 登录失效、选择器失效等一律收敛到 `exit 3`（stderr 会有具体原因）。
+> 需要程序化区分这两种场景时，请读 `--json` 的 `inProgress` 字段与 stderr 文案，**不要依赖退出码**。
 
 因此本地 Agent 可以直接这样捕获结果：
 
@@ -241,6 +261,44 @@ node ask_chatgpt.mjs "..." > answer.md
 
 `--json` 会输出 `{ "ok": true, "text": "...", "url": "...", "elapsedMs": N }`，便于程序化解析。
 `--out <path>` 可额外把结果落盘。
+
+### 长回复轮询协议（IN_PROGRESS → --fetch / fetch_chatgpt_response）
+
+长思考回合很容易撞上 MCP 宿主的单次调用熔断线（Antigravity 对工具调用实施 **3 分钟强杀**）。
+因此**等待超时不再报错**，而是变成一次"可续拉"的中间状态：
+
+```text
+ask_chatgpt(prompt, timeout=150)
+   │
+   ├─ 时限内生成完毕 ─────────────► 最终回复文本（exit 0）
+   │
+   └─ 到点仍在流式生成 ───────────► [STATUS: IN_PROGRESS]（仍 exit 0）
+                                     + expectedTurn
+                                     + conversationUrl
+                                     + 已捕获的最后 ~400 字符
+                                            │
+                      fetch_chatgpt_response ◄┘（循环调用直到文本稳定）
+```
+
+**本地 Agent 必须遵守的两条规则：**
+
+1. **看到 `IN_PROGRESS` 绝不重发 Prompt** —— 此时 Prompt 已注入且正在生成，重发会覆盖或打乱进行中的回复；
+2. **续拉时带上凭证** —— `expectedTurn`（最小助手回合数，防轮次串线）与 `conversationUrl`（会话身份，防标签串线）。
+
+| 通道 | 写法 |
+| --- | --- |
+| MCP | `fetch_chatgpt_response({ expectedTurn, conversationUrl, timeout: 150 })` |
+| CLI | `ask_chatgpt.mjs --fetch`（等价 `--poll`），可配 `--json` / `--out` |
+
+其他约束：
+
+- `timeout` 在 MCP 路径被**硬性夹逼**到 `[5, 165]` 秒，默认 150 秒；CLI 路径默认 600 秒（不受宿主熔断约束）；
+- **同一条绝对 deadline 贯穿全链路**：deadline 在 MCP 边界锚定 → `runBrainTask` → `sendPromptViaCdp` / `fetchLatestResponse` → Chrome 就绪 / CDP 连接 / 探针 / 静默窗口 / 文本读取。任何一层都**不得**重新锚定相对超时，也**不得**用 `Math.max()` 制造额外时间；预算耗尽后一个 CDP 调用都不会再发出（这是代码级不变量，有回归用例守着）；
+- `safeTimeout: false`（仅 API/CLI 层面可用）会恢复"超时即硬失败"的旧行为；
+- **会话身份状态机**：`UNBOUND_ROOT → PINNED(/c/<id>)`。首次观测到具体会话即**永久锁定**，此后严格比较 —— 根路径 `/` 不能当永久通行证，`/ → /c/A → /c/B` 会在读取文本前 fail-closed；
+- **临时身份不算身份**：新会话提交后 SPA 会短暂停留在客户端临时地址 `/c/WEB:<uuid>`，之后才换成服务端 `/c/<uuid>`。该形态**不参与锁定、也不能当恢复凭证**，因此"临时 → 真实"的跃迁是正常流程，不会被误判为劫持（这一条是实机踩出来的，mock 测不出）；
+- **恢复凭证会升级**：从 `/` 或临时身份发起的提问，返回的 `conversationUrl` 是具体 `/c/<服务端 uuid>`；
+- **多标签精确匹配**：带 `conversationUrl` 续拉时按规范化会话身份精确选标签；匹配不到直接 fail-closed（报 `未找到与目标会话匹配的 ChatGPT 标签页`），绝不退回"第一个 ChatGPT 标签"；根路径/临时身份凭证不具备可比性，自动退化为绑定标签语义。
 
 ### 项目锁定
 
@@ -468,11 +526,20 @@ Desktop 快捷方式 **`ChatGPT (AI智脑)`** 打开的专用 Chrome 如果尚�
 
 **绝对不要尝试自动填写**用户名、密码、验证码、2FA。
 
-> **注意**：ChatGPT **未登录时的首页同样有可用的输入框和发送按钮**，
-> 所以"输入框存在"≠"已登录"。脚本会在发送前检查未登录标志
-> （`login-button`、`Log in` / `Sign up` 文案元素），并在发送后持续监听是否被
-> 重定向到 `accounts.google.com` / `auth.openai.com` 等身份提供方；
-> 一旦命中立刻以 exit 4 停止并给出登录指引，不会傻等到超时。
+> **⚠️ 现状说明（务必按此判断，勿信旧版描述）**：脚本**没有**独立的"登录态检测 → exit 4"分支。
+> 未登录或登录失效时的实际表现是：输入框定位持续失败 → 以 **exit 3** 报
+> `等待 ChatGPT 输入框加载稳定超时`（stderr 会打印探针结果）。
+> 此时的处理方式是**人工介入**：
+>
+> 1. 双击桌面 `ChatGPT (Antigravity智脑)` 打开专用 Chrome；
+> 2. 手动登录你的 ChatGPT 账号（脚本绝不代填任何凭证）；
+> 3. 登录完成后不要关闭窗口，回到 Agent 侧重跑一次即可。
+>
+> 探针里已经采集了未登录标志（`login-button`、`Log in` / `Sign up` 文案元素），
+> 但**仅用于诊断输出**，不参与流程阻断 —— 因为 ChatGPT 未登录首页同样有输入框，
+> 这些选择器在正常登录态下也可能命中，据此硬拦会产生误报。
+> 同理，"重定向到 `accounts.google.com` / `auth.openai.com` 即中止"也尚未实现；
+> 会话身份校验只覆盖"是否仍是同一个 ChatGPT 会话"，不覆盖身份提供方跳转。
 >
 > 另外，如果专用 Chrome 里已经有一个停留在登录页的标签，脚本**不会再开新标签**，
 > 而是直接提示你去那个窗口完成登录。
@@ -536,11 +603,12 @@ D:\ChatGPT-Brain-Bridge\chrome-profile
 
 | 现象 | 先做什么 |
 | --- | --- |
-| `exit 4` / 提示登录 | 双击桌面 `ChatGPT (AI智脑)`，手动登录后重跑 |
+| 未登录 / 登录失效（`exit 3` + 输入框定位超时） | 双击桌面 `ChatGPT (Antigravity智脑)`，手动登录后重跑 |
 | `exit 3` 等不到 CDP | `netstat -ano \| findstr :9222`；手动跑快捷方式看 Chrome 是否弹窗 |
 | `exit 3` 输入框未命中 | `--doctor`，看输入框/发送按钮选择器命中情况（ChatGPT 改版） |
 | `exit 3` 插入后仍为空 | 同上；确认 `#prompt-textarea` 是否存在，必要时更新选择器表 |
-| `exit 5` 超时 | 加大 `--timeout 1200`；看 stderr 里的超时诊断与部分内容 |
+| stdout 出现 `[IN_PROGRESS]` | 正常现象（长回复到点未生成完），**不要重发 Prompt**，改跑 `--fetch` 或 `fetch_chatgpt_response` 续拉 |
+| 续拉报会话身份校验失败 | 标签页被切走了；用返回的 `conversationUrl` 重新绑定，或 `--new` 重开一轮 |
 | `exit 6` 附带文件被拒 | 该文件是二进制/媒体/压缩/数据库，或超过 256 KB 上限 |
 
 脚本使用 `Input.insertText` 一次性输入全文（**不逐字符模拟键盘**），
@@ -556,7 +624,8 @@ D:\ChatGPT-Brain-Bridge\chrome-profile
 2. Assistant 文本非空；
 3. 最后一条 Assistant 回复连续 3 次读取内容完全一致（每次间隔 800~1500 ms）。
 
-总超时默认 600 秒（10 分钟），可用 `--timeout` 调整。
+CLI 总超时默认 600 秒（10 分钟），可用 `--timeout` 调整。
+到点仍未生成完时**不会失败**，而是输出 `[IN_PROGRESS] ...` 并以 `exit 0` 结束，之后用 `--fetch` 续拉。
 
 ---
 
@@ -564,10 +633,11 @@ D:\ChatGPT-Brain-Bridge\chrome-profile
 
 ```
 --new                新建会话（仅导航到首页/锁定项目，不删除任何历史）
---attach <files..>   附带本地源码文件（自动识别语言、拒绝二进制）
+--attach <files..>   附带本地源码文件（多文件梯度切片预算、自动识别语言、拒绝二进制）
 --file <path>        从文件读取完整提示词（绕过命令行长度限制）
+--fetch              抓取当前页面正在生成或最新的回复（无需重发 Prompt，别名 --poll）
 --url <url>          本次锁定到指定 ChatGPT 项目/页面 URL
---timeout <seconds>  总超时，默认 600
+--timeout <seconds>  总超时，CLI 默认 600；MCP 路径默认 150 且硬性夹逼上限 165
 --out <path>         额外把结果写入文件
 --json               以 JSON 输出结果
 --debug              打印调试日志到 stderr

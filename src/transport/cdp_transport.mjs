@@ -13,7 +13,53 @@ import os from 'node:os';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
 import { computeFingerprint, BROWSER_FINGERPRINT_SNIPPET } from './fingerprint.mjs';
-import { selectTargetPage } from './target_selector.mjs';
+import {
+  selectTargetPage,
+  canonicalizeConversationUrl,
+  conversationPathname,
+  isRootConversation,
+  isEphemeralConversation,
+  isPinnableConversation,
+  isSameConversation,
+  isSameConversationStrict,
+} from './target_selector.mjs';
+
+// 会话身份工具同时对外暴露（历史 API 兼容，测试与上层均从此模块导入）
+export { canonicalizeConversationUrl, isRootConversation, isEphemeralConversation, isPinnableConversation, isSameConversation, isSameConversationStrict };
+
+/**
+ * 端到端共享的绝对截止时间安全边界。
+ * 所有等待（CDP 连接、DOM 探测、静默窗口、文本读取）都必须来自同一条 deadlineMs 预算，
+ * 任何一步都不得用 Math.max(x, ...) 人为制造"额外时间"。
+ */
+export const DEFAULT_SAFETY_MARGIN_MS = 5000;
+
+/**
+ * 计算某一步实际可用的剩余预算（毫秒）；返回值 <= 0 表示预算已耗尽，调用方必须立刻收尾。
+ * @param {number} deadlineMs 绝对截止时间戳
+ * @param {number} capMs 单步上限
+ * @param {number} [marginMs=0] 预留安全边际
+ * @returns {number}
+ */
+export function remainingBudgetMs(deadlineMs, capMs, marginMs = 0) {
+  if (typeof deadlineMs !== 'number' || !Number.isFinite(deadlineMs)) return capMs;
+  return Math.max(0, Math.min(capMs, deadlineMs - Date.now() - marginMs));
+}
+
+/** 构造统一的 inProgress（优雅降级）结果，恢复凭证必须带上已锁定的具体会话身份 */
+function buildInProgressResult({ text = '', turns = 0, expectedTurn, url = null, conversationUrl = null, isStreaming = false, message = '' } = {}) {
+  return {
+    ok: true,
+    inProgress: true,
+    isStreaming: Boolean(isStreaming),
+    text: text || '',
+    turns: typeof turns === 'number' ? turns : 0,
+    expectedTurn,
+    url,
+    conversationUrl: conversationUrl || url || null,
+    message,
+  };
+}
 
 function resolveProfileDir() {
   if (process.env.CHATGPT_BRAIN_PROFILE_DIR) {
@@ -76,15 +122,15 @@ export function findChrome() {
 
 const COMPOSER_SELECTORS = [
   '#prompt-textarea',
-  'div.ProseMirror[contenteditable="true"]',
-  'form [contenteditable="true"]',
-  '[contenteditable="true"][translate="no"]',
-  '[contenteditable="true"][data-lexical-editor="true"]',
-  'div[contenteditable="true"][id^="prompt"]',
+  'div[contenteditable="true"]#prompt-textarea',
+  'textarea#prompt-textarea',
+  'div#prompt-textarea',
+  'div.ProseMirror[contenteditable="true"]#prompt-textarea',
+  'div[contenteditable="true"][data-placeholder]',
+  'textarea[data-id="root"]',
   'main form textarea',
   'form textarea',
-  'textarea#prompt-textarea',
-  'main [contenteditable="true"]',
+  'main form [contenteditable="true"]',
 ];
 
 const SEND_BUTTON_SELECTORS = [
@@ -129,12 +175,14 @@ const LOGIN_HINT_SELECTORS = [
 
 const PRELUDE = `
   const isVisible = (el) => {
-    if (!el) return false;
+    if (!el || !el.isConnected) return false;
     try {
-      const r = el.getBoundingClientRect();
-      if (r.width <= 0 || r.height <= 0) return false;
+      if (typeof el.checkVisibility === 'function') {
+        return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+      }
       const s = getComputedStyle(el);
-      return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+      if (s.visibility === 'hidden' || s.display === 'none' || s.opacity === '0') return false;
+      return (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
     } catch (e) { return false; }
   };
   const pickVisible = (selectors) => {
@@ -153,13 +201,14 @@ const PRELUDE = `
     for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
     return h;
   };
-  const textOfTurn = (el) => {
+  const textOfTurn = (el, fast = false) => {
     if (!el) return '';
     let target = el;
     try {
       const md = el.querySelector('.markdown, .prose, [class*="markdown"]');
       if (md) target = md;
     } catch (e) {}
+    if (fast) return (target.textContent || '').trim();
     return ((target.innerText || target.textContent || '') + '').trim();
   };
   const extractComposerText = (el) => {
@@ -184,7 +233,7 @@ const PRELUDE = `
 `;
 
 const PROBE_JS = `(() => {
-${PRELUDE}
+  ${PRELUDE}
   const COMPOSER = ${JSON.stringify(COMPOSER_SELECTORS)};
   const SEND = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
   const STOP = ${JSON.stringify(STOP_BUTTON_SELECTORS)};
@@ -199,13 +248,19 @@ ${PRELUDE}
   for (let i = 0; i < ASSIST.length; i++) {
     let nodes = [];
     try { nodes = Array.prototype.slice.call(document.querySelectorAll(ASSIST[i])); } catch (e) { continue; }
-    const vis = nodes.filter(isVisible);
-    if (vis.length) { turn = { el: vis[vis.length - 1], sel: ASSIST[i], count: vis.length }; break; }
+    if (!nodes.length) continue;
+    for (let j = nodes.length - 1; j >= 0; j--) {
+      if (isVisible(nodes[j])) {
+        turn = { el: nodes[j], sel: ASSIST[i], count: nodes.length };
+        break;
+      }
+    }
+    if (turn) break;
   }
 
   let lastText = '';
   let turnCount = 0;
-  if (turn) { lastText = textOfTurn(turn.el); turnCount = turn.count; }
+  if (turn) { lastText = textOfTurn(turn.el, true); turnCount = turn.count; }
 
   let loginSignals = [];
   for (let i = 0; i < LOGIN.length; i++) {
@@ -222,7 +277,7 @@ ${PRELUDE}
 
   let userCount = 0;
   try {
-    const us = Array.prototype.slice.call(document.querySelectorAll('[data-message-author-role="user"]')).filter(isVisible);
+    const us = Array.prototype.slice.call(document.querySelectorAll('[data-message-author-role="user"]'));
     userCount = us.length;
   } catch (e) {}
 
@@ -401,7 +456,7 @@ export async function checkCdpStatus() {
   }
 }
 
-async function ensureCdpReady(chromeExe) {
+async function ensureCdpReady(chromeExe, deadlineMs = null) {
   const status = await checkCdpStatus();
   if (status.running) return;
 
@@ -412,16 +467,25 @@ async function ensureCdpReady(chromeExe) {
     `--remote-debugging-port=${DEBUG_PORT}`,
     `--remote-debugging-address=${DEBUG_HOST}`,
     '--remote-allow-origins=*',
-    process.platform === 'win32' ? `--user-data-dir="${PROFILE_DIR}"` : `--user-data-dir=${PROFILE_DIR}`,
+    `--user-data-dir=${PROFILE_DIR}`,
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--no-first-run',
+    '--no-default-browser-check',
     DEFAULT_TARGET_URL,
   ];
 
-  const child = process.platform === 'win32'
-    ? spawn('cmd.exe', ['/c', 'start', '""', `"${chromeExe}"`, ...args], { detached: true, stdio: 'ignore' })
-    : spawn(chromeExe, args, { detached: true, stdio: 'ignore' });
+  // 启动等待必须受总 deadline 约束：绝不无条件等待 45s
+  const waitCap = remainingBudgetMs(deadlineMs, 45000);
+  if (waitCap <= 0) {
+    throw new Error('总截止时间预算已耗尽（在启动/等待专用 Chrome 之前），已中止以防突破宿主超时');
+  }
+
+  const child = spawn(chromeExe, args, { detached: true, stdio: 'ignore' });
   child.unref();
 
-  const deadline = Date.now() + 45000;
+  const deadline = Date.now() + waitCap;
   while (Date.now() < deadline) {
     await sleep(600);
     const s = await checkCdpStatus();
@@ -447,13 +511,16 @@ export function resetBoundTargetId() {
   boundTargetId = null;
 }
 
-export async function resolveTarget(preferredId = null, allowRebind = false) {
+export async function resolveTarget(preferredId = null, allowRebind = false, extra = {}) {
   const list = await fetch(`${HTTP_BASE}/json/list`).then((r) => r.json());
-  const selection = selectTargetPage(list, boundTargetId, { preferredId, allowRebind });
+  const selection = selectTargetPage(list, boundTargetId, {
+    preferredId,
+    allowRebind,
+    conversationUrl: extra && extra.conversationUrl ? extra.conversationUrl : null,
+  });
   if (selection.target) {
-    if (selection.isNewBinding) {
-      boundTargetId = selection.target.id;
-    }
+    boundTargetId = selection.target.id;
+    await fetch(`${HTTP_BASE}/json/activate/${boundTargetId}`).catch(() => {});
     return selection.target;
   }
 
@@ -466,6 +533,7 @@ export async function resolveTarget(preferredId = null, allowRebind = false) {
         const created = await res.json();
         if (created.webSocketDebuggerUrl) {
           boundTargetId = created.id;
+          await fetch(`${HTTP_BASE}/json/activate/${boundTargetId}`).catch(() => {});
           return created;
         }
       }
@@ -528,25 +596,22 @@ export async function clearComposer(cdp) {
       return true;
     }
 
-    const sel = window.getSelection();
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    sel.removeAllRanges();
-    sel.addRange(range);
-    document.execCommand('insertText', false, '');
-    if ((el.innerText || el.textContent || '').trim().length > 0) {
-      el.innerHTML = '';
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-    }
+    try {
+      document.execCommand('selectAll', false, null);
+      document.execCommand('delete', false, null);
+    } catch {}
+    el.innerHTML = '<p><br></p>';
+    el.dispatchEvent(new Event('input', { bubbles: true }));
     return true;
-  })()`, 15000);
+  })()`, 10000).catch(() => {});
 }
 
 export async function insertTextReliable(cdp, text) {
-  const bytes = Buffer.byteLength(text, 'utf8');
-  const expected = computeFingerprint(text);
-  const timeoutMs = getInjectionTimeout(text);
-  const b64 = Buffer.from(text, 'utf8').toString('base64');
+  const normalizedText = typeof text === 'string' ? text.replace(/\r\n/g, '\n') : '';
+  const bytes = Buffer.byteLength(normalizedText, 'utf8');
+  const expected = computeFingerprint(normalizedText);
+  const timeoutMs = getInjectionTimeout(normalizedText);
+  const b64 = Buffer.from(normalizedText, 'utf8').toString('base64');
 
   let timedOut = false;
   let verifiedAfterTimeout = false;
@@ -583,20 +648,25 @@ export async function insertTextReliable(cdp, text) {
         return { ok: true, length: fp.length, hash: fp.hash, isTextarea: true };
       }
 
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(el);
-      range.collapse(false);
-      sel.removeAllRanges();
-      sel.addRange(range);
+      try {
+        document.execCommand('selectAll', false, null);
+        document.execCommand('insertText', false, str);
+      } catch {}
 
-      document.execCommand('insertText', false, str);
       let content = extractComposerText(el);
-      if (content.length === 0) {
-        el.textContent = str;
+      if (content.length === 0 || !content.includes(str.slice(0, 30))) {
+        const p = document.createElement('p');
+        p.textContent = str;
+        el.innerHTML = '';
+        el.appendChild(p);
         el.dispatchEvent(new Event('input', { bubbles: true }));
         content = extractComposerText(el);
       }
+      try {
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: str }));
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      } catch {}
       const fp = computeFingerprint(content);
       return { ok: true, length: fp.length, hash: fp.hash, isTextarea: false };
     })()`, attemptTimeoutMs);
@@ -757,19 +827,18 @@ export async function submitMessageReliable(cdp, options = {}) {
   })()`;
 
   let clickRes = null;
-  const deadline = Date.now() + 3000;
+  const deadline = Date.now() + 4000;
   while (Date.now() < deadline) {
     try {
       clickRes = await evaluate(cdp, clickProbeScript, 3000);
-      if (clickRes && (clickRes.action === 'CLICKED' || clickRes.action === 'DISABLED')) {
+      if (clickRes && clickRes.action === 'CLICKED') {
         break;
       }
     } catch (err) {
-      // evaluate 异常：无法确认 click 是否已在页面发生，标记为 CLICK_UNKNOWN
       clickRes = { action: 'CLICK_UNKNOWN', error: err.message };
       break;
     }
-    await sleep(200);
+    await sleep(250);
   }
 
   let enterDispatched = false;
@@ -876,14 +945,16 @@ async function waitForComposer(cdp, deadlineMs = 30000) {
   let hits = 0;
   while (Date.now() < deadline) {
     try {
-      const p = await evaluate(cdp, PROBE_JS, 4000);
+      const p = await evaluate(cdp, PROBE_JS, 12000);
       if (p && p.composer && p.composer.found) {
         hits++;
         if (hits >= 2) return p;
       } else {
         hits = 0;
       }
-    } catch {}
+    } catch (err) {
+      warn('waitForComposer probe error:', err.message);
+    }
     await sleep(600);
   }
   throw new Error('等待 ChatGPT 输入框加载稳定超时');
@@ -913,34 +984,339 @@ class AsyncMutex {
 
 const cdpMutex = new AsyncMutex();
 
-export async function sendPromptViaCdp(options) {
-  return cdpMutex.runExclusive(() => _sendPromptViaCdpInternal(options));
+export async function waitForStreamingCompletion(cdp, options = {}) {
+  const deadlineMs = typeof options.deadlineMs === 'number'
+    ? options.deadlineMs
+    : (Date.now() + (typeof options.timeoutMs === 'number' ? options.timeoutMs : 150000));
+  const beforeTurns = typeof options.beforeTurns === 'number' ? options.beforeTurns : 0;
+  const expectedTurn = options.expectedTurn;
+  const targetUrl = options.targetUrl || DEFAULT_TARGET_URL;
+  const expectedConversationUrl = options.expectedConversationUrl || null;
+  const safeTimeout = options.safeTimeout !== false;
+
+  const SAFETY_MARGIN_MS = DEFAULT_SAFETY_MARGIN_MS;
+  let lastHash = 0;
+  let lastLen = 0;
+  let stableHits = 0;
+  const minRequiredTurns = typeof expectedTurn === 'number' ? expectedTurn : (beforeTurns + 1);
+
+  // -------------------------------------------------------------------------
+  // 会话身份状态机：UNBOUND_ROOT --(首次观测到具体 /c/<id>)--> PINNED(/c/<id>)
+  // 一旦锁定，之后一律严格比较（`/` 不再兼容任何会话），彻底封死
+  // `/ → /c/A → /c/B` 的 wildcard 漏判。
+  // 注意：新会话提交后 SPA 会短暂停留在客户端临时身份 `/c/WEB:<uuid>`，
+  // 该形态没有持久身份，既不参与锁定，也不能当作恢复凭证。
+  // -------------------------------------------------------------------------
+  let pinnedConversationUrl = isPinnableConversation(expectedConversationUrl)
+    ? canonicalizeConversationUrl(expectedConversationUrl)
+    : null;
+
+  const observeIdentity = (currentUrl) => {
+    if (!currentUrl || typeof currentUrl !== 'string') return;
+    if (pinnedConversationUrl) {
+      if (!isSameConversationStrict(currentUrl, pinnedConversationUrl)) {
+        throw new Error(
+          `会话身份校验失败: 已锁定会话为 ${pinnedConversationUrl}，但页面当前为 ${canonicalizeConversationUrl(currentUrl)}`
+        );
+      }
+      return;
+    }
+    if (isPinnableConversation(currentUrl)) {
+      // 首次观测到具体会话 → 立刻升级锁定，并作为恢复凭证向上返回
+      pinnedConversationUrl = canonicalizeConversationUrl(currentUrl);
+    }
+  };
+
+  // 恢复凭证：优先返回已锁定的具体身份；未锁定（仍处于 root/临时身份）时退回真实 URL
+  const identityUrl = () => pinnedConversationUrl || canonicalizeConversationUrl(targetUrl) || targetUrl;
+  const stepBudget = (capMs, marginMs = 0) => remainingBudgetMs(deadlineMs, capMs, marginMs);
+
+  while (stepBudget(1, SAFETY_MARGIN_MS) > 0) {
+    const probeTimeout = stepBudget(5000, SAFETY_MARGIN_MS);
+    if (probeTimeout <= 0) break;
+
+    const p = await evaluate(cdp, PROBE_JS, probeTimeout).catch(() => null);
+    if (!p) {
+      await sleep(400);
+      continue;
+    }
+
+    // 每轮都观测一次身份（涵盖 root → /c/<id> 的 SPA 跃迁锁定）
+    observeIdentity(p.url);
+
+    const isStreaming = Boolean(p.stopButton && p.stopButton.found);
+
+    if (!isStreaming && p.assistant && p.assistant.count >= minRequiredTurns && p.assistant.len > 0) {
+      if (p.assistant.hash === lastHash && p.assistant.len === lastLen) {
+        stableHits++;
+      } else {
+        lastHash = p.assistant.hash;
+        lastLen = p.assistant.len;
+        stableHits = 0;
+      }
+
+      if (stableHits >= 2) {
+        const quietBudget = stepBudget(2500, SAFETY_MARGIN_MS);
+        if (quietBudget <= 0) break;
+        const quietTimeout = Math.max(100, quietBudget);
+
+        const quiet = await evaluate(cdp, `new Promise((resolve) => {
+          let t = setTimeout(() => resolve(true), 350);
+          const obs = new MutationObserver(() => {
+            clearTimeout(t);
+            t = setTimeout(() => { obs.disconnect(); resolve(true); }, 350);
+          });
+          obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+          setTimeout(() => { obs.disconnect(); resolve(false); }, ${quietTimeout});
+        })`, { timeoutMs: quietTimeout + 500, awaitPromise: true }).catch(() => false);
+
+        if (quiet) {
+          // 返回文本前再次读取 live location.href：既做 TOCTOU 拦截，也完成身份升级锁定
+          const hrefBudget = stepBudget(2000, SAFETY_MARGIN_MS);
+          if (hrefBudget <= 0) break;
+          const liveHref = await evaluate(cdp, 'location.href', hrefBudget).catch(() => '');
+          if (liveHref) observeIdentity(liveHref);
+
+          const fetchBudget = stepBudget(10000, SAFETY_MARGIN_MS);
+          if (fetchBudget <= 0) break;
+          const text = await evaluate(cdp, GET_LAST_TEXT_JS, fetchBudget).catch(() => '');
+          if (text && text.trim()) {
+            const finalUrl = identityUrl();
+            return {
+              ok: true,
+              inProgress: false,
+              text: text.trim(),
+              url: finalUrl,
+              conversationUrl: finalUrl,
+              turns: p.assistant.count,
+            };
+          }
+        }
+      }
+    } else {
+      stableHits = 0;
+    }
+
+    await sleep(400);
+  }
+
+  // -------------------------------------------------------------------------
+  // 收尾：预算严格单调递减，绝不借用额外时间。
+  // deadline 已耗尽时一个 CDP evaluate 都不再执行。
+  // -------------------------------------------------------------------------
+  let tailBudget = Math.max(0, deadlineMs - Date.now());
+  let finalProbe = null;
+  if (tailBudget > 0) {
+    finalProbe = await evaluate(cdp, PROBE_JS, Math.min(2000, tailBudget)).catch(() => null);
+    observeIdentity(finalProbe?.url);
+  }
+
+  const stillStreaming = Boolean(finalProbe?.stopButton && finalProbe.stopButton.found);
+  let partialText = '';
+
+  tailBudget = Math.max(0, deadlineMs - Date.now());
+  if (tailBudget > 0 && finalProbe?.assistant?.len > 0 && finalProbe.assistant.count >= minRequiredTurns) {
+    partialText = await evaluate(cdp, GET_LAST_TEXT_JS, Math.min(3000, tailBudget)).catch(() => '');
+  }
+
+  if (safeTimeout) {
+    const finalUrl = identityUrl();
+    return {
+      ...buildInProgressResult({
+        text: partialText || '',
+        turns: finalProbe?.assistant?.count || beforeTurns,
+        expectedTurn: minRequiredTurns,
+        url: finalUrl,
+        conversationUrl: finalUrl,
+        isStreaming: stillStreaming,
+        message: stillStreaming
+          ? 'ChatGPT 正在深度推理与生成长回复中。已安全返回以避免触发 MCP 客户端 3 分钟超时限制。'
+          : 'ChatGPT 生成仍在处理中。',
+      }),
+    };
+  }
+
+  throw new Error(`等待 ChatGPT 生成超时`);
 }
 
-async function _sendPromptViaCdpInternal({ prompt, mode = 'reuse', timeoutS = 600, lockUrl, targetId }) {
+export async function fetchLatestResponse(options = {}) {
+  return cdpMutex.runExclusive(() => _fetchLatestResponseInternal(options));
+}
+
+async function _fetchLatestResponseInternal({ timeoutS = 150, deadlineMs: externalDeadlineMs, targetId, expectedTurn, conversationUrl, safeTimeout = true } = {}) {
+  // 绝对截止时间：优先使用上层（MCP / orchestrator）透传的同一条 deadline
+  const deadlineMs = typeof externalDeadlineMs === 'number' ? externalDeadlineMs : (Date.now() + timeoutS * 1000);
+
   const chromeExe = findChrome();
   if (!chromeExe) throw new Error('未在常用路径找到 Google Chrome 可执行文件');
 
-  await ensureCdpReady(chromeExe);
+  await ensureCdpReady(chromeExe, deadlineMs);
 
-  const target = await resolveTarget(targetId);
+  // 提供 conversationUrl 时按规范化会话身份在多标签页中精确定位（绝不"取第一个标签再靠 guard 兜底"）
+  const target = await resolveTarget(targetId, Boolean(conversationUrl), { conversationUrl });
+
+  const connectBudget = remainingBudgetMs(deadlineMs, 15000);
+  if (connectBudget <= 0) {
+    throw new Error('总截止时间预算已耗尽（在连接 CDP 之前），已中止以防突破宿主超时');
+  }
+
   const cdp = new CDP(target.webSocketDebuggerUrl);
-  await cdp.connect(15000);
+  await cdp.connect(connectBudget);
 
   try {
-    await cdp.send('Runtime.enable', {}, 10000).catch(() => {});
-    await cdp.send('Page.enable', {}, 10000).catch(() => {});
+    const enableBudget = remainingBudgetMs(deadlineMs, 10000);
+    if (enableBudget > 0) {
+      await cdp.send('Runtime.enable', {}, enableBudget).catch(() => {});
+      await cdp.send('Page.enable', {}, remainingBudgetMs(deadlineMs, 10000)).catch(() => {});
+    }
 
-    let p = await waitForComposer(cdp, 25000);
+    // 连接后实时校验 live location.href (彻底消除 TOCTOU 竞态)
+    const hrefBudget = remainingBudgetMs(deadlineMs, 5000);
+    const liveUrl = hrefBudget > 0
+      ? await evaluate(cdp, 'location.href', hrefBudget).catch(() => target.url)
+      : target.url;
+
+    // 仅当凭证是"可锁定"的具体会话身份时才做严格校验：
+    // 根路径 / 与临时 /c/WEB:<uuid> 不具备可比性（此时依赖标签绑定 + 后续轮询观测）
+    if (conversationUrl && typeof conversationUrl === 'string' && isPinnableConversation(conversationUrl)) {
+      if (!isSameConversationStrict(liveUrl, conversationUrl)) {
+        const currentNorm = canonicalizeConversationUrl(liveUrl);
+        const expectedNorm = canonicalizeConversationUrl(conversationUrl);
+        throw new Error(`会话身份校验失败: 当前标签页 URL (${currentNorm}) 与请求的会话 (${expectedNorm}) 不匹配`);
+      }
+    }
+
+    const identityUrl = canonicalizeConversationUrl(liveUrl) || liveUrl;
+
+    const probeBudget = remainingBudgetMs(deadlineMs, 5000);
+    const p = probeBudget > 0 ? await evaluate(cdp, PROBE_JS, probeBudget).catch(() => null) : null;
+
+    if (!p || !p.assistant || p.assistant.count === 0) {
+      return await waitForStreamingCompletion(cdp, {
+        deadlineMs,
+        beforeTurns: 0,
+        expectedTurn: expectedTurn || 1,
+        targetUrl: liveUrl,
+        expectedConversationUrl: conversationUrl || liveUrl,
+        safeTimeout,
+      });
+    }
+
+    const minRequiredTurns = typeof expectedTurn === 'number' ? expectedTurn : p.assistant.count;
+    const isStreaming = Boolean(p.stopButton && p.stopButton.found);
+    if (!isStreaming && p.assistant.count >= minRequiredTurns && p.assistant.len > 0) {
+      const textBudget = remainingBudgetMs(deadlineMs, 10000);
+      const text = textBudget > 0 ? await evaluate(cdp, GET_LAST_TEXT_JS, textBudget).catch(() => '') : '';
+      if (text && text.trim()) {
+        return {
+          ok: true,
+          inProgress: false,
+          text: text.trim(),
+          url: identityUrl,
+          // 恢复凭证必须升级为具体会话身份，绝不能继续把根路径 `/` 当凭证
+          conversationUrl: identityUrl,
+          turns: p.assistant.count,
+        };
+      }
+    }
+
+    // 仍在流式传输或需等待稳定
+    return await waitForStreamingCompletion(cdp, {
+      deadlineMs,
+      beforeTurns: p.assistant.count > 1 ? p.assistant.count - 1 : 0,
+      expectedTurn: minRequiredTurns,
+      targetUrl: liveUrl,
+      expectedConversationUrl: conversationUrl || liveUrl,
+      safeTimeout,
+    });
+  } finally {
+    await cdp.close();
+  }
+}
+
+export async function sendPromptViaCdp(options) {
+  return cdpMutex.runExclusive(() => _sendPromptInternal(options));
+}
+
+async function _sendPromptInternal({ prompt, mode = 'reuse', timeoutS = 150, deadlineMs: externalDeadlineMs, targetId, safeTimeout = true } = {}) {
+  // 绝对截止时间：优先使用上层（MCP / orchestrator）透传的同一条 deadline，
+  // 否则才以本层为锚点创建（保持独立调用时的向后兼容）。
+  const deadlineMs = typeof externalDeadlineMs === 'number' ? externalDeadlineMs : (Date.now() + timeoutS * 1000);
+  const SAFETY_MARGIN_MS = DEFAULT_SAFETY_MARGIN_MS;
+  const stepBudget = (capMs, marginMs = 0) => remainingBudgetMs(deadlineMs, capMs, marginMs);
+
+  const chromeExe = findChrome();
+  if (!chromeExe) throw new Error('未在常用路径找到 Google Chrome 可执行文件');
+
+  await ensureCdpReady(chromeExe, deadlineMs);
+
+  // fail-closed: 普通发送严禁静默重绑
+  const target = await resolveTarget(targetId, mode === 'new');
+
+  const connectBudget = stepBudget(15000);
+  if (connectBudget <= 0) {
+    throw new Error('总截止时间预算已耗尽（在连接 CDP 之前），已中止以防突破宿主超时');
+  }
+
+  const cdp = new CDP(target.webSocketDebuggerUrl);
+  await cdp.connect(connectBudget);
+
+  try {
+    const enableBudget = stepBudget(10000);
+    if (enableBudget > 0) {
+      await cdp.send('Runtime.enable', {}, enableBudget).catch(() => {});
+      await cdp.send('Page.enable', {}, stepBudget(10000)).catch(() => {});
+    }
+
+    const composerBudget = stepBudget(25000, SAFETY_MARGIN_MS);
+    if (composerBudget <= 0) {
+      throw new Error('总截止时间预算已耗尽（在定位输入框之前），已中止以防突破宿主超时');
+    }
+    let p = await waitForComposer(cdp, composerBudget);
 
     // 新会话导航策略
     if (mode === 'new') {
-      const isClean = p.url.startsWith(DEFAULT_TARGET_URL) && (!p.assistant.found || p.assistant.count === 0);
+      const isClean = p.url === DEFAULT_TARGET_URL || (p.url.startsWith(DEFAULT_TARGET_URL) && (!p.assistant?.found || p.assistant.count === 0));
       if (!isClean) {
         log('导航到全新会话页面...');
-        await cdp.send('Page.navigate', { url: DEFAULT_TARGET_URL }, 20000);
-        await sleep(1000);
-        p = await waitForComposer(cdp, 30000);
+        // 优先尝试 SPA 内部平滑跳转（避免销毁 WebSocket）
+        const clickBudget = stepBudget(3000, SAFETY_MARGIN_MS);
+        const clickedNew = clickBudget > 0
+          ? await evaluate(cdp, `(() => {
+          const btn = document.querySelector('a[href="/"], button[data-testid="create-new-chat-button"], a[aria-label*="New chat" i], a[aria-label*="新聊天"]');
+          if (btn) { btn.click(); return true; }
+          window.history.pushState({}, '', '/');
+          return false;
+        })()`, clickBudget).catch(() => false)
+          : false;
+
+        if (!clickedNew) {
+          await cdp.send('Page.navigate', { url: DEFAULT_TARGET_URL }, stepBudget(20000)).catch(() => {});
+        }
+        await sleep(1200);
+
+        // 若 WebSocket 在页面跳转中重置，自动重连新页面 WebSocket
+        if (cdp.closed || !cdp.ws || cdp.ws.readyState !== WebSocket.OPEN) {
+          log('CDP 正在重连新页面 WebSocket...');
+          const freshTarget = await resolveTarget(targetId, true);
+          cdp.wsUrl = freshTarget.webSocketDebuggerUrl;
+          const reconnectBudget = stepBudget(15000);
+          if (reconnectBudget <= 0) {
+            throw new Error('总截止时间预算已耗尽（在重连 CDP 之前），已中止以防突破宿主超时');
+          }
+          await cdp.connect(reconnectBudget);
+          const reEnableBudget = stepBudget(10000);
+          if (reEnableBudget > 0) {
+            await cdp.send('Runtime.enable', {}, reEnableBudget).catch(() => {});
+            await cdp.send('Page.enable', {}, stepBudget(10000)).catch(() => {});
+          }
+        }
+
+        const navBudget = stepBudget(30000, SAFETY_MARGIN_MS);
+        if (navBudget <= 0) {
+          throw new Error('总截止时间预算已耗尽（在等待新会话输入框之前），已中止以防突破宿主超时');
+        }
+        p = await waitForComposer(cdp, navBudget);
       }
     }
 
@@ -964,71 +1340,19 @@ async function _sendPromptViaCdpInternal({ prompt, mode = 'reuse', timeoutS = 60
       p = await verifyUnknownReceiptOrThrow(cdp, submitReceipt, beforeTurns);
     }
 
-    // 等待回复流启动
-    const startDeadline = Date.now() + 45000;
-    let started = false;
-    while (Date.now() < startDeadline) {
-      p = await evaluate(cdp, PROBE_JS);
-      if ((p.assistant.found && p.assistant.count > beforeTurns) || p.stopButton.found) {
-        started = true;
-        break;
-      }
-      await sleep(600);
-    }
+    const hrefBudget = stepBudget(3000);
+    const liveUrl = hrefBudget > 0
+      ? await evaluate(cdp, 'location.href', hrefBudget).catch(() => target.url)
+      : target.url;
 
-    if (!started) {
-      throw new Error('发送后未检测到新的 ChatGPT 回复回合');
-    }
-
-    // 等待生成结束 (低延迟 MutationObserver quiet + stopButton + turns + content stability)
-    const deadline = Date.now() + timeoutS * 1000;
-    let lastHash = 0;
-    let lastLen = 0;
-    let stableHits = 0;
-
-    while (Date.now() < deadline) {
-      p = await evaluate(cdp, PROBE_JS);
-      const isStreaming = p.stopButton.found;
-
-      if (!isStreaming && p.assistant.count > beforeTurns && p.assistant.len > 0) {
-        if (p.assistant.hash === lastHash && p.assistant.len === lastLen) {
-          stableHits++;
-        } else {
-          lastHash = p.assistant.hash;
-          lastLen = p.assistant.len;
-          stableHits = 0;
-        }
-
-        if (stableHits >= 2) {
-          const quiet = await evaluate(cdp, `new Promise((resolve) => {
-            let t = setTimeout(() => resolve(true), 350);
-            const obs = new MutationObserver(() => {
-              clearTimeout(t);
-              t = setTimeout(() => { obs.disconnect(); resolve(true); }, 350);
-            });
-            obs.observe(document.body, { childList: true, subtree: true, characterData: true });
-            setTimeout(() => { obs.disconnect(); resolve(false); }, 1500);
-          })`, { timeoutMs: 2500, awaitPromise: true }).catch(() => false);
-
-          if (quiet) {
-            const text = await evaluate(cdp, GET_LAST_TEXT_JS, 20000);
-            if (text && text.trim()) {
-              return {
-                ok: true,
-                text: text.trim(),
-                url: target.url,
-                turns: p.assistant.count,
-              };
-            }
-          }
-        }
-      } else {
-        stableHits = 0;
-      }
-      await sleep(600);
-    }
-
-    throw new Error(`等待 ChatGPT 生成超时 (${timeoutS}s)`);
+    // 提交已确认，直接进入流式与稳定等待（由同一条 deadlineMs 严格单调递减统一预算保护）
+    return await waitForStreamingCompletion(cdp, {
+      deadlineMs,
+      beforeTurns,
+      targetUrl: liveUrl || target.url,
+      expectedConversationUrl: liveUrl || target.url,
+      safeTimeout,
+    });
   } finally {
     await cdp.close();
   }

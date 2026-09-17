@@ -32,7 +32,7 @@ AI 助手收到后，会自动为你全流程完成：
 2. 🔌 **自动注册全局 MCP 服务**：自动写入 `~/.gemini/config/mcp_config.json`；
 3. 🔗 **自动挂载 Antigravity 全局 Skill**：软链接至 `~/.gemini/config/skills/antigravity-with-chatgpt`；
 4. 🖥️ **自动创建专用 Chrome 快捷方式**：在桌面生成独立 Profile 调试会话图标（端口 `9222`）；
-5. ✅ **自动执行 37 项架构自检**：确认通信与安全边界 100% 准备就绪。
+5. ✅ **自动执行 84 项对抗性测试 + 37 项环境自检**：确认通信与安全边界 100% 准备就绪。
 
 配置完成后，双击桌面的 **「ChatGPT (Antigravity智脑)」** 登录一次你的 ChatGPT 个人账号，即可在 Antigravity 2.0 中随时通过例如 *“请让 ChatGPT 帮我 review 当前代码”* 开启双脑协同！
 
@@ -71,6 +71,16 @@ AI 助手收到后，会自动为你全流程完成：
   3. `review`：闭环代码审查真实 Git Diff 与测试日志；
   4. `derive`：纯算法与数学推导（默认过滤代码文件，免受杂音干扰）；
   5. `diagnose`：故障定位与根因排查。
+- ⏳ **长回复轮询与宿主超时防护（Long-Reply Polling & Host-Timeout Guard）**：
+  - MCP 单次调用等待窗口默认 **150 秒、硬上限 165 秒**，稳稳落在 Antigravity 宿主的 180 秒熔断线内，长思考回合不再被中途强杀；
+  - ChatGPT 仍在生成时，桥接会返回 `[STATUS: IN_PROGRESS]` 及恢复凭证（`expectedTurn` + `conversationUrl`），而**不是**直接失败；用 `fetch_chatgpt_response` 续拉即可 —— **无需重新注入 Prompt，也不会覆盖正在生成中的回复**；
+  - **同一条绝对截止时间贯穿全链路**：deadline 在 MCP 边界锚定，一路透传经 orchestrator 进入传输层的每一个等待点（Chrome 就绪、CDP 连接、DOM 探测、静默窗口、文本读取）。下游各层**不得**重新锚定相对超时、**不得**用 `Math.max()` 制造额外时间 —— 预算耗尽后一个 CDP 调用都不会再发出。
+- 🧭 **会话身份守卫（状态机 Conversation Identity Guard）**：
+  - 会话 URL 先规范化（协议 + 主机 + 路径，剥离 query/hash），并以 `UNBOUND_ROOT → PINNED(/c/<id>)` 状态机跟踪：首次观测到的具体 `/c/<id>` 会被**永久锁定**，此后一律严格比较；
+  - 这封死了危险的 `/ → /c/A → /c/B` 漏洞：根路径绝不能成为永久通行证，生成途中任何跨会话导航都 **fail-closed**，绝不返回其他会话的内容；
+  - 恢复凭证会**升级为已锁定的具体身份** —— 从 `/` 发起的提问，返回的是 `/c/A` 而不是 `/`；
+  - **临时身份不算身份**：新会话提交后 SPA 会短暂停留在客户端临时地址 `/c/WEB:<uuid>`，之后才换成服务端 `/c/<uuid>`。该形态既不被锁定、也不作凭证，因此"临时 → 真实"的正常跃迁不会被误判为劫持；
+  - 多标签页抓取按**规范化会话身份精确选标签**，而不是"取第一个 ChatGPT 标签后指望 URL guard 兜底"。
 
 ---
 
@@ -103,6 +113,8 @@ AI 助手收到后，会自动为你全流程完成：
 │      * AsyncMutex 单飞行并发排队隔离                    │
 │      * Base64 快速 DOM 注入                             │
 │      * 双哈希多采样 + MutationObserver Quiet 结束判定   │
+│      * 绝对截止时间与 IN_PROGRESS 续拉协议              │
+│      * 会话身份实时重校验 (fail-closed)                 │
 │      * 事件驱动 WebSocket 生命周期与断开清理            │
 └───────────────────────────┬─────────────────────────────┘
                             │ Chrome DevTools Protocol
@@ -234,7 +246,36 @@ node scripts/ask_chatgpt.mjs --attach src/auth.ts src/server.ts "请检查该模
 
 # 8. 系统状态诊断自检 (--doctor)
 node scripts/ask_chatgpt.mjs --doctor
+
+# 9. 轮询抓取长回复 (--fetch / --poll, 无需重新注入 Prompt)
+node scripts/ask_chatgpt.mjs --fetch
+node scripts/ask_chatgpt.mjs --fetch --json
 ```
+
+---
+
+## ⏳ 长回复轮询与宿主超时防护
+
+深度推理回合很容易超出 MCP 宿主的单次调用熔断线（Antigravity 对工具调用实施 **3 分钟**强杀）。与其在生成途中被硬性打断，桥接层选择优雅降级：
+
+```
+ask_chatgpt(prompt, timeout: 150)
+        │
+        ├── 时限内生成完毕 ──────────────────► 完整回复文本
+        │
+        └── 到达截止时间仍在流式生成 ────────► [STATUS: IN_PROGRESS]
+                                                 + expectedTurn
+                                                 + conversationUrl
+                                                        │
+                              fetch_chatgpt_response ◄──┘
+                              （循环调用直到回复稳定）
+```
+
+- **等待窗口夹逼**：`ask_chatgpt` 与 `fetch_chatgpt_response` 的 `timeout` 默认均为 **150 秒**，并被硬性夹逼至 **165 秒**以内，稳居宿主熔断线之内；
+- **绝不重复提交**：返回 `IN_PROGRESS` 时 Prompt 已经注入且正在生成。请携带返回的凭证调用 `fetch_chatgpt_response` 续拉 —— 重新提交完整提问可能覆盖或打乱正在生成中的回复；
+- **恢复凭证**：`expectedTurn`（最小助手回合序号，防轮次串线）与 `conversationUrl`（规范化后的会话身份，防标签串线）。两者均可选，但当有多个 ChatGPT 标签页时强烈建议携带；
+- **部分文本**：`IN_PROGRESS` 响应会附上已捕获的最后约 400 字符，便于 Agent 在等待期间向用户流式汇报进度；
+- **`safeTimeout` 语义**：默认 `safeTimeout: true` 时超时返回 `IN_PROGRESS`（退出码 `0`），而非抛出错误；显式传 `safeTimeout: false` 才会硬失败。
 
 ---
 
@@ -242,7 +283,8 @@ node scripts/ask_chatgpt.mjs --doctor
 
 | 工具名称 | 描述 | 关键参数 |
 | :--- | :--- | :--- |
-| **`ask_chatgpt`** | 向 ChatGPT 网页版发送结构化任务并获取完整推理结果 | `prompt` (必填): 提问内容<br>`mode`: `ask` / `plan` / `review` / `derive` / `diagnose`<br>`files`: 附带的代码文件路径数组<br>`gitDiff`: 是否注入真实 Git Diff (布尔值)<br>`diffOffset`: Git Diff 分页起始字节偏移量 (默认 0)<br>`diffMaxBytes`: 单次最大字节预算限制 (默认 32768)<br>`session`: `reuse` / `new`<br>`timeout`: 超时时间（秒，默认 600） |
+| **`ask_chatgpt`** | 向 ChatGPT 网页版发送结构化任务并获取完整推理结果 | `prompt` (必填): 提问内容<br>`mode`: `ask` / `plan` / `review` / `derive` / `diagnose`<br>`files`: 附带的代码文件路径数组<br>`gitDiff`: 是否注入真实 Git Diff (布尔值)<br>`diffOffset`: Git Diff 分页起始字节偏移量 (默认 0)<br>`diffMaxBytes`: 单次最大字节预算限制 (默认 32768)<br>`session`: `reuse` / `new`<br>`timeout`: 单次等待秒数 (默认 150，硬上限 165)<br>仍在生成时返回 `[STATUS: IN_PROGRESS]` 及 `expectedTurn` / `conversationUrl` |
+| **`fetch_chatgpt_response`** | 在已绑定会话中续拉 / 轮询最新回复，无需重新注入 Prompt | `timeout`: 单次等待秒数 (默认 150，硬上限 165)<br>`expectedTurn`: 预期最小助手回合序号 (防轮次串线)<br>`conversationUrl`: 预期会话 URL (防标签串线)<br>`workspace`: 可选工作区路径 |
 | **`get_git_diff_page`** | 按需提取真实 Git Diff 的指定分页切片（受字节预算与脱敏保护） | `workspace`: 可选工作区路径<br>`offset`: 分页起始字节偏移量 (默认 0)<br>`maxBytes`: 单次提取最大字节数 (默认 32768, 最大 65536)<br>`head`: 是否对比 HEAD (默认 true)<br>`staged`: 是否仅已暂存 (默认 false)<br>`file`: 可选文件路径过滤 |
 | **`read_review_file`** | 安全读取工作区内代码文件（受沙箱防逃逸与字节预算保护） | `path` (必填): 相对文件路径<br>`workspace`: 可选工作区路径<br>`maxBytes`: 最大读取字节数 (默认 32768) |
 | **`chatgpt_status`** | 探测专用 Chrome 实例、CDP 9222 端口及工作区就绪性 | `workspace`: 可选工作区路径 |
@@ -255,7 +297,7 @@ node scripts/ask_chatgpt.mjs --doctor
 本项目针对持续集成与本地安装分别提供自动化验证方案：
 
 ### 1. 自动化 CI 测试套件 (`npm test`)
-在 GitHub Actions 持续集成流水线中自动执行，覆盖 Ubuntu、Windows 与 macOS 三大主流平台（Node 22 与 Node 24 矩阵）：
+在 GitHub Actions 持续集成流水线中自动执行，覆盖 Ubuntu、Windows 与 macOS 三大主流平台（Node 22 与 Node 24 矩阵）。**84 项对抗性用例**覆盖路径逃逸与符号链接穿越、密钥脱敏、出口统一脱敏、Git porcelain 解析、证据预算天花板、绝对 deadline 耗尽后零借用、会话身份锁定（`/ → /c/A → /c/B`）、多标签精确选择，以及真实 handler 链路上的 MCP 参数穿透：
 
 ```powershell
 npm test
@@ -266,7 +308,7 @@ npm test
 检查本机环境依赖、模块完整性、全局挂载与真实 Chrome CDP 连通性：
 
 ```powershell
-# 运行本地环境与配置自检 (36 项检查)
+# 运行本地环境与配置自检 (37 项检查)
 npm run verify
 
 # 可选：在已运行 Chrome 的环境下执行端到端多模式推理测试

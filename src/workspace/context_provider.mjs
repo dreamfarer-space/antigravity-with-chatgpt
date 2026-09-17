@@ -149,28 +149,46 @@ export function readFileSafe(workspaceRoot, filePath, options = {}) {
 }
 
 /**
- * 组装安全的附件 Markdown 代码块
+ * 组装安全的附件 Markdown 代码块（带多文件阶梯预算与截断提示）
  * @param {string} workspaceRoot
  * @param {Array<string>} files
- * @param {number} [maxTotalBytes=524288]
+ * @param {number|object} [optionsOrMaxTotalBytes=196608] 默认总上限 192 KB
  * @returns {string}
  */
-export function buildAttachmentsBlock(workspaceRoot, files, maxTotalBytes = 512 * 1024) {
+export function buildAttachmentsBlock(workspaceRoot, files, optionsOrMaxTotalBytes = 192 * 1024) {
   if (!files || files.length === 0) return '';
+
+  const opts = typeof optionsOrMaxTotalBytes === 'number'
+    ? { maxTotalBytes: optionsOrMaxTotalBytes }
+    : { maxTotalBytes: 192 * 1024, ...optionsOrMaxTotalBytes };
+
+  const maxTotalBytes = opts.maxTotalBytes || 192 * 1024;
+  const fileCount = files.length;
+  // 多文件时动态调配单文件预算：单文件上限 128KB；多文件时均分并保底 16KB，最高 64KB
+  const defaultPerFileBudget = fileCount <= 1
+    ? 128 * 1024
+    : Math.max(16 * 1024, Math.min(64 * 1024, Math.floor(maxTotalBytes / fileCount)));
+  const maxBytesPerFile = opts.maxBytesPerFile || defaultPerFileBudget;
 
   const blocks = [];
   let accumulatedBytes = 0;
 
   for (const f of files) {
     try {
-      const read = readFileSafe(workspaceRoot, f, { maxBytes: 128 * 1024 });
+      const read = readFileSafe(workspaceRoot, f, { maxBytes: maxBytesPerFile });
       const ext = path.extname(read.path).toLowerCase();
       const lang = LANG_MAP[ext] || '';
-      const block = `## File: ${read.path} (${read.linesRead}/${read.totalLines} lines)\n\`\`\`${lang}\n${read.content}\n\`\`\``;
+      
+      let truncationNotice = '';
+      if (read.truncated || read.linesRead < read.totalLines) {
+        truncationNotice = `\n> [NOTE: File slice bounded (${read.linesRead}/${read.totalLines} lines, ${Buffer.byteLength(read.content, 'utf8')}B). If full content is needed, request via <EVIDENCE_REQUEST> {"type": "read_file", "path": "${read.path}"}]`;
+      }
+
+      const block = `## File: ${read.path} (${read.linesRead}/${read.totalLines} lines)\n\`\`\`${lang}\n${read.content}\n\`\`\`${truncationNotice}`;
       const blockBytes = Buffer.byteLength(block, 'utf8');
 
       if (accumulatedBytes + blockBytes > maxTotalBytes) {
-        blocks.push(`> [WARN] 附件总大小超出限制，部分文件已略过: ${f}`);
+        blocks.push(`> [WARN] 附件总大小超出预算限制 (${maxTotalBytes}B)，部分文件已略过: ${f}`);
         break;
       }
 

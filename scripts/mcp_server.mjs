@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
-import { runBrainTask } from '../src/brain/orchestrator.mjs';
+import { runBrainTask, fetchLatestBrainResponse } from '../src/brain/orchestrator.mjs';
 import { MODES } from '../src/brain/prompts.mjs';
 import { checkCdpStatus } from '../src/transport/cdp_transport.mjs';
 import { recordExecution } from '../src/execution/recorder.mjs';
@@ -40,6 +40,16 @@ function log(...args) {
 function send(msg) {
   process.stdout.write(JSON.stringify(msg) + '\n');
 }
+
+/**
+ * 依赖注入接缝（测试用）：MCP handler 对底层编排/传输层的调用必须可被真实拦截，
+ * 才能断言参数穿透契约（而不是在测试里自建 dummy wrapper 自证）。
+ * 生产运行时保持指向真实实现，行为不变。
+ */
+export const __deps = {
+  runBrainTask,
+  fetchLatestBrainResponse,
+};
 
 // ---------------------------------------------------------------------------
 // Tool Specifications
@@ -95,11 +105,39 @@ const TOOLS = [
         },
         timeout: {
           type: 'number',
-          description: '等待 ChatGPT 回复的最长超时时间（秒），默认 600',
-          default: 600,
+          description: '等待 ChatGPT 回复的最长超时时间（秒），默认 150 秒（受 MCP 客户端 3 分钟限制保护，上限 165 秒）',
+          default: 150,
         },
       },
       required: ['prompt'],
+    },
+  },
+  {
+    name: 'fetch_chatgpt_response',
+    description:
+      '抓取当前 ChatGPT 标签页中最新生成完毕或正在生成的长回复（带会话与回合身份校验）。' +
+      '用于在上一轮提问由于耗时较长（返回 IN_PROGRESS）后拉取结果，或无需重新注入 Prompt 提取最新一轮回答。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeout: {
+          type: 'number',
+          description: '最长等待时间（秒），默认 150 秒（上限 165 秒）',
+          default: 150,
+        },
+        expectedTurn: {
+          type: 'number',
+          description: '预期的最小回复回合数（可选，防止多会话或前后轮次串线）',
+        },
+        conversationUrl: {
+          type: 'string',
+          description: '预期的会话 URL（可选，校验标签页身份，防止串标签）',
+        },
+        workspace: {
+          type: 'string',
+          description: '可选的工作区根目录路径',
+        },
+      },
     },
   },
   {
@@ -226,7 +264,7 @@ const TOOLS = [
 // Tool Handlers
 // ---------------------------------------------------------------------------
 
-async function handleAskChatGPT(args) {
+export async function handleAskChatGPT(args) {
   const prompt = args.prompt;
   if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
     return {
@@ -243,8 +281,13 @@ async function handleAskChatGPT(args) {
     };
   }
 
+  // 严格夹逼 MCP 单次调用等待时间（默认 150 秒，上限 165 秒），防止触发 Antigravity 宿主 180s 强杀
+  const safeTimeout = Math.min(Math.max(5, Number(args.timeout) || 150), 165);
+  // 端到端唯一绝对截止时间：在 MCP 边界锚定，一路透传到 CDP 传输层的每一个等待点
+  const deadlineMs = Date.now() + safeTimeout * 1000;
+
   try {
-    const res = await runBrainTask({
+    const res = await __deps.runBrainTask({
       prompt,
       mode: args.mode || MODES.ASK,
       session: args.session || (args.mode === 'new' ? 'new' : 'reuse'),
@@ -253,8 +296,36 @@ async function handleAskChatGPT(args) {
       gitDiff: args.gitDiff,
       diffOffset: args.diffOffset,
       diffMaxBytes: args.diffMaxBytes,
-      timeout: args.timeout,
+      timeout: safeTimeout,
+      deadlineMs,
+      safeTimeout: true,
     });
+
+    if (res.inProgress) {
+      const targetTurn = res.expectedTurn || (res.turns || 1);
+      const convUrl = res.conversationUrl || res.url || '';
+      const waitNotice = [
+        `[STATUS: IN_PROGRESS] ChatGPT 正在深度思考与生成长回复中。`,
+        `为防止触发 Antigravity / MCP 客户端的 3 分钟硬性超时限制 (timed out after 3m0s)，已在安全窗口 (${Math.round((res.elapsedMs || 0) / 1000)}s) 内安全返回。`,
+        ``,
+        `【当前生成状态与恢复身份凭证】:`,
+        `- 目标期望回复回合 (expectedTurn): ${targetTurn}`,
+        convUrl ? `- 绑定的会话 (conversationUrl): ${convUrl}` : '',
+        `- 是否仍在流式传输: ${res.isStreaming ? '是 (Streaming)' : '等待 DOM 稳定'}`,
+        res.text ? `- 已截获部分文本切片 (${res.text.length} 字符):\n\`\`\`\n${res.text.slice(-400)}\n\`\`\`` : `- 尚未产生可见文本切片`,
+        ``,
+        `【后续操作指引】:`,
+        `请勿重新提交完整提问（以防覆盖正在生成的长回复）！请直接调用工具 \`fetch_chatgpt_response\` 携带会话与回合凭据拉取完整回复:`,
+        `\`\`\`json`,
+        JSON.stringify({ expectedTurn: targetTurn, ...(convUrl ? { conversationUrl: convUrl } : {}) }, null, 2),
+        `\`\`\``,
+      ].filter(Boolean).join('\n');
+
+      return {
+        content: [{ type: 'text', text: waitNotice }],
+        isError: false,
+      };
+    }
 
     return {
       content: [{ type: 'text', text: res.text }],
@@ -263,6 +334,57 @@ async function handleAskChatGPT(args) {
   } catch (err) {
     return {
       content: [{ type: 'text', text: `Brain Bridge 执行异常: ${err.message}` }],
+      isError: true,
+    };
+  }
+}
+
+export async function handleFetchChatGPTResponse(args = {}) {
+  const safeTimeout = Math.min(Math.max(5, Number(args.timeout) || 150), 165);
+  const deadlineMs = Date.now() + safeTimeout * 1000;
+
+  try {
+    const res = await __deps.fetchLatestBrainResponse({
+      timeout: safeTimeout,
+      deadlineMs,
+      expectedTurn: args.expectedTurn,
+      conversationUrl: args.conversationUrl,
+      workspace: args.workspace,
+      safeTimeout: true,
+    });
+
+    if (res.inProgress) {
+      const targetTurn = args.expectedTurn || res.expectedTurn || res.turns || 1;
+      const convUrl = args.conversationUrl || res.conversationUrl || res.url || '';
+      const waitNotice = [
+        `[STATUS: IN_PROGRESS] ChatGPT 仍在生成长回复中（已等待 ${Math.round((res.elapsedMs || 0) / 1000)}s）。`,
+        `- 目标期望回复回合: ${targetTurn}`,
+        convUrl ? `- 绑定的会话: ${convUrl}` : '',
+        `- 是否仍在流式传输: ${res.isStreaming ? '是' : '否'}`,
+        res.text ? `- 已截获最新切片 (${res.text.length} 字符):\n\`\`\`\n${res.text.slice(-400)}\n\`\`\`` : '',
+        `可再次调用 \`fetch_chatgpt_response\` (携带 expectedTurn: ${targetTurn}) 继续拉取，直到生成完全结束。`,
+      ].filter(Boolean).join('\n');
+
+      return {
+        content: [{ type: 'text', text: waitNotice }],
+        isError: false,
+      };
+    }
+
+    if (!res.text || !res.text.trim()) {
+      return {
+        content: [{ type: 'text', text: res.message || '当前页面暂未获取到有效的回复内容。' }],
+        isError: false,
+      };
+    }
+
+    return {
+      content: [{ type: 'text', text: res.text }],
+      isError: false,
+    };
+  } catch (err) {
+    return {
+      content: [{ type: 'text', text: `拉取回复失败: ${err.message}` }],
       isError: true,
     };
   }
@@ -424,6 +546,8 @@ async function handleRpcRequest(req) {
     let res;
     if (name === 'ask_chatgpt') {
       res = await handleAskChatGPT(args);
+    } else if (name === 'fetch_chatgpt_response') {
+      res = await handleFetchChatGPTResponse(args);
     } else if (name === 'chatgpt_status') {
       res = await handleCheckStatus(args);
     } else if (name === 'record_execution') {
@@ -502,4 +626,19 @@ function startServer() {
   });
 }
 
-startServer();
+// 仅在作为可执行入口运行时才启动 stdio 事件循环；
+// 被测试 import 时不得占用 stdin、不得自动退出进程。
+const isMainModule = (() => {
+  try {
+    const argvPath = process.argv[1] ? path.resolve(process.argv[1]).toLowerCase() : '';
+    if (!argvPath) return false;
+    const modulePath = path.resolve(fileURLToPath(import.meta.url)).toLowerCase();
+    return argvPath === modulePath || argvPath.endsWith(`${path.sep}mcp_server.mjs`);
+  } catch {
+    return false;
+  }
+})();
+
+if (isMainModule) {
+  startServer();
+}

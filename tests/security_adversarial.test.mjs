@@ -15,13 +15,14 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { resolveSafePath, isPathContained, canonicalizeManifestPath, SecurityError } from '../src/security/path_guard.mjs';
 import { sanitizeContent, isSensitivePath, redactSensitive } from '../src/security/sensitive.mjs';
-import { runBrainTask, parseEvidenceRequests, buildEvidenceRoundSnippets, MAX_AGGREGATE_EVIDENCE_BYTES } from '../src/brain/orchestrator.mjs';
+import { runBrainTask, parseEvidenceRequests, buildEvidenceRoundSnippets, MAX_AGGREGATE_EVIDENCE_BYTES, fetchLatestBrainResponse } from '../src/brain/orchestrator.mjs';
 import { recordExecution } from '../src/execution/recorder.mjs';
 import { getUntrackedEvidence, truncateUtf8ByBytes, getGitDiff, getReviewEvidence, parseGitStatusOutput, unquoteGitPath, parseRenamePathPair } from '../src/git/git_helper.mjs';
-import { evaluate, getInjectionTimeout, SUBMIT_STATUS, insertTextReliable, submitMessageReliable, verifyUnknownReceiptOrThrow } from '../src/transport/cdp_transport.mjs';
-import { readFileSafe } from '../src/workspace/context_provider.mjs';
+import { evaluate, getInjectionTimeout, SUBMIT_STATUS, insertTextReliable, submitMessageReliable, verifyUnknownReceiptOrThrow, waitForStreamingCompletion, canonicalizeConversationUrl, isSameConversation, isSameConversationStrict, isRootConversation, isEphemeralConversation, isPinnableConversation, remainingBudgetMs } from '../src/transport/cdp_transport.mjs';
+import { readFileSafe, buildAttachmentsBlock } from '../src/workspace/context_provider.mjs';
 import { computeFingerprint, BROWSER_FINGERPRINT_SNIPPET } from '../src/transport/fingerprint.mjs';
 import { selectTargetPage, filterChatGptPages } from '../src/transport/target_selector.mjs';
+import { handleAskChatGPT, handleFetchChatGPTResponse, __deps as mcpDeps } from '../scripts/mcp_server.mjs';
 
 let passed = 0;
 let total = 0;
@@ -1310,6 +1311,663 @@ Also need to check another file:
       assert.deepEqual(parsed.staged, [], `冲突状态 ${code} 严禁误归入 staged`);
       assert.deepEqual(parsed.modified, [], `冲突状态 ${code} 严禁误归入 modified`);
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 22. 多文件附件阶梯预算与截断指引测试
+  // ---------------------------------------------------------------------------
+  console.log('\n22. 多文件附件阶梯预算与截断指引测试:');
+
+  test('buildAttachmentsBlock: 多文件自动分配单文件阶梯预算并添加按需拉取提示', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-attach-test-'));
+    try {
+      const files = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'];
+      for (const f of files) {
+        fs.writeFileSync(path.join(tempDir, f), `// Content of ${f}\n`.repeat(500), 'utf8');
+      }
+
+      // 5 个文件，总预算 64 KB -> 每个文件单体预算约 16 KB ~ 32 KB
+      const block = buildAttachmentsBlock(tempDir, files, { maxTotalBytes: 64 * 1024, maxBytesPerFile: 8 * 1024 });
+      assert.ok(block.includes('## File: a.ts'));
+      assert.ok(block.includes('## File: e.ts'));
+      assert.ok(block.includes('NOTE: File slice bounded'));
+      assert.ok(block.includes('<EVIDENCE_REQUEST>'));
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 23. waitForStreamingCompletion 优雅非抛错超时 (safeTimeout) 测试
+  // ---------------------------------------------------------------------------
+  console.log('\n23. waitForStreamingCompletion safeTimeout 防超时熔断测试:');
+
+  await testAsync('waitForStreamingCompletion: safeTimeout 触发时不抛错并返回 inProgress 状态', async () => {
+    const mockCdpStreaming = {
+      send: async (method) => {
+        if (method === 'Runtime.evaluate') {
+          return {
+            result: {
+              value: {
+                stopButton: { found: true },
+                assistant: { count: 1, len: 120, hash: 12345 },
+              },
+            },
+          };
+        }
+        return {};
+      },
+    };
+
+    const res = await waitForStreamingCompletion(mockCdpStreaming, {
+      timeoutMs: 100,
+      beforeTurns: 0,
+      safeTimeout: true,
+    });
+
+    assert.equal(res.ok, true);
+    assert.equal(res.inProgress, true);
+    assert.equal(res.isStreaming, true);
+    assert.ok(res.message.includes('ChatGPT 正在深度推理与生成长回复中'));
+  });
+
+  // ---------------------------------------------------------------------------
+  // 24. Prompt 注入指纹精确完整性对抗测试 (防同长不同内容与微小缺失)
+  // ---------------------------------------------------------------------------
+  console.log('\n24. Prompt 注入指纹精确完整性对抗测试:');
+
+  await testAsync('insertTextReliable: 相同长度但不同内容/哈希的注入必须拒绝 (防同长篡改)', async () => {
+    const original = 'const token = "1234567890";';
+    const fake =     'const token = "0987654321";';
+    assert.equal(original.length, fake.length);
+    assert.notEqual(computeFingerprint(original).hash, computeFingerprint(fake).hash);
+
+    let injectAttempts = 0;
+    let clearCalled = false;
+    const mockCdpTampered = {
+      send: async (method, params) => {
+        if (method === 'Runtime.evaluate') {
+          const expr = params?.expression || '';
+          if (expr.includes('TextDecoder')) {
+            injectAttempts++;
+            return {
+              result: {
+                value: {
+                  ok: true,
+                  length: fake.length,
+                  hash: computeFingerprint(fake).hash,
+                  isTextarea: false,
+                },
+              },
+            };
+          }
+          if (expr.includes('delete') || expr.includes('selectAll')) {
+            clearCalled = true;
+            return { result: { value: true } };
+          }
+          if (expr.includes('PROBE_COMPOSER_JS')) {
+            if (clearCalled && injectAttempts === 1) {
+              clearCalled = false;
+              return {
+                result: {
+                  value: { found: true, empty: true, length: 0, hash: '811c9dc5', isTextarea: false },
+                },
+              };
+            }
+            return {
+              result: {
+                value: {
+                  found: true,
+                  empty: false,
+                  length: fake.length,
+                  hash: computeFingerprint(fake).hash,
+                  isTextarea: false,
+                },
+              },
+            };
+          }
+        }
+        return { result: { value: null } };
+      },
+    };
+
+    await assert.rejects(
+      async () => {
+        await insertTextReliable(mockCdpTampered, original);
+      },
+      /注入完整性校验失败/,
+      '相同长度但指纹不匹配的注入必须抛出完整性异常'
+    );
+  });
+
+  await testAsync('insertTextReliable: 缺失 1% 内容的注入必须拒绝 (防宽松长度容忍)', async () => {
+    const fullText = 'A'.repeat(1000);
+    const cutText = 'A'.repeat(990); // 缺失 1%
+
+    let injectAttempts = 0;
+    let clearCalled = false;
+    const mockCdpTruncated = {
+      send: async (method, params) => {
+        if (method === 'Runtime.evaluate') {
+          const expr = params?.expression || '';
+          if (expr.includes('TextDecoder')) {
+            injectAttempts++;
+            return {
+              result: {
+                value: {
+                  ok: true,
+                  length: cutText.length,
+                  hash: computeFingerprint(cutText).hash,
+                  isTextarea: false,
+                },
+              },
+            };
+          }
+          if (expr.includes('delete') || expr.includes('selectAll')) {
+            clearCalled = true;
+            return { result: { value: true } };
+          }
+          if (expr.includes('PROBE_COMPOSER_JS')) {
+            if (clearCalled && injectAttempts === 1) {
+              clearCalled = false;
+              return {
+                result: {
+                  value: { found: true, empty: true, length: 0, hash: '811c9dc5', isTextarea: false },
+                },
+              };
+            }
+            return {
+              result: {
+                value: {
+                  found: true,
+                  empty: false,
+                  length: cutText.length,
+                  hash: computeFingerprint(cutText).hash,
+                  isTextarea: false,
+                },
+              },
+            };
+          }
+        }
+        return { result: { value: null } };
+      },
+    };
+
+    await assert.rejects(
+      async () => {
+        await insertTextReliable(mockCdpTruncated, fullText);
+      },
+      /注入完整性校验失败/,
+      '哪怕仅缺失 1% 内容，也坚决严禁放行'
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // 25. Strict Canonical Conversation URL Guard 身份校验测试
+  // ---------------------------------------------------------------------------
+  console.log('\n25. Strict Canonical Conversation URL Guard 身份校验测试:');
+
+  test('canonicalizeConversationUrl & isSameConversation 严格规范化与身份比对', () => {
+    // 1. 同一会话的不同形式比较 (带 query / hash / trailing slash)
+    const fullA = 'https://chatgpt.com/c/6aabbc29-0410-83ea-960a-749e9bcafe3e?model=gpt-4#bottom';
+    const fullB = 'https://chatgpt.com/c/6aabbc29-0410-83ea-960a-749e9bcafe3e/';
+    const pathOnly = '/c/6aabbc29-0410-83ea-960a-749e9bcafe3e';
+
+    assert.equal(isSameConversation(fullA, fullB), true, '同会话带 query/hash 与 trailing slash 必须规范化匹配');
+    assert.equal(isSameConversation(fullA, pathOnly), true, '完整 URL 与相对会话路径必须匹配');
+
+    // 2. 不同会话 ID 严格拒绝
+    const diffA = 'https://chatgpt.com/c/6aabbc29-0410-83ea-960a-749e9bcafe3e';
+    const diffB = 'https://chatgpt.com/c/other-session-id-12345';
+    assert.equal(isSameConversation(diffA, diffB), false, '不同会话 ID 必须严格判定为不匹配');
+
+    // 3. 恶意子域名劫持防护
+    const evil = 'https://chatgpt.com.attacker.com/c/6aabbc29-0410-83ea-960a-749e9bcafe3e';
+    assert.equal(isSameConversation(fullA, evil), false, '域名仿冒/子域逃逸必须严格拒绝');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 26. MCP expectedTurn 与 conversationUrl 穿透传递契约测试 (真实 handler 链路)
+  // ---------------------------------------------------------------------------
+  console.log('\n26. MCP handleFetchChatGPTResponse 参数穿透契约测试:');
+
+  await testAsync('MCP handleFetchChatGPTResponse: 真实 handler 链路验证 expectedTurn 与 conversationUrl 完整透传', async () => {
+    const testExpectedTurn = 5;
+    const testConversationUrl = 'https://chatgpt.com/c/session-uuid-12345';
+
+    // 通过依赖注入接缝拦截真实 handler 对底层传输的调用（不再自建 dummy wrapper 自证）
+    const originalFetch = mcpDeps.fetchLatestBrainResponse;
+    let capturedOptions = null;
+
+    mcpDeps.fetchLatestBrainResponse = async (options) => {
+      capturedOptions = options;
+      return {
+        ok: true,
+        inProgress: true,
+        turns: 4,
+        expectedTurn: options.expectedTurn,
+        conversationUrl: options.conversationUrl,
+        text: '',
+        elapsedMs: 10,
+      };
+    };
+
+    try {
+      const res = await handleFetchChatGPTResponse({
+        timeout: 150,
+        expectedTurn: testExpectedTurn,
+        conversationUrl: testConversationUrl,
+        workspace: process.cwd(),
+      });
+
+      assert.ok(capturedOptions, '真实 handler 必须调用底层 fetchLatestBrainResponse');
+      assert.equal(capturedOptions.expectedTurn, 5, 'expectedTurn 必须原样透传至底层');
+      assert.equal(capturedOptions.conversationUrl, testConversationUrl, 'conversationUrl 必须原样透传至底层');
+      assert.equal(capturedOptions.safeTimeout, true, 'safeTimeout 必须强制为 true');
+      assert.equal(capturedOptions.timeout, 150);
+      assert.ok(
+        typeof capturedOptions.deadlineMs === 'number' &&
+          capturedOptions.deadlineMs > Date.now() &&
+          capturedOptions.deadlineMs <= Date.now() + 165 * 1000 + 1000,
+        '必须在 MCP 边界锚定绝对 deadlineMs 并透传至底层'
+      );
+
+      // IN_PROGRESS 回执必须携带可续拉的恢复凭证
+      assert.equal(res.isError, false);
+      assert.match(res.content[0].text, /\[STATUS: IN_PROGRESS\]/);
+      assert.match(res.content[0].text, /session-uuid-12345/);
+    } finally {
+      mcpDeps.fetchLatestBrainResponse = originalFetch;
+    }
+  });
+
+  await testAsync('MCP handleAskChatGPT: 真实 handler 链路必须锚定并透传绝对 deadlineMs（防各层重新锚定相对超时）', async () => {
+    const originalRun = mcpDeps.runBrainTask;
+    let captured = null;
+
+    mcpDeps.runBrainTask = async (options) => {
+      captured = options;
+      return {
+        ok: true,
+        inProgress: true,
+        isStreaming: true,
+        text: 'partial',
+        url: 'https://chatgpt.com/c/pinned-session',
+        conversationUrl: 'https://chatgpt.com/c/pinned-session',
+        turns: 2,
+        expectedTurn: 2,
+        elapsedMs: 5,
+      };
+    };
+
+    try {
+      const t0 = Date.now();
+      const res = await handleAskChatGPT({ prompt: '分析该架构', timeout: 9999 });
+
+      assert.ok(captured, '真实 handler 必须调用 runBrainTask');
+      assert.equal(captured.timeout, 165, 'MCP 单次等待必须被硬性夹逼到 165s 上限');
+      assert.ok(
+        typeof captured.deadlineMs === 'number' &&
+          captured.deadlineMs - t0 <= 165 * 1000 + 50 &&
+          captured.deadlineMs >= t0,
+        'deadlineMs 必须由 MCP 边界锚定，且不得超过 165s 硬上限'
+      );
+
+      // IN_PROGRESS 回执必须给出续拉 JSON 凭证，且凭证中的会话身份必须是具体 /c/<id>
+      assert.equal(res.isError, false);
+      assert.match(res.content[0].text, /fetch_chatgpt_response/);
+      assert.match(res.content[0].text, /"expectedTurn": 2/);
+      assert.match(res.content[0].text, /pinned-session/);
+    } finally {
+      mcpDeps.runBrainTask = originalRun;
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 27. selectTargetPage / resolveTarget 默认 allowRebind=false Fail-Closed 测试
+  // ---------------------------------------------------------------------------
+  console.log('\n27. resolveTarget 默认 allowRebind=false Fail-Closed 测试:');
+
+  test('selectTargetPage: 默认 allowRebind=false 时若原绑定标签丢失严禁隐式认领新标签', () => {
+    const list = [
+      { id: 'NEW_TAB_UUID', type: 'page', url: 'https://chatgpt.com/c/other-session', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/NEW_TAB_UUID' },
+    ];
+    // 绑定的目标已丢失
+    const boundId = 'OLD_TAB_UUID_LOST';
+
+    // 默认 allowRebind: false -> 必须抛错 fail-closed
+    assert.throws(
+      () => selectTargetPage(list, boundId, { allowRebind: false }),
+      /已绑定的 ChatGPT 目标标签页已关闭或丢失/
+    );
+
+    // 显式 allowRebind: true -> 允许认领
+    const claimed = selectTargetPage(list, boundId, { allowRebind: true });
+    assert.equal(claimed.target.id, 'NEW_TAB_UUID');
+    assert.equal(claimed.isNewBinding, true);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 28. waitForStreamingCompletion 绝对单调截止时间 (Absolute Monotonic Deadline) 测试
+  // ---------------------------------------------------------------------------
+  console.log('\n28. waitForStreamingCompletion 绝对单调截止时间测试:');
+
+  await testAsync('waitForStreamingCompletion: deadlineMs 耗尽时绝不借用额外时间，且一个 CDP evaluate 都不执行', async () => {
+    let evalCount = 0;
+    const mockCdpLong = {
+      send: async (method) => {
+        if (method === 'Runtime.evaluate') {
+          evalCount++;
+          return {
+            result: {
+              value: {
+                stopButton: { found: true },
+                assistant: { count: 1, len: 100, hash: 999 },
+              },
+            },
+          };
+        }
+        return {};
+      },
+    };
+
+    // 1. deadline 已在过去 -> 严格零探测（旧实现会人为制造 500ms 额外预算并执行 evaluate）
+    const t0 = Date.now();
+    const res = await waitForStreamingCompletion(mockCdpLong, {
+      deadlineMs: Date.now() - 1,
+      beforeTurns: 0,
+      safeTimeout: true,
+    });
+    const elapsed = Date.now() - t0;
+
+    assert.equal(res.inProgress, true);
+    assert.equal(evalCount, 0, 'deadline 已耗尽时严禁再执行任何 CDP evaluate');
+    assert.ok(elapsed < 300, `deadline 耗尽后不得产生任何额外等待 (实际 ${elapsed}ms)`);
+
+    // 2. 仅剩 50ms -> 总耗时必须被剩余预算严格约束（而不是 <2s 这种宽松容忍）
+    let evalCount2 = 0;
+    const mockCdpTiny = {
+      send: async (method) => {
+        if (method === 'Runtime.evaluate') {
+          evalCount2++;
+          return { result: { value: { stopButton: { found: true }, assistant: { count: 1, len: 100, hash: 999 } } } };
+        }
+        return {};
+      },
+    };
+
+    const t1 = Date.now();
+    const res2 = await waitForStreamingCompletion(mockCdpTiny, {
+      deadlineMs: Date.now() + 50,
+      beforeTurns: 0,
+      safeTimeout: true,
+    });
+    const elapsed2 = Date.now() - t1;
+
+    assert.equal(res2.inProgress, true);
+    assert.ok(elapsed2 <= 400, `50ms 剩余预算下总耗时必须被严格约束 (实际 ${elapsed2}ms)`);
+    assert.ok(evalCount2 <= 2, `50ms 剩余预算下最多允许 1~2 次探测，实际 ${evalCount2} 次`);
+  });
+
+  test('remainingBudgetMs: 预算恒不为负，且绝不使用 Math.max 人为制造额外时间', () => {
+    assert.equal(remainingBudgetMs(Date.now() - 5000, 5000), 0, '过期 deadline 的剩余预算必须为 0');
+    assert.equal(remainingBudgetMs(Date.now() - 5000, 45000), 0, '过期 deadline 的大 cap 同样必须为 0');
+    assert.ok(remainingBudgetMs(Date.now() + 100000, 5000) === 5000, '未耗尽时必须受单步 cap 约束');
+    assert.ok(remainingBudgetMs(null, 5000) === 5000, '未提供 deadline 时退化为单步 cap（向后兼容）');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 29. waitForStreamingCompletion TOCTOU 实时会话 URL 重校验测试
+  // ---------------------------------------------------------------------------
+  console.log('\n29. waitForStreamingCompletion TOCTOU 实时会话 URL 重校验测试:');
+
+  await testAsync('waitForStreamingCompletion: 生成过程中发生跨会话导航必须 fail-closed 拦截', async () => {
+    let evalCount = 0;
+    const mockCdpHijacked = {
+      send: async (method, params) => {
+        if (method === 'Runtime.evaluate') {
+          const expr = params?.expression || '';
+          if (expr === 'location.href' || expr.trim() === 'location.href') {
+            // 模拟生成中被导航到了其他会话
+            return { result: { value: 'https://chatgpt.com/c/hijacked-other-session' } };
+          }
+          if (expr.includes('MutationObserver')) {
+            return { result: { value: true } };
+          }
+          if (expr.includes('pickVisible') || expr.includes('COMPOSER')) {
+            evalCount++;
+            return {
+              result: {
+                value: {
+                  stopButton: { found: false },
+                  assistant: { count: 1, len: 100, hash: 888 },
+                },
+              },
+            };
+          }
+          if (expr.includes('textOfTurn') || expr.includes('markdown')) {
+            return { result: { value: 'Leaked text from wrong session' } };
+          }
+        }
+        return {};
+      },
+    };
+
+    await assert.rejects(
+      async () => {
+        await waitForStreamingCompletion(mockCdpHijacked, {
+          deadlineMs: Date.now() + 20000,
+          beforeTurns: 0,
+          expectedTurn: 1,
+          expectedConversationUrl: 'https://chatgpt.com/c/original-legit-session',
+          safeTimeout: true,
+        });
+      },
+      /会话身份校验失败/,
+      '生成过程中发生目标会话偏离必须立即抛出异常拒绝返回文本'
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // 30. 会话身份状态机 UNBOUND_ROOT -> PINNED 测试 (P1: 封死 / -> /c/A -> /c/B wildcard)
+  // ---------------------------------------------------------------------------
+  console.log('\n30. 会话身份状态机 (UNBOUND_ROOT -> PINNED) 测试:');
+
+  await testAsync('waitForStreamingCompletion: / -> /c/A -> /c/B 必须在最终读取前 fail-closed（根路径绝不成为永久通行证）', async () => {
+    const urls = ['https://chatgpt.com/', 'https://chatgpt.com/c/A', 'https://chatgpt.com/c/B'];
+    let probeIdx = 0;
+
+    const mockCdpRootThenHijack = {
+      send: async (method, params) => {
+        if (method !== 'Runtime.evaluate') return {};
+        const expr = params?.expression || '';
+        const current = urls[Math.min(probeIdx, urls.length - 1)];
+        if (expr.includes('MutationObserver')) return { result: { value: true } };
+        if (expr.includes('pickVisible') || expr.includes('COMPOSER')) {
+          probeIdx++;
+          return {
+            result: {
+              value: {
+                url: current,
+                stopButton: { found: false },
+                // 每轮哈希都不同 -> 永不进入"稳定完成"分支，逼迫身份守卫先触发
+                assistant: { count: 1, len: 100, hash: 1000 + probeIdx },
+              },
+            },
+          };
+        }
+        if (expr === 'location.href') return { result: { value: current } };
+        if (expr.includes('textOfTurn') || expr.includes('markdown')) {
+          return { result: { value: 'text that must never be returned' } };
+        }
+        return {};
+      },
+    };
+
+    await assert.rejects(
+      async () => {
+        await waitForStreamingCompletion(mockCdpRootThenHijack, {
+          deadlineMs: Date.now() + 20000,
+          beforeTurns: 0,
+          expectedTurn: 1,
+          // 关键：提交瞬间 SPA 尚未跃迁，期望身份仍是根路径
+          expectedConversationUrl: 'https://chatgpt.com/',
+          safeTimeout: true,
+        });
+      },
+      /会话身份校验失败/,
+      '根路径起步的会话一旦锁定 /c/A，后续跳转到 /c/B 必须 fail-closed'
+    );
+  });
+
+  await testAsync('waitForStreamingCompletion: / -> /c/A 完成后恢复凭证必须升级为 /c/A，绝不能再返回 /', async () => {
+    const mockCdpUpgrade = {
+      send: async (method, params) => {
+        if (method !== 'Runtime.evaluate') return {};
+        const expr = params?.expression || '';
+        if (expr === 'location.href') return { result: { value: 'https://chatgpt.com/c/A' } };
+        if (expr.includes('MutationObserver')) return { result: { value: true } };
+        // 判别依据：PROBE_JS 含 sendButton 字段；GET_LAST_TEXT_JS 只做 textOfTurn 取文本
+        if (expr.includes('sendButton')) {
+          return {
+            result: {
+              value: {
+                url: 'https://chatgpt.com/',
+                stopButton: { found: false },
+                assistant: { count: 1, len: 100, hash: 4242 },
+              },
+            },
+          };
+        }
+        if (expr.includes('textOfTurn')) {
+          return { result: { value: 'legit answer text' } };
+        }
+        return {};
+      },
+    };
+
+    const res = await waitForStreamingCompletion(mockCdpUpgrade, {
+      deadlineMs: Date.now() + 20000,
+      beforeTurns: 0,
+      expectedTurn: 1,
+      expectedConversationUrl: 'https://chatgpt.com/',
+      safeTimeout: true,
+    });
+
+    assert.equal(res.inProgress, false);
+    assert.equal(res.text, 'legit answer text');
+    assert.equal(res.conversationUrl, 'https://chatgpt.com/c/A', '恢复凭证必须升级为具体会话身份');
+    assert.notEqual(res.conversationUrl, 'https://chatgpt.com/', '绝不允许把根路径当作恢复凭证返回');
+  });
+
+  test('isRootConversation / isSameConversationStrict: 根路径不得匹配任何具体会话', () => {
+    assert.equal(isRootConversation('https://chatgpt.com/'), true);
+    assert.equal(isRootConversation('https://chatgpt.com/?model=gpt-5'), true);
+    assert.equal(isRootConversation('https://chatgpt.com/c/A'), false);
+
+    // 宽容版（用于未锁定状态）与严格版（用于已锁定状态）语义必须分离
+    assert.equal(isSameConversation('https://chatgpt.com/c/A', 'https://chatgpt.com/'), true);
+    assert.equal(isSameConversationStrict('https://chatgpt.com/', 'https://chatgpt.com/c/A'), false);
+    assert.equal(isSameConversationStrict('https://chatgpt.com/c/A', 'https://chatgpt.com/'), false);
+    assert.equal(isSameConversationStrict('https://chatgpt.com/c/A', 'https://chatgpt.com/c/B'), false);
+    assert.equal(isSameConversationStrict('https://chatgpt.com/c/A?foo=1#bar', 'https://chatgpt.com/c/A/'), true);
+  });
+
+  test('isEphemeralConversation / isPinnableConversation: 客户端临时身份 /c/WEB:<uuid> 不得被锁定或当凭证', () => {
+    // 实机观测形态：新会话提交后 URL 短暂为 /c/WEB:<uuid>，随后跃迁为服务端 /c/<uuid>
+    assert.equal(isEphemeralConversation('https://chatgpt.com/c/WEB:3e5e31d1-ac59-4704-82a9-61cfd51a8daa'), true);
+    assert.equal(isEphemeralConversation('https://chatgpt.com/c/WEB%3A3e5e31d1-ac59-4704-82a9-61cfd51a8daa'), true);
+    assert.equal(isEphemeralConversation('https://chatgpt.com/c/6aabd112-f51c-83ea-ac8a-7cfb7b4e27ce'), false);
+
+    assert.equal(isPinnableConversation('https://chatgpt.com/c/WEB:tmp-1'), false);
+    assert.equal(isPinnableConversation('https://chatgpt.com/'), false);
+    assert.equal(isPinnableConversation('https://chatgpt.com/c/6aabd112-f51c-83ea-ac8a-7cfb7b4e27ce'), true);
+  });
+
+  await testAsync('waitForStreamingCompletion: / -> /c/WEB:<临时> -> /c/<真实> 的正常跃迁必须被接受，不得误判为劫持', async () => {
+    const urls = [
+      'https://chatgpt.com/c/WEB:3e5e31d1-ac59-4704-82a9-61cfd51a8daa',
+      'https://chatgpt.com/c/WEB:3e5e31d1-ac59-4704-82a9-61cfd51a8daa',
+      'https://chatgpt.com/c/6aabd112-f51c-83ea-ac8a-7cfb7b4e27ce',
+    ];
+    let probeIdx = 0;
+
+    const mockCdpEphemeral = {
+      send: async (method, params) => {
+        if (method !== 'Runtime.evaluate') return {};
+        const expr = params?.expression || '';
+        if (expr === 'location.href') return { result: { value: urls[urls.length - 1] } };
+        if (expr.includes('MutationObserver')) return { result: { value: true } };
+        if (expr.includes('sendButton')) {
+          const current = urls[Math.min(probeIdx, urls.length - 1)];
+          probeIdx++;
+          return {
+            result: {
+              value: {
+                url: current,
+                stopButton: { found: false },
+                // 哈希恒定 -> 允许进入"稳定完成"分支，从而真正走到文本读取与凭证返回
+                assistant: { count: 1, len: 100, hash: 5000 },
+              },
+            },
+          };
+        }
+        if (expr.includes('textOfTurn')) {
+          return { result: { value: 'answer from the new conversation' } };
+        }
+        return {};
+      },
+    };
+
+    const res = await waitForStreamingCompletion(mockCdpEphemeral, {
+      deadlineMs: Date.now() + 20000,
+      beforeTurns: 0,
+      expectedTurn: 1,
+      expectedConversationUrl: 'https://chatgpt.com/c/WEB:3e5e31d1-ac59-4704-82a9-61cfd51a8daa',
+      safeTimeout: true,
+    });
+
+    assert.equal(res.inProgress, false, '临时身份跃迁为真实身份必须视为正常流程，而不是劫持');
+    assert.equal(res.text, 'answer from the new conversation');
+    assert.equal(
+      res.conversationUrl,
+      'https://chatgpt.com/c/6aabd112-f51c-83ea-ac8a-7cfb7b4e27ce',
+      '恢复凭证必须升级为服务端真实会话身份，绝不能是临时 WEB: 身份'
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // 31. 多标签页按会话身份精确定位测试 (P2: 不再"取第一个标签再靠 guard 兜底")
+  // ---------------------------------------------------------------------------
+  console.log('\n31. 多标签页按 conversationUrl 精确定位测试:');
+
+  test('selectTargetPage: 必须按规范化会话身份精确选中目标标签页，而非盲目取第一个', () => {
+    const pages = [
+      { id: 'TAB_B', type: 'page', url: 'https://chatgpt.com/c/B', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/TAB_B' },
+      { id: 'TAB_A', type: 'page', url: 'https://chatgpt.com/c/A?model=gpt-5', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/TAB_A' },
+    ];
+
+    const sel = selectTargetPage(pages, null, { conversationUrl: 'https://chatgpt.com/c/A' });
+    assert.equal(sel.target.id, 'TAB_A', '必须精确命中 A 会话所在标签，而不是第一个标签 TAB_B');
+
+    // 目标会话不存在 -> fail-closed，绝不退回第一个标签
+    assert.throws(
+      () => selectTargetPage(pages, null, { conversationUrl: 'https://chatgpt.com/c/MISSING' }),
+      /未找到与目标会话匹配的 ChatGPT 标签页/
+    );
+
+    // 恶意子域不得被当作同一会话
+    const evil = [
+      { id: 'EVIL', type: 'page', url: 'https://chatgpt.com.evil.com/c/A', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/EVIL' },
+    ];
+    assert.throws(
+      () => selectTargetPage(evil, null, { conversationUrl: 'https://chatgpt.com/c/A' }),
+      /未找到与目标会话匹配的 ChatGPT 标签页/
+    );
+
+    // 根路径身份不参与精确匹配（未锁定状态退化为普通选择语义）
+    const rootSel = selectTargetPage(pages, null, { conversationUrl: 'https://chatgpt.com/' });
+    assert.equal(rootSel.target.id, 'TAB_B');
   });
 
   console.log(`\n========================================`);

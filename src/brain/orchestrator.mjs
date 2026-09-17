@@ -14,7 +14,7 @@ import { getGitDiff, getReviewEvidence } from '../git/git_helper.mjs';
 import { getRecentExecutions, formatExecutionSummary } from '../execution/recorder.mjs';
 import { sanitizeContent } from '../security/sensitive.mjs';
 import { canonicalizeManifestPath } from '../security/path_guard.mjs';
-import { sendPromptViaCdp } from '../transport/cdp_transport.mjs';
+import { sendPromptViaCdp, fetchLatestResponse } from '../transport/cdp_transport.mjs';
 
 /**
  * 解析 ChatGPT 回复中的 <EVIDENCE_REQUEST> 证据拉取标签
@@ -240,6 +240,11 @@ export async function runBrainTask(options = {}) {
   const workspace = options.workspace ? path.resolve(options.workspace) : process.cwd();
   const session = options.session === 'new' ? 'new' : 'reuse';
   const timeoutS = (typeof options.timeout === 'number' && options.timeout > 0) ? options.timeout : 600;
+  // 端到端唯一绝对截止时间：优先使用调用方（MCP / CLI）锚定的 deadlineMs，
+  // 否则以本层 t0 为锚点。下游所有等待都必须消费同一条预算。
+  const deadlineMs = (typeof options.deadlineMs === 'number' && Number.isFinite(options.deadlineMs))
+    ? options.deadlineMs
+    : (t0 + timeoutS * 1000);
 
   let attachmentsBlock = '';
   let gitDiffBlock = '';
@@ -324,12 +329,32 @@ export async function runBrainTask(options = {}) {
     throw new Error(`组装后的提示词超出安全传输大小限制 (${Buffer.byteLength(safePrompt, 'utf8')} 字节 > ${MAX_PROMPT_BYTES} 字节)`);
   }
 
-  // 4. 调度 CDP 传输层
+  // 4. 调度 CDP 传输层（透传同一条绝对 deadline，禁止下游重新锚定相对超时）
+  const safeTimeout = options.safeTimeout !== false;
   let cdpRes = await sendPromptViaCdp({
     prompt: safePrompt,
     mode: session,
     timeoutS,
+    deadlineMs,
+    safeTimeout,
   });
+
+  if (cdpRes.inProgress) {
+    const elapsedMs = Date.now() - t0;
+    return {
+      ok: true,
+      inProgress: true,
+      isStreaming: cdpRes.isStreaming,
+      text: cdpRes.text || '',
+      url: cdpRes.url,
+      turns: cdpRes.turns,
+      expectedTurn: cdpRes.expectedTurn,
+      conversationUrl: cdpRes.conversationUrl || cdpRes.url,
+      mode,
+      elapsedMs,
+      message: cdpRes.message || 'ChatGPT 正在深度推理与生成长回复中。',
+    };
+  }
 
   // 5. 闭环证据拉取协议 (Closed-Loop Bounded Evidence Protocol)
   let evidenceRounds = 0;
@@ -399,11 +424,58 @@ export async function runBrainTask(options = {}) {
         throw new Error(`Follow-up evidence prompt (${followUpBytes}B) strictly exceeded aggregate evidence ceiling (${MAX_AGGREGATE_EVIDENCE_BYTES}B)`);
       }
 
+      // 与主轮次共用同一条绝对 deadline（绝不重新锚定相对超时）
+      const remainingMs = deadlineMs - Date.now();
+      const SAFETY_MARGIN_MS = 5000;
+
+      if (remainingMs <= SAFETY_MARGIN_MS) {
+        // 总 deadline 预算已耗尽，严禁启动新的等待窗口，立即优雅返回 inProgress
+        const elapsedMs = Date.now() - t0;
+        return {
+          ok: true,
+          inProgress: true,
+          isStreaming: Boolean(cdpRes?.isStreaming),
+          text: cdpRes?.text || '',
+          url: cdpRes?.url,
+          turns: cdpRes?.turns,
+          expectedTurn: cdpRes?.expectedTurn,
+          conversationUrl: cdpRes?.conversationUrl || cdpRes?.url,
+          mode,
+          elapsedMs,
+          evidenceRounds,
+          evidenceAudit,
+          message: '总截止时间预算已用尽，安全返回以防 MCP 宿主 180s 强杀。可通过 fetch_chatgpt_response 获取后续回复。',
+        };
+      }
+
+      const remainingTimeoutS = Math.max(1, Math.floor(remainingMs / 1000));
+
       cdpRes = await sendPromptViaCdp({
         prompt: safeFollowUp,
         mode: 'reuse',
-        timeoutS,
+        timeoutS: remainingTimeoutS,
+        deadlineMs,
+        safeTimeout,
       });
+
+      if (cdpRes.inProgress) {
+        const elapsedMs = Date.now() - t0;
+        return {
+          ok: true,
+          inProgress: true,
+          isStreaming: cdpRes.isStreaming,
+          text: cdpRes.text || '',
+          url: cdpRes.url,
+          turns: cdpRes.turns,
+          expectedTurn: cdpRes.expectedTurn,
+          conversationUrl: cdpRes.conversationUrl || cdpRes.url,
+          mode,
+          elapsedMs,
+          evidenceRounds,
+          evidenceAudit,
+          message: cdpRes.message || 'ChatGPT 在证据审阅中仍在生成。',
+        };
+      }
 
       if (roundRes.budgetReached) break;
     }
@@ -413,12 +485,54 @@ export async function runBrainTask(options = {}) {
 
   return {
     ok: true,
+    inProgress: false,
     text: cdpRes.text,
     url: cdpRes.url,
+    conversationUrl: cdpRes.conversationUrl || cdpRes.url,
     turns: cdpRes.turns,
     mode,
     elapsedMs,
     evidenceRounds,
     evidenceAudit,
+  };
+}
+
+/**
+ * 抓取当前 ChatGPT 会话中最新生成完毕或正在生成的回复（无需注入 Prompt，带身份与回合校验）
+ * @param {object} [options]
+ * @param {number} [options.timeout=150]
+ * @param {number} [options.expectedTurn] 预期的最小回复回合数 (防串线)
+ * @param {string} [options.conversationUrl] 预期的会话 URL (防串标签)
+ * @param {boolean} [options.safeTimeout=true]
+ * @returns {Promise<object>}
+ */
+export async function fetchLatestBrainResponse(options = {}) {
+  const t0 = Date.now();
+  const timeoutS = (typeof options.timeout === 'number' && options.timeout > 0) ? options.timeout : 150;
+  const safeTimeout = options.safeTimeout !== false;
+  const deadlineMs = (typeof options.deadlineMs === 'number' && Number.isFinite(options.deadlineMs))
+    ? options.deadlineMs
+    : (t0 + timeoutS * 1000);
+
+  const cdpRes = await fetchLatestResponse({
+    timeoutS,
+    deadlineMs,
+    expectedTurn: options.expectedTurn,
+    conversationUrl: options.conversationUrl,
+    safeTimeout,
+  });
+
+  const elapsedMs = Date.now() - t0;
+  return {
+    ok: cdpRes.ok,
+    inProgress: Boolean(cdpRes.inProgress),
+    isStreaming: Boolean(cdpRes.isStreaming),
+    text: cdpRes.text || '',
+    url: cdpRes.url,
+    conversationUrl: cdpRes.conversationUrl || cdpRes.url,
+    turns: cdpRes.turns,
+    expectedTurn: cdpRes.expectedTurn,
+    elapsedMs,
+    message: cdpRes.message,
   };
 }

@@ -14,7 +14,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-import { runBrainTask } from '../src/brain/orchestrator.mjs';
+import { runBrainTask, fetchLatestBrainResponse } from '../src/brain/orchestrator.mjs';
 import { MODES } from '../src/brain/prompts.mjs';
 import { checkCdpStatus, findChrome } from '../src/transport/cdp_transport.mjs';
 
@@ -34,6 +34,7 @@ function parseArgs(argv) {
     timeoutS: 600,
     doctor: false,
     json: false,
+    fetch: false,
     out: null,
     workspace: process.cwd(),
     promptParts: [],
@@ -47,6 +48,7 @@ function parseArgs(argv) {
       case '--continue': opts.session = 'reuse'; break;
       case '--doctor': opts.doctor = true; break;
       case '--json': opts.json = true; break;
+      case '--fetch': case '--poll': opts.fetch = true; break;
       case '--git-diff': opts.gitDiff = true; break;
       case '--mode': {
         const m = rest[++i];
@@ -94,6 +96,7 @@ antigravity-with-chatgpt - Antigravity / Gemini 调用 ChatGPT 智脑桥接
   node ask_chatgpt.mjs --new "<prompt>"                 # 开启全新独立会话
   node ask_chatgpt.mjs --attach a.ts b.py "<prompt>"    # 附带本地源码 (带安全收敛与脱敏)
   node ask_chatgpt.mjs --file prompt.md                 # 从文件读取提示词
+  node ask_chatgpt.mjs --fetch                          # 抓取当前页面正在生成或最新的回复 (无需重发 Prompt)
 
 专业工作模式:
   node ask_chatgpt.mjs --plan "<goal>"                  # 架构与任务规划模式
@@ -134,6 +137,32 @@ async function main() {
     return runDoctor();
   }
 
+  if (opts.fetch) {
+    try {
+      const result = await fetchLatestBrainResponse({
+        timeout: opts.timeoutS,
+        workspace: opts.workspace,
+      });
+
+      if (opts.out && result.text) {
+        fs.mkdirSync(path.dirname(path.resolve(opts.out)), { recursive: true });
+        fs.writeFileSync(path.resolve(opts.out), result.text, 'utf8');
+      }
+
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(result) + '\n');
+      } else {
+        const text = result.text || result.message || '';
+        process.stdout.write(text.endsWith('\n') ? text : text + '\n');
+      }
+
+      process.exit(EXIT.OK);
+    } catch (err) {
+      process.stderr.write(`[brain-bridge][ERROR] ${err.message}\n`);
+      process.exit(EXIT.ERROR);
+    }
+  }
+
   let prompt = opts.prompt || '';
   if (opts.file) {
     try {
@@ -161,7 +190,7 @@ async function main() {
       timeout: opts.timeoutS,
     });
 
-    if (opts.out) {
+    if (opts.out && result.text) {
       fs.mkdirSync(path.dirname(path.resolve(opts.out)), { recursive: true });
       fs.writeFileSync(path.resolve(opts.out), result.text, 'utf8');
     }
@@ -169,7 +198,8 @@ async function main() {
     if (opts.json) {
       process.stdout.write(JSON.stringify(result) + '\n');
     } else {
-      process.stdout.write(result.text.endsWith('\n') ? result.text : result.text + '\n');
+      const text = result.text || (result.inProgress ? `[IN_PROGRESS] ${result.message}` : '');
+      process.stdout.write(text.endsWith('\n') ? text : text + '\n');
     }
 
     process.exit(EXIT.OK);
