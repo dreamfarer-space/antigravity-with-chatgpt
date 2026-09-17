@@ -32,7 +32,7 @@ AI 助手收到后，会自动为你全流程完成：
 2. 🔌 **自动注册全局 MCP 服务**：自动写入 `~/.gemini/config/mcp_config.json`；
 3. 🔗 **自动挂载 Antigravity 全局 Skill**：软链接至 `~/.gemini/config/skills/antigravity-with-chatgpt`；
 4. 🖥️ **自动创建专用 Chrome 快捷方式**：在桌面生成独立 Profile 调试会话图标（端口 `9222`）；
-5. ✅ **自动执行 110 项对抗性测试 + 37 项环境自检**：确认通信与安全边界 100% 准备就绪。
+5. ✅ **自动执行 117 项对抗性测试 + 37 项环境自检**：确认通信与安全边界 100% 准备就绪。
 
 配置完成后，双击桌面的 **「ChatGPT (Antigravity智脑)」** 登录一次你的 ChatGPT 个人账号，即可在 Antigravity 2.0 中随时通过例如 *“请让 ChatGPT 帮我 review 当前代码”* 开启双脑协同！
 
@@ -82,8 +82,11 @@ AI 助手收到后，会自动为你全流程完成：
   - 原因：路径沙箱只保护"调用者自己传进来的根"。若允许（可能已被 prompt injection 影响的）Agent 把 workspace 指成 `C://` 或 Home，所有包含性校验都会形同虚设。
 - 🧱 **单一文件授权入口（One File-Authorization Choke Point）**：
   - 所有可能跨越浏览器边界的内容都必须经过 `authorizeCanonicalFile()`：工作区授权 + 词法包含校验 + symlink 逃逸校验 + **词法与 realpath 双重**敏感名与 `.brainignore` 策略；
-  - 由此封堵三处旁路：未跟踪的 `alias.txt -> .env` 软链接、已被 Git 跟踪的 diff（改为按 `git diff --name-status -z` 逐文件过滤，rename 校验 old/new 两端）、以及 `searchWorkspace`（ripgrep 与 `git grep` 两条分支统一策略，ripgrep 改用 `--json` 消除 Windows 盘符解析歧义）；
+  - 由此封堵三处旁路：未跟踪的 `alias.txt -> .env` 软链接、已被 Git 跟踪的 diff（改为按 `git diff --name-status -z` 逐文件过滤，rename 校验 old/new 两端）、以及 `searchWorkspace`（ripgrep 用 `--json`、`git grep` 用 `-z`，Windows 盘符与被 C-style 引号/八进制转义的非 ASCII 文件名都不会再导致路径错配）；
   - 被排除的文件**不会生成任何 diff 头或内容**，路径只出现在可审计的 `[DIFF FILTERED: …]` 提示行里。
+- 🔒 **两级并发控制（同进程 + 跨进程）**：
+  - 同进程 `AsyncMutex` 串行化所有操作，排队等待受 deadline 约束，且**只有真的发生争用时**才会报锁争用；
+  - **跨进程锁文件**（`<chrome-profile>/.chatgpt-bridge.lock`）覆盖同进程锁管不到的场景：Antigravity 的 MCP server 与终端 CLI 是两个进程，同时注入同一标签会导致 Prompt 交错。原子获取（`O_EXCL`）、释放做 pid + startedAt 所有权校验、陈旧锁自动回收（持有者消失或超 10 分钟）、等待受 deadline 约束。
 - 🧭 **会话身份守卫（状态机 Conversation Identity Guard）**：
   - 会话 URL 先规范化（协议 + 主机 + 路径，剥离 query/hash），并以 `UNBOUND_ROOT → PINNED(/c/<id>)` 状态机跟踪：首次观测到的具体 `/c/<id>` 会被**永久锁定**，此后一律严格比较；
   - 这封死了危险的 `/ → /c/A → /c/B` 漏洞：根路径绝不能成为永久通行证，生成途中任何跨会话导航都 **fail-closed**，绝不返回其他会话的内容；
@@ -124,6 +127,8 @@ AI 助手收到后，会自动为你全流程完成：
 │      * 双哈希多采样 + MutationObserver Quiet 结束判定   │
 │      * 绝对截止时间与 IN_PROGRESS 续拉协议              │
 │      * 会话身份实时重校验 (fail-closed)                 │
+│      * 重连时陈旧 socket 与状态解耦                     │
+│      * 跨进程锁 + deadline 感知互斥                     │
 │      * 事件驱动 WebSocket 生命周期与断开清理            │
 └───────────────────────────┬─────────────────────────────┘
                             │ Chrome DevTools Protocol
@@ -306,7 +311,7 @@ ask_chatgpt(prompt, timeout: 150)
 本项目针对持续集成与本地安装分别提供自动化验证方案：
 
 ### 1. 自动化 CI 测试套件 (`npm test`)
-在 GitHub Actions 持续集成流水线中自动执行，覆盖 Ubuntu、Windows 与 macOS 三大主流平台（Node 22 与 Node 24 矩阵）。**110 项对抗性用例**覆盖路径逃逸与符号链接穿越、密钥脱敏、出口统一脱敏、Git porcelain 解析、证据预算天花板、绝对 deadline 耗尽后零借用（连接/注入/提交/收据复核全路径）、授权工作区强制校验、未跟踪软链接别名、Git diff 文件级策略、会话身份锁定（`/ → /c/A → /c/B`）、durable 恢复凭证、多标签精确选择，以及真实 handler 链路上的 MCP 参数穿透：
+在 GitHub Actions 持续集成流水线中自动执行，覆盖 Ubuntu、Windows 与 macOS 三大主流平台（Node 22 与 Node 24 矩阵）。**117 项对抗性用例**覆盖路径逃逸与符号链接穿越、密钥脱敏、出口统一脱敏、Git porcelain 解析、证据预算天花板、绝对 deadline 耗尽后零借用（连接/注入/提交/收据复核全路径）、授权工作区强制校验、未跟踪软链接别名、Git diff 文件级策略、会话身份锁定（`/ → /c/A → /c/B`）、durable 恢复凭证、多标签精确选择，以及真实 handler 链路上的 MCP 参数穿透：
 
 ```powershell
 npm test

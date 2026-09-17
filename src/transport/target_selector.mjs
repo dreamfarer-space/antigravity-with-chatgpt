@@ -205,7 +205,10 @@ export function selectTargetPage(pages, boundTargetId = null, options = {}) {
     }
     // Fail-Closed: the bound target was closed or disappeared
     if (!allowRebind) {
-      throw new Error(`已绑定的 ChatGPT 目标标签页已关闭或丢失 ("${boundTargetId}")，已中止以防止静默操作其他标签页 (Fail-Closed)`);
+      throw new Error(
+        `已绑定的 ChatGPT 目标标签页已关闭或丢失 ("${boundTargetId}")，已中止以防止静默操作其他标签页 (Fail-Closed)。` +
+        `如系手动关闭窗口或重启了专用 Chrome，请以 session:"new"（CLI: --new）重新发起，以便重新绑定标签`
+      );
     }
     if (cgPages.length > 0) {
       return { target: cgPages[0], isNewBinding: true };

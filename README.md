@@ -32,7 +32,7 @@ Your AI Agent will handle the entire installation automatically:
 2. 🔌 **Register Native MCP Server**: Automatically updates `~/.gemini/config/mcp_config.json`;
 3. 🔗 **Mount Global Antigravity Skill**: Creates the skill junction in `~/.gemini/config/skills/antigravity-with-chatgpt`;
 4. 🖥️ **Generate Dedicated Chrome Shortcut**: Creates a desktop launcher with isolated profile and port `9222`;
-5. ✅ **Run Full Self-Checks**: Runs the 110-case adversarial test suite plus the 37-point environment self-check to ensure 100% readiness.
+5. ✅ **Run Full Self-Checks**: Runs the 117-case adversarial test suite plus the 37-point environment self-check to ensure 100% readiness.
 
 After setup, double-click the **"ChatGPT (Antigravity智脑)"** desktop shortcut to log in to your ChatGPT Web account once, and you can immediately delegate deep reasoning and adversarial code reviews to ChatGPT from within Antigravity 2.0!
 
@@ -82,8 +82,11 @@ Inspired by the notable community project `XiaoDuoYa/codex-with-chatgpt` (**"Cha
   - Rationale: a path sandbox only protects the root the caller hands in. Letting a (possibly prompt-injected) agent pick `C://` or `HOME` reduces every containment check to theatre.
 - 🧱 **One File-Authorization Choke Point**:
   - All content that may cross the browser boundary goes through `authorizeCanonicalFile()`: workspace authorization + lexical containment + symlink-escape check + **dual** (lexical **and** realpath) sensitive-name and `.brainignore` policy.
-  - Closes three bypasses: untracked `alias.txt -> .env` symlinks, tracked Git diffs (now filtered per file via `git diff --name-status -z`, renames validated on both ends), and `searchWorkspace` (both ripgrep and `git grep` branches, ripgrep switched to `--json` to remove Windows drive-letter parsing ambiguity).
+  - Closes three bypasses: untracked `alias.txt -> .env` symlinks, tracked Git diffs (now filtered per file via `git diff --name-status -z`, renames validated on both ends), and `searchWorkspace` (ripgrep via `--json`, `git grep` via `-z`, so Windows drive letters and C-quoted/escaped non-ASCII filenames can no longer mis-parse the path).
   - Excluded files never produce diff headers or content—only an auditable `[DIFF FILTERED: …]` notice.
+- 🔒 **Two-Level Concurrency Control**:
+  - In-process `AsyncMutex` serializes every operation and gives up waiting once the deadline passes—and only reports lock contention when there really is contention.
+  - A **cross-process file lock** (`<chrome-profile>/.chatgpt-bridge.lock`) covers what the in-process mutex cannot: the Antigravity MCP server and a terminal CLI are separate processes, and injecting into the same tab from both interleaves prompts. Acquisition is atomic (`O_EXCL`), release is ownership-checked (pid + startedAt), stale locks are reclaimed (dead holder or >10 min), and waiting honours the deadline.
 - 🧭 **Conversation Identity Guard (State Machine)**:
   - Conversation URLs are canonicalized (scheme + host + path, query/hash stripped) and tracked as `UNBOUND_ROOT → PINNED(/c/<id>)`. The first concrete `/c/<id>` observed is **pinned permanently**; from then on comparison is strict.
   - This closes the dangerous `/ → /c/A → /c/B` hole: a root URL can never act as a permanent wildcard, and any mid-generation cross-conversation navigation **fails closed** instead of returning another chat's content.
@@ -125,6 +128,8 @@ Inspired by the notable community project `XiaoDuoYa/codex-with-chatgpt` (**"Cha
 │      * Absolute deadline + in-progress (IN_PROGRESS)    │
 │        resumption via fetch_chatgpt_response            │
 │      * Conversation identity re-validation (fail-closed)│
+│      * Stale-socket decoupling on reconnect (guarded)   │
+│      * Cross-process lock + deadline-aware mutex        │
 │      * Event-driven WebSocket lifecycle & cleanup       │
 └───────────────────────────┬─────────────────────────────┘
                             │ Chrome DevTools Protocol
@@ -307,7 +312,7 @@ ask_chatgpt(prompt, timeout: 150)
 The project includes both an automated cross-platform test suite for continuous integration and an environment verification suite for local setup:
 
 ### 1. Automated CI Test Suite (`npm test`)
-Executed automatically in GitHub Actions on every push and pull request across Ubuntu, Windows, and macOS (Node 22 & 24). **110 adversarial cases** cover path traversal & symlink breakout, secret redaction, egress sanitization, git porcelain parsing, evidence budget ceilings, absolute-deadline exhaustion (zero-borrow across connect/inject/submit/verify), authorized-workspace enforcement, untracked symlink aliases, per-file Git diff policy, conversation identity pinning (`/ → /c/A → /c/B`), durable resume credentials, multi-tab precise selection, and MCP parameter pass-through on the real handler chain:
+Executed automatically in GitHub Actions on every push and pull request across Ubuntu, Windows, and macOS (Node 22 & 24). **117 adversarial cases** cover path traversal & symlink breakout, secret redaction, egress sanitization, git porcelain parsing, evidence budget ceilings, absolute-deadline exhaustion (zero-borrow across connect/inject/submit/verify), authorized-workspace enforcement, untracked symlink aliases, per-file Git diff policy, conversation identity pinning (`/ → /c/A → /c/B`), durable resume credentials, multi-tab precise selection, and MCP parameter pass-through on the real handler chain:
 
 ```powershell
 npm test

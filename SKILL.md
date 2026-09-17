@@ -578,6 +578,23 @@ Desktop 快捷方式 **`ChatGPT (AI智脑)`** 打开的专用 Chrome 如果尚�
 > 为什么：`resolveSafePath(workspaceRoot, p)` 只能保证"不逃出调用者指定的根"。
 > 若允许调用者把 workspace 指成 `C:\` 或 Home，路径沙箱保护的就成了"攻击者指定的沙箱"。
 
+### 0.1 并发与 CDP 状态机不变量
+
+**两把锁、一个活跃 socket：**
+
+1. **同进程锁** `AsyncMutex`：串行化同一进程内的所有 Bridge 操作；排队等待受 deadline 约束，
+   且**只有在真的发生争用时**才会报"同进程并发锁"——否则会把任务内部的失败原因（例如跨进程
+   文件锁）错误归因。
+2. **跨进程锁**（锁文件 `<chrome-profile>/.chatgpt-bridge.lock`）：Antigravity 的 MCP server
+   与终端 CLI 是两个进程，同进程锁覆盖不到，同时注入会导致 Prompt 交错 / 答案错配。
+   - 原子获取（`O_EXCL`），释放做 **pid + startedAt 所有权校验**（绝不误删他人锁）；
+   - **陈旧锁回收**：持有者进程已消失（超过 2s 宽限）或锁年龄超过 10 分钟即回收重建；
+   - deadline 感知：等待期间预算耗尽立刻 fail-closed 并报出持有者 pid；
+   - `CHATGPT_BRAIN_DISABLE_LOCK=1` 为显式逃生舱（仅调试用）。
+3. **CDP 单活跃 socket 不变量**：`connect()` 会先摘除旧 socket 的事件处理器再关闭它，
+   且所有 socket 事件都带 `this.ws !== ws` 守卫 —— 陈旧 socket 的 `onclose` 不得关闭新会话，
+   其迟到响应也不得按 id 命中新连接的在途请求（否则重连后会出现"CDP 连接已关闭"误判与响应错配）。
+
 ### 1. 绝对零删除
 
 严禁操作任何 `Delete / 删除 / Archive / 归档 / Clear / 清空 / Remove` 等历史数据相关按钮。
@@ -645,7 +662,8 @@ D:\ChatGPT-Brain-Bridge\chrome-profile
   `git diff --name-status -z` 清单，逐文件授权后再生成 patch（rename/copy 校验 old/new 两端），
   被排除的路径只出现在可审计的 `[DIFF FILTERED: ...]` 提示行里，内容与 diff 头一律不生成；
 - **searchWorkspace**：ripgrep 与 `git grep` 两条分支现在都同时应用敏感规则与 `.brainignore`
-  （ripgrep 分支改用 `--json` 结构化输出，规避 Windows 盘符与 `:` 分隔歧义）。
+  （ripgrep 用 `--json`、`git grep` 用 `-z`：Windows 盘符、以及被 C-style 引号/八进制转义的
+  非 ASCII 或含特殊字符文件名，都不会再导致路径错配或策略漏判）。
 
 ---
 

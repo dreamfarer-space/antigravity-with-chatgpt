@@ -229,25 +229,41 @@ export function searchWorkspace(workspaceRoot, query, options = {}) {
     return matches;
   }
 
-  // 降级尝试 git grep（输出为仓库相对路径，同样强制应用 brainignore 与敏感规则）
-  const gitRes = spawnSync('git', ['-C', absRoot, 'grep', '-n', '-I', '--no-color', query], {
+  // 降级尝试 git grep。
+  // 必须用 -z：默认模式下非 ASCII 或含特殊字符的文件名会被 C-style 引号 + 八进制转义
+  // （例如 "\344\270\255.txt"），按 ':' 切分会得到错误路径 —— 既会让策略过滤对不上号，
+  // 也会把错配的文件名喂给模型。
+  //
+  // 注意 -z 的真实布局是「字段用 NUL 分隔、记录仍以 \n 结尾」：
+  //     <path>\0<line>\0<text>\n<path>\0<line>\0<text>\n...
+  // 因此这里做顺序扫描（而不是按固定 3 段切分），这样路径里即使含 \n 也不会错位。
+  const gitRes = spawnSync('git', ['-C', absRoot, 'grep', '-n', '-I', '-z', '--no-color', query], {
     encoding: 'utf8',
     shell: false,
   });
 
   if (gitRes.status === 0 && gitRes.stdout) {
+    const out = gitRes.stdout;
     const matches = [];
-    const lines = gitRes.stdout.split('\n').filter(Boolean);
-    for (const line of lines) {
-      const parts = line.split(':');
-      if (parts.length >= 3) {
-        const rel = parts[0].replace(/\\/g, '/');
-        const lineNum = Number(parts[1]);
-        const content = parts.slice(2).join(':').trim();
-        if (!isSearchableRel(rel)) continue;
-        matches.push({ file: rel, line: lineNum, text: sanitizeContent(content) });
-        if (matches.length >= maxMatches) break;
-      }
+    let cursor = 0;
+
+    while (cursor < out.length) {
+      const pathEnd = out.indexOf('\0', cursor);
+      if (pathEnd === -1) break;
+      const rel = out.slice(cursor, pathEnd).replace(/\\/g, '/');
+
+      const lineEnd = out.indexOf('\0', pathEnd + 1);
+      if (lineEnd === -1) break;
+      const lineNum = Number(out.slice(pathEnd + 1, lineEnd));
+
+      const recordEnd = out.indexOf('\n', lineEnd + 1);
+      const rawText = recordEnd === -1 ? out.slice(lineEnd + 1) : out.slice(lineEnd + 1, recordEnd);
+      cursor = recordEnd === -1 ? out.length : recordEnd + 1;
+
+      if (!rel) continue;
+      if (!isSearchableRel(rel)) continue;
+      matches.push({ file: rel, line: lineNum, text: sanitizeContent(rawText.replace(/\r$/, '').trim()) });
+      if (matches.length >= maxMatches) break;
     }
     return matches;
   }

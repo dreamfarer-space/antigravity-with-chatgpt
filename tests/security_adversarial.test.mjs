@@ -18,7 +18,7 @@ import { sanitizeContent, isSensitivePath, redactSensitive } from '../src/securi
 import { runBrainTask, parseEvidenceRequests, buildEvidenceRoundSnippets, MAX_AGGREGATE_EVIDENCE_BYTES, fetchLatestBrainResponse } from '../src/brain/orchestrator.mjs';
 import { recordExecution } from '../src/execution/recorder.mjs';
 import { getUntrackedEvidence, truncateUtf8ByBytes, getGitDiff, getReviewEvidence, parseGitStatusOutput, unquoteGitPath, parseRenamePathPair, parseNameStatusZ, filterDiffEntriesByPolicy } from '../src/git/git_helper.mjs';
-import { evaluate, getInjectionTimeout, SUBMIT_STATUS, insertTextReliable, submitMessageReliable, verifyUnknownReceiptOrThrow, clearComposer, waitForStreamingCompletion, canonicalizeConversationUrl, isSameConversation, isSameConversationStrict, isRootConversation, isEphemeralConversation, isPinnableConversation, remainingBudgetMs } from '../src/transport/cdp_transport.mjs';
+import { CDP, AsyncMutex, acquireBridgeLock, evaluate, getInjectionTimeout, SUBMIT_STATUS, insertTextReliable, submitMessageReliable, verifyUnknownReceiptOrThrow, clearComposer, waitForStreamingCompletion, canonicalizeConversationUrl, isSameConversation, isSameConversationStrict, isRootConversation, isEphemeralConversation, isPinnableConversation, remainingBudgetMs } from '../src/transport/cdp_transport.mjs';
 import { readFileSafe, buildAttachmentsBlock, searchWorkspace } from '../src/workspace/context_provider.mjs';
 import { computeFingerprint, BROWSER_FINGERPRINT_SNIPPET } from '../src/transport/fingerprint.mjs';
 import { selectTargetPage, filterChatGptPages } from '../src/transport/target_selector.mjs';
@@ -2425,6 +2425,32 @@ Also need to check another file:
     }
   });
 
+  test('searchWorkspace: 非 ASCII / 含特殊字符文件名必须原样返回（git grep -z 或 rg --json）', () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'search-unicode-'));
+    try {
+      const git = (...args) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+      git('init', '-q', '-b', 'main');
+      git('config', 'user.name', 'T');
+      git('config', 'user.email', 't@e.com');
+
+      // 默认 core.quotePath=true 时，非 ASCII 文件名在 git grep 默认输出里会被
+      // 八进制转义 + C-style 引号包裹（"\344\270\255.txt"），必须仍能正确解析
+      fs.writeFileSync(path.join(repo, '中文文件.txt'), 'UNICODE_NEEDLE\n', 'utf8');
+      fs.writeFileSync(path.join(repo, 'with space.txt'), 'UNICODE_NEEDLE\n', 'utf8');
+      git('add', '.');
+      git('commit', '-qm', 'init');
+
+      const matches = searchWorkspace(repo, 'UNICODE_NEEDLE');
+      const files = matches.map((m) => m.file);
+
+      assert.ok(files.includes('中文文件.txt'), '非 ASCII 文件名必须原样返回，不得被引号/转义破坏: ' + JSON.stringify(files));
+      assert.ok(files.includes('with space.txt'), '含空格文件名必须原样返回: ' + JSON.stringify(files));
+      assert.ok(matches.every((m) => m.text.includes('UNICODE_NEEDLE')), '命中文本必须完整');
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   test('searchWorkspace: 敏感文件名同样不得出现在搜索结果中', () => {
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'search-sensitive-'));
     try {
@@ -2637,6 +2663,230 @@ Also need to check another file:
       sleepViolations.push(`L${i + 1}: ${trimmed.slice(0, 120)}`);
     });
     assert.deepEqual(sleepViolations, [], `检测到不受 deadline 约束的 sleep:/n${sleepViolations.join('\n')}`);
+  });
+
+
+  // ---------------------------------------------------------------------------
+  // 40. CDP 状态机对抗测试 (P1: 陈旧 socket 必须与实例状态解耦)
+  // ---------------------------------------------------------------------------
+  console.log('\n40. CDP 状态机（陈旧 socket 解耦）测试:');
+
+  await testAsync('CDP: 陈旧 socket 的 onclose/onmessage 绝不影响新连接（重连竞态）', async () => {
+    const RealWebSocket = globalThis.WebSocket;
+    const sockets = [];
+
+    class FakeWebSocket {
+      constructor(url) {
+        this.url = url;
+        this.readyState = 0; // CONNECTING
+        this.sent = [];
+        sockets.push(this);
+      }
+      send(payload) { this.sent.push(payload); }
+      close() {
+        this.readyState = 3; // CLOSED
+        if (typeof this.onclose === 'function') this.onclose({});
+      }
+      _open() {
+        this.readyState = 1; // OPEN
+        if (typeof this.onopen === 'function') this.onopen();
+      }
+      _message(obj) {
+        if (typeof this.onmessage === 'function') this.onmessage({ data: JSON.stringify(obj) });
+      }
+    }
+    FakeWebSocket.CONNECTING = 0;
+    FakeWebSocket.OPEN = 1;
+    FakeWebSocket.CLOSING = 2;
+    FakeWebSocket.CLOSED = 3;
+    globalThis.WebSocket = FakeWebSocket;
+
+    try {
+      const cdp = new CDP('ws://127.0.0.1:9222/devtools/page/T1');
+      const first = cdp.connect(2000);
+      const firstWs = sockets[0];
+      firstWs._open();
+      await first;
+      assert.equal(cdp.ws, firstWs);
+      assert.equal(cdp.closed, false);
+
+      // 导航后重连场景：底层已 CLOSED 但事件尚未派发（connect 不会拆除其处理器）
+      firstWs.readyState = 3;
+      const reconnect = cdp.connect(2000);
+      const secondWs = sockets[1];
+      secondWs._open();
+      await reconnect;
+
+      assert.equal(cdp.ws, secondWs, '活跃 socket 必须已切换为新连接');
+      assert.equal(cdp.closed, false);
+
+      // 新连接上的在途请求
+      const pending = cdp.send('Runtime.evaluate', { expression: '1+1' }, 2000);
+
+      // 陈旧 socket 迟到的 close：绝不能把新会话标记为已关闭
+      firstWs.onclose({});
+      assert.equal(cdp.closed, false, '陈旧 socket 的 onclose 不得关闭新会话');
+
+      // 陈旧 socket 迟到的同 id 响应：绝不能命中新连接的 pending
+      firstWs._message({ id: 1, result: { value: 'STALE' } });
+
+      // 正确响应必须解析为新连接的结果
+      secondWs._message({ id: 1, result: { value: 'FRESH' } });
+      const res = await pending;
+      assert.equal(res.value, 'FRESH', '绝不能把陈旧 socket 的响应错配给新请求');
+      assert.equal(cdp.pending.size, 0);
+
+      // 活跃 socket 关闭时，在途请求必须被立即拒绝且不泄漏
+      const pending2 = cdp.send('Runtime.evaluate', {}, 5000);
+      secondWs.readyState = 3;
+      secondWs.onclose({});
+      await assert.rejects(() => pending2, /CDP 连接已关闭/);
+      assert.equal(cdp.closed, true);
+      assert.equal(cdp.pending.size, 0, '连接关闭后不得残留 pending 请求');
+    } finally {
+      globalThis.WebSocket = RealWebSocket;
+    }
+  });
+
+  await testAsync('CDP: 连接超时的 socket 必须被解耦，不得污染后续会话', async () => {
+    const RealWebSocket = globalThis.WebSocket;
+    const sockets = [];
+
+    class NeverOpenWebSocket {
+      constructor(url) {
+        this.url = url;
+        this.readyState = 0;
+        sockets.push(this);
+      }
+      send() {}
+      close() { this.readyState = 3; }
+    }
+    NeverOpenWebSocket.CONNECTING = 0;
+    NeverOpenWebSocket.OPEN = 1;
+    NeverOpenWebSocket.CLOSED = 3;
+    globalThis.WebSocket = NeverOpenWebSocket;
+
+    try {
+      const cdp = new CDP('ws://127.0.0.1:9222/devtools/page/T2');
+      await assert.rejects(() => cdp.connect(80), /连接超时/);
+
+      const failedWs = sockets[0];
+      assert.equal(failedWs.onclose, null, '超时 socket 的事件处理器必须被摘除');
+      assert.equal(failedWs.onmessage, null);
+      assert.equal(cdp.ws, null);
+      // 失败 socket 之后被底层关闭，也不得把实例标记为 closed
+      failedWs.readyState = 3;
+      assert.equal(cdp.closed, false);
+    } finally {
+      globalThis.WebSocket = RealWebSocket;
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 41. 跨进程互斥锁对抗测试 (P1: AsyncMutex 覆盖不到多进程)
+  // ---------------------------------------------------------------------------
+  console.log('\n41. 跨进程互斥锁测试:');
+
+  await testAsync('acquireBridgeLock: 跨进程互斥 + 所有权校验 + 陈旧锁回收', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-lock-'));
+    const lockFile = path.join(dir, 'bridge.lock');
+    try {
+      const l1 = await acquireBridgeLock({ lockFilePath: lockFile, deadlineMs: Date.now() + 5000 });
+      assert.equal(l1.acquired, true);
+      assert.ok(fs.existsSync(lockFile));
+      const written = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+      assert.equal(written.pid, process.pid);
+
+      // 第二个进程（此处模拟）必须等待，并在 deadline 到达时 fail-closed
+      const t0 = Date.now();
+      await assert.rejects(
+        () => acquireBridgeLock({ lockFilePath: lockFile, deadlineMs: Date.now() + 300, pollMs: 50 }),
+        /等待跨进程互斥锁/
+      );
+      assert.ok(Date.now() - t0 >= 250, '必须真的等待到 deadline 才放弃');
+
+      // 所有权校验：绝不能删除别人持有的锁
+      fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid + 1, startedAt: Date.now(), label: 'foreign' }));
+      l1.release();
+      assert.ok(fs.existsSync(lockFile), '非自己持有的锁绝不能被删除');
+
+      // 持有者"仍健在"（age 未超阈值）时不得被回收
+      await assert.rejects(
+        () => acquireBridgeLock({ lockFilePath: lockFile, deadlineMs: Date.now() + 200, pollMs: 50, staleMs: 3600000 }),
+        /等待跨进程互斥锁/
+      );
+
+      // 持有者进程已消失且超过宽限期 -> 陈旧锁必须被回收
+      fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999999, startedAt: Date.now() - 60000, label: 'dead' }));
+      const l2 = await acquireBridgeLock({ lockFilePath: lockFile, deadlineMs: Date.now() + 3000, pollMs: 50 });
+      assert.equal(l2.acquired, true);
+      assert.equal(JSON.parse(fs.readFileSync(lockFile, 'utf8')).pid, process.pid);
+
+      // 正常释放必须删掉自己的锁
+      l2.release();
+      assert.equal(fs.existsSync(lockFile), false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('acquireBridgeLock: CHATGPT_BRAIN_DISABLE_LOCK=1 为显式逃生舱（调试用）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-lock-off-'));
+    const lockFile = path.join(dir, 'bridge.lock');
+    const prev = process.env.CHATGPT_BRAIN_DISABLE_LOCK;
+    process.env.CHATGPT_BRAIN_DISABLE_LOCK = '1';
+    try {
+      const l = await acquireBridgeLock({ lockFilePath: lockFile, deadlineMs: Date.now() + 1000 });
+      assert.equal(l.acquired, false);
+      assert.equal(fs.existsSync(lockFile), false, '关闭后不得创建锁文件');
+    } finally {
+      if (prev === undefined) delete process.env.CHATGPT_BRAIN_DISABLE_LOCK;
+      else process.env.CHATGPT_BRAIN_DISABLE_LOCK = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 42. 同进程互斥锁 deadline 语义测试
+  // ---------------------------------------------------------------------------
+  console.log('\n42. AsyncMutex deadline 语义测试:');
+
+  await testAsync('AsyncMutex: 排队等待必须受 deadline 约束，且放弃等待不得破坏锁队列', async () => {
+    const mutex = new AsyncMutex();
+    let releaseFirst;
+    const gate = new Promise((resolve) => { releaseFirst = resolve; });
+
+    const first = mutex.runExclusive(async () => {
+      await gate;
+      return 'first';
+    });
+
+    const t0 = Date.now();
+    await assert.rejects(
+      () => mutex.runExclusive(async () => 'second', { deadlineMs: Date.now() + 200, label: 'ask' }),
+      /等待 ask 同进程并发锁/
+    );
+    const waited = Date.now() - t0;
+    assert.ok(waited >= 150 && waited < 1500, `必须在 deadline 附近放弃等待，实际 ${waited}ms`);
+
+    releaseFirst();
+    assert.equal(await first, 'first');
+
+    // 队列必须仍然可用（放弃等待不得永久占用锁）
+    assert.equal(await mutex.runExclusive(async () => 'third'), 'third');
+    assert.equal(mutex.waitingCount, 0);
+  });
+
+  await testAsync('AsyncMutex: 无争用时不得用"锁超时"掩盖任务自身的失败原因（如跨进程文件锁）', async () => {
+    const mutex = new AsyncMutex();
+    await assert.rejects(
+      () => mutex.runExclusive(
+        async () => { throw new Error('总截止时间预算已耗尽（等待跨进程互斥锁）：另一个 Bridge 进程正在使用'); },
+        { deadlineMs: Date.now() + 5000, label: 'fetch' }
+      ),
+      /等待跨进程互斥锁/,
+      '无争用时必须原样抛出任务内部错误，帮助定位真正的阻塞者'
+    );
   });
 
   console.log(`\n========================================`);

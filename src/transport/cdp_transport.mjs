@@ -370,42 +370,92 @@ export class CDP {
     this.closed = false;
   }
 
+  /**
+   * 建立（或重建）CDP WebSocket 连接。
+   *
+   * 状态机不变量：**同一时刻只有一个"活跃 socket"**。
+   * 任何陈旧 socket 的 onmessage / onclose / onerror 都必须被忽略，
+   * 否则会出现两类真实故障：
+   *   1. 旧 socket 迟到的响应按 id 命中新连接的 pending 请求 → 跨 socket 响应错配；
+   *   2. 旧 socket 延迟触发的 onclose 把 `closed` 置为 true → 新会话所有请求
+   *      被误判为"CDP 连接已关闭"（导航/重连路径下尤其容易命中）。
+   *
+   * @param {number} timeoutMs
+   * @returns {Promise<void>}
+   */
   connect(timeoutMs = 15000) {
     return new Promise((resolve, reject) => {
       let settled = false;
+
+      // 显式拆除上一个连接：先摘掉事件处理器，再关闭，确保它不再影响本实例状态
+      const stale = this.ws;
+      if (stale && stale.readyState !== WebSocket.CLOSED) {
+        stale.onmessage = null;
+        stale.onerror = null;
+        stale.onclose = null;
+        try { stale.close(); } catch {}
+      }
+
       let ws;
       try {
         ws = new WebSocket(this.wsUrl);
       } catch (e) {
         return reject(new Error(`无法创建 WebSocket: ${e.message}`));
       }
+
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        // 连接超时的 socket 同样需要解耦，防止其 onclose 污染后续会话
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.onclose = null;
         try { ws.close(); } catch {}
         reject(new Error(`CDP WebSocket 连接超时 (${timeoutMs}ms): ${this.wsUrl}`));
       }, timeoutMs);
 
       ws.onopen = () => {
-        if (settled) return;
+        if (settled) {
+          // 超时后迟到的 open：只拆除这个 socket，不影响当前状态
+          try { ws.close(); } catch {}
+          return;
+        }
         settled = true;
         clearTimeout(timer);
         this.ws = ws;
         this.closed = false;
         resolve();
       };
+
       ws.onerror = (ev) => {
+        if (this.ws === ws) {
+          // 连接已建立后的错误：立即标记关闭并拒绝所有在途请求，避免静默挂到超时
+          this.closed = true;
+          for (const [, p] of this.pending) {
+            clearTimeout(p.timer);
+            p.reject(new Error('CDP 连接错误: ' + ((ev && ev.message) || 'unknown')));
+          }
+          this.pending.clear();
+        }
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         reject(new Error(`CDP WebSocket 连接失败: ${this.wsUrl}${ev && ev.message ? ' - ' + ev.message : ''}`));
       };
+
       ws.onclose = () => {
+        // 陈旧 socket 的关闭事件一律忽略（否则会误杀新会话）
+        if (this.ws !== ws) return;
         this.closed = true;
-        for (const [, p] of this.pending) p.reject(new Error('CDP 连接已关闭'));
+        for (const [, p] of this.pending) {
+          clearTimeout(p.timer);
+          p.reject(new Error('CDP 连接已关闭'));
+        }
         this.pending.clear();
       };
+
       ws.onmessage = (ev) => {
+        if (this.ws !== ws) return;
         try {
           const raw = typeof ev.data === 'string' ? ev.data : ev.data.toString();
           const msg = JSON.parse(raw);
@@ -1078,21 +1128,201 @@ async function waitForComposer(cdp, absoluteDeadlineMs) {
 // Concurrency & Mutex (Single-flight Serialization per Target)
 // ---------------------------------------------------------------------------
 
-class AsyncMutex {
+/**
+ * 同进程内的 single-flight 互斥锁。
+ * 注意：它**只**能串行化同一进程内的调用；跨进程（MCP server 与 CLI 同时运行）
+ * 必须依赖 acquireBridgeLock() 的文件锁，否则两个进程会向同一标签交错注入。
+ */
+export class AsyncMutex {
   constructor() {
     this._queue = Promise.resolve();
+    this._waiting = 0;
+    this._busy = false;
   }
 
-  runExclusive(fn) {
+  get waitingCount() {
+    return this._waiting;
+  }
+
+  get busy() {
+    return this._busy;
+  }
+
+  /**
+   * @param {() => Promise<any>} fn
+   * @param {{ deadlineMs?: number, label?: string }} [options]
+   *   排队等待期间若 deadline 已到，立即放弃等待并抛错（不得"先等锁再失败"）。
+   *   注意：被放弃的任务在真正拿到锁后仍会执行，但此时其内部所有 requireBudgetMs
+   *   都会立刻失败，因此不会再发出任何 CDP 调用。
+   */
+  runExclusive(fn, options = {}) {
+    const { deadlineMs, label = 'mutex' } = options;
+
+    // 是否真的在"排队等锁"：只有存在争用时才启用等待超时，
+    // 否则会把任务内部的失败原因（如跨进程文件锁）误报成同进程锁争用。
+    const contended = this._busy || this._waiting > 0;
+
     let release;
     const next = new Promise((resolve) => { release = resolve; });
     const current = this._queue;
-    this._queue = this._queue.then(() => next, () => next);
-    return current.then(() => fn()).finally(() => release());
+    this._queue = current.then(() => next, () => next);
+
+    this._waiting++;
+    const acquired = current
+      .then(() => {
+        this._busy = true;
+        return fn();
+      })
+      .finally(() => {
+        this._busy = false;
+        this._waiting--;
+        release();
+      });
+    // 外部可能因 deadline 提前放弃等待，这里吞掉后台拒绝，避免 unhandledRejection
+    acquired.catch(() => {});
+
+    if (!contended) return acquired;
+    if (typeof deadlineMs !== 'number' || !Number.isFinite(deadlineMs)) return acquired;
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(`总截止时间预算已耗尽（等待 ${label} 同进程并发锁）：已有另一个操作在进行中`));
+      }, Math.max(0, deadlineMs - Date.now()));
+
+      acquired.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        }
+      );
+    });
   }
 }
 
 const cdpMutex = new AsyncMutex();
+
+// ---------------------------------------------------------------------------
+// Cross-Process Mutex (file lock)
+// ---------------------------------------------------------------------------
+
+const LOCK_FILENAME = '.chatgpt-bridge.lock';
+const LOCK_STALE_MS = 10 * 60 * 1000;
+
+/**
+ * 判断进程是否存活（用于陈旧锁回收）
+ * @param {number} pid
+ * @returns {boolean}
+ */
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM 表示进程存在但无权限发信号
+    return err && err.code === 'EPERM';
+  }
+}
+
+/**
+ * 跨进程互斥锁（基于锁文件的原子创建 'wx'）。
+ *
+ * 为什么需要：AsyncMutex 只覆盖同进程。Antigravity 的 MCP server 与终端里的 CLI
+ * 是两个进程，若同时向同一个 ChatGPT 标签注入，会出现 Prompt 交错 / 答案错配。
+ *
+ * 特性：
+ *   - 原子获取（O_EXCL）+ 所有权校验释放（pid + startedAt 双因子，绝不误删他人锁）
+ *   - 陈旧锁回收：持有者进程已消失，或锁年龄超过 staleMs
+ *   - deadline 感知：等待期间预算耗尽即 fail-closed，不会无限等
+ *   - CHATGPT_BRAIN_DISABLE_LOCK=1 可显式关闭（仅调试用）
+ *
+ * @param {object} [options]
+ * @param {number|null} [options.deadlineMs] 绝对截止时间
+ * @param {string} [options.label] 日志标签
+ * @param {string|null} [options.lockFilePath] 覆盖锁路径（测试用）
+ * @param {number} [options.staleMs] 陈旧锁阈值
+ * @param {number} [options.pollMs] 轮询间隔
+ * @returns {Promise<{ acquired: boolean, owner?: object, release: () => void }>}
+ */
+export async function acquireBridgeLock(options = {}) {
+  const {
+    deadlineMs = null,
+    label = 'bridge',
+    lockFilePath = null,
+    staleMs = LOCK_STALE_MS,
+    pollMs = 200,
+  } = options;
+
+  if (process.env.CHATGPT_BRAIN_DISABLE_LOCK === '1') {
+    return { acquired: false, release() {} };
+  }
+
+  const file = lockFilePath || path.join(PROFILE_DIR, LOCK_FILENAME);
+  const owner = { pid: process.pid, startedAt: Date.now(), label, host: (os.hostname && os.hostname()) || 'unknown' };
+  const payload = JSON.stringify(owner);
+
+  try { fs.mkdirSync(path.dirname(file), { recursive: true }); } catch {}
+
+  while (true) {
+    try {
+      const fd = fs.openSync(file, 'wx');
+      try { fs.writeSync(fd, payload); } finally { fs.closeSync(fd); }
+      return {
+        acquired: true,
+        owner,
+        release() {
+          try {
+            const cur = JSON.parse(fs.readFileSync(file, 'utf8'));
+            // 所有权校验：只有自己的锁才允许删除（防误删他人锁）
+            if (cur && cur.pid === owner.pid && cur.startedAt === owner.startedAt) {
+              fs.unlinkSync(file);
+            }
+          } catch {}
+        },
+      };
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        throw new Error(`无法获取跨进程互斥锁 "${file}": ${err.message}`);
+      }
+    }
+
+    let holder = null;
+    try { holder = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+    const age = holder && typeof holder.startedAt === 'number' ? Date.now() - holder.startedAt : Infinity;
+    const holderAlive = holder ? isProcessAlive(holder.pid) : false;
+
+    // 陈旧锁回收：持有者已死（留 2s 宽限避免竞态）或锁年龄超阈值
+    if (age > staleMs || (!holderAlive && age > 2000)) {
+      warn(`回收陈旧跨进程锁 (pid=${holder ? holder.pid : 'unknown'}, age=${Number.isFinite(age) ? Math.round(age / 1000) + 's' : 'unknown'})`);
+      try { fs.unlinkSync(file); } catch {}
+      continue;
+    }
+
+    const remaining = typeof deadlineMs === 'number' && Number.isFinite(deadlineMs)
+      ? deadlineMs - Date.now()
+      : pollMs;
+
+    if (remaining <= 0) {
+      throw new Error(
+        `总截止时间预算已耗尽（等待跨进程互斥锁）：另一个 Bridge 进程 (pid=${holder ? holder.pid : '?'}) 正在使用该 ChatGPT 标签`
+      );
+    }
+
+    // 严格不越界：最多睡到 deadline 为止（sleepWithin 内部再次以剩余预算夹逼）
+    await sleepWithin(Math.min(pollMs, remaining), typeof deadlineMs === 'number' ? deadlineMs : null);
+  }
+}
 
 export async function waitForStreamingCompletion(cdp, options = {}) {
   const deadlineMs = typeof options.deadlineMs === 'number'
@@ -1255,7 +1485,15 @@ export async function waitForStreamingCompletion(cdp, options = {}) {
 }
 
 export async function fetchLatestResponse(options = {}) {
-  return cdpMutex.runExclusive(() => _fetchLatestResponseInternal(options));
+  return cdpMutex.runExclusive(async () => {
+    // 跨进程互斥：MCP server 与 CLI 是两个进程，同进程锁无法覆盖
+    const lock = await acquireBridgeLock({ deadlineMs: options?.deadlineMs, label: 'fetch' });
+    try {
+      return await _fetchLatestResponseInternal(options);
+    } finally {
+      lock.release();
+    }
+  }, { deadlineMs: options?.deadlineMs, label: 'fetch' });
 }
 
 async function _fetchLatestResponseInternal({ timeoutS = 150, deadlineMs: externalDeadlineMs, targetId, expectedTurn, conversationUrl, safeTimeout = true } = {}) {
@@ -1358,7 +1596,15 @@ async function _fetchLatestResponseInternal({ timeoutS = 150, deadlineMs: extern
 }
 
 export async function sendPromptViaCdp(options) {
-  return cdpMutex.runExclusive(() => _sendPromptInternal(options));
+  return cdpMutex.runExclusive(async () => {
+    // 跨进程互斥：MCP server 与 CLI 是两个进程，同进程锁无法覆盖
+    const lock = await acquireBridgeLock({ deadlineMs: options?.deadlineMs, label: 'ask' });
+    try {
+      return await _sendPromptInternal(options);
+    } finally {
+      lock.release();
+    }
+  }, { deadlineMs: options?.deadlineMs, label: 'ask' });
 }
 
 async function _sendPromptInternal({ prompt, mode = 'reuse', timeoutS = 150, deadlineMs: externalDeadlineMs, targetId, safeTimeout = true } = {}) {
